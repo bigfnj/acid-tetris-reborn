@@ -1,9 +1,11 @@
 ACiD Tetris Reborn — third-party and original-work notices
 ===========================================================
 
-This port is an independent, non-commercial fan project. It is not affiliated
-with, endorsed by, or sponsored by the original authors, Dungeon Dwellers
-Design, or The Tetris Company.
+This port is an independent, non-commercial fan project by BigFNj
+(https://github.com/bigfnj/acid-tetris-reborn). It is not affiliated with,
+endorsed by, or sponsored by the original authors, Dungeon Dwellers Design, or
+The Tetris Company. The port's own code and release binaries are released under
+0BSD (do anything, no attribution required); see LICENSE.
 
 Original game
 -------------

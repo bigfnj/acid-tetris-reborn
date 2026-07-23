@@ -10,7 +10,9 @@ set -u
 here="$(cd "$(dirname "$0")" && pwd)"
 exe="${1:-}"
 if [ -z "$exe" ]; then
-  for cand in "$here/build/Release/acid_tetris_port.exe" "$here/build/acid_tetris_port"; do
+  for cand in \
+    "$here/build/Release/saba-reborn.exe" "$here/build/saba-reborn" \
+    "$here/build/Release/acid_tetris_port.exe" "$here/build/acid_tetris_port"; do
     [ -x "$cand" ] && exe="$cand" && break
   done
 fi

@@ -22,7 +22,7 @@ port decodes everything it needs from it **at runtime, in memory** (see
 `src/atet_data.cpp`). Nothing from the original data file is written out or
 modified.
 
-**All you need is the game's data file.** Drop it next to the `acid_tetris_port`
+**All you need is the game's data file.** Drop it next to the `saba-reborn`
 executable and run — that single file is enough; the port reads every graphic,
 sound, and music track out of it. If you have the game as a zip instead of a loose
 file, just place the whole zip beside the executable and the port will pull the
@@ -63,7 +63,7 @@ cmake --build build --config Release
 ```
 
 The build copies `SDL3.dll` next to the executable. The result is
-`build/Release/acid_tetris_port.exe` — a windowed (no-console) game with an app
+`build/Release/saba-reborn.exe` — a windowed (no-console) game with an app
 icon.
 
 **Linux** (GCC/Clang + Ninja):
@@ -72,7 +72,7 @@ icon.
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 # run with the fetched SDL3 on the library path:
-LD_LIBRARY_PATH=$PWD/build/_deps/sdl3-build ./build/acid_tetris_port
+LD_LIBRARY_PATH=$PWD/build/_deps/sdl3-build ./build/saba-reborn
 ```
 
 ## Controls
@@ -101,6 +101,8 @@ response). Both need a copy of the game data to run.
 Original ACiD Tetris © 1997 Jason Pimble (code) and Scott Emerle (graphics), with
 music by Liam Hesse, Bobby Tamburrino, Jon Dal Kristbjornsson, and Chris & Scott
 Emerle, on Jean-Paul Mikkers' MikMod engine. This port is an independent,
-non-commercial fan work. See [`NOTICE`](NOTICE) for the full credits, the
-original freeware terms, and trademark information, and [`LICENSE`](LICENSE) for
-the port's MIT license (which covers the port's code only, not the game).
+non-commercial fan work by BigFNj (<https://github.com/bigfnj/acid-tetris-reborn>).
+See [`NOTICE`](NOTICE) for the full credits, the original freeware terms, and
+trademark information, and [`LICENSE`](LICENSE) for the port's license — 0BSD, i.e.
+do whatever you like with the port's own code and release binaries, no attribution
+required (this covers the port only, not the game).

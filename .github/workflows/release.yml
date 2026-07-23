@@ -1,0 +1,135 @@
+name: Release
+
+# Build the Windows + Linux release artifacts and attach them to a (draft) GitHub
+# release. Triggers on pushing a version tag (v*), or manually via the Actions tab.
+# Release artifacts are named saba-reborn-<version>-<platform> (no "tetris" in any
+# download); they bundle SABA's intact, verified original archive so they are turnkey.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag for the release (e.g. v1.0.0)'
+        required: true
+        default: 'v0.0.0-test'
+
+permissions:
+  contents: write
+
+env:
+  # The intact original SABA archive (Dungeon Dwellers Design freeware, redistributed
+  # unmodified). Verified against this SHA-256 before it is bundled.
+  SABA_SHA256: 0861aa05ef0f7ce37e2b26c506adaee1814e1f120ce688c777115b34dae8bece
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set version
+        id: v
+        shell: bash
+        run: echo "version=${{ github.event.inputs.version || github.ref_name }}" >> "$GITHUB_OUTPUT"
+      - name: Configure + build
+        run: |
+          cmake -S . -B build -A x64
+          cmake --build build --config Release
+      - name: Fetch + verify SABA
+        shell: bash
+        run: |
+          for url in "http://www.dddgames.com/archive/saba.zip" "https://dosgames.com/files/saba.zip"; do
+            echo "trying $url"
+            curl -fsSL -o saba.zip "$url" || continue
+            echo "${SABA_SHA256}  saba.zip" | sha256sum -c - && exit 0
+          done
+          echo "::error::could not obtain a SHA-256-verified saba.zip"; exit 1
+      - name: Package
+        shell: bash
+        run: |
+          N="saba-reborn-${{ steps.v.outputs.version }}-windows-x64"
+          mkdir "$N"
+          cp build/Release/saba-reborn.exe build/Release/SDL3.dll saba.zip README.md NOTICE LICENSE "$N/"
+          powershell -Command "Compress-Archive -Path '$N' -DestinationPath '$N.zip'"
+          sha256sum "$N.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: saba-reborn-*-windows-x64.zip
+
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set version
+        id: v
+        run: echo "version=${{ github.event.inputs.version || github.ref_name }}" >> "$GITHUB_OUTPUT"
+      - name: Install SDL3 build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libx11-dev libxext-dev libxrandr-dev \
+            libxcursor-dev libxi-dev libxfixes-dev libxss-dev libxkbcommon-dev \
+            libwayland-dev wayland-protocols libdrm-dev libgbm-dev \
+            libasound2-dev libpulse-dev
+      - name: Configure + build
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build
+      - name: Fetch + verify SABA
+        run: |
+          for url in "http://www.dddgames.com/archive/saba.zip" "https://dosgames.com/files/saba.zip"; do
+            echo "trying $url"
+            curl -fsSL -o saba.zip "$url" || continue
+            echo "${SABA_SHA256}  saba.zip" | sha256sum -c - && exit 0
+          done
+          echo "::error::could not obtain a SHA-256-verified saba.zip"; exit 1
+      - name: Package
+        run: |
+          N="saba-reborn-${{ steps.v.outputs.version }}-linux-x64"
+          mkdir "$N"
+          cp build/saba-reborn "$N/"
+          cp -P build/_deps/sdl3-build/libSDL3.so* "$N/"
+          cp saba.zip README.md NOTICE LICENSE "$N/"
+          chmod +x "$N/saba-reborn"
+          tar czf "$N.tar.gz" "$N"
+          sha256sum "$N.tar.gz"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: saba-reborn-*-linux-x64.tar.gz
+
+  release:
+    needs: [build-windows, build-linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: List artifacts
+        run: ls -la dist
+      - name: Draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.version || github.ref_name }}
+          name: SABA Reborn ${{ github.event.inputs.version || github.ref_name }}
+          draft: true
+          files: dist/*
+          body: |
+            A faithful native Windows + Linux source port of the 1997 DOS game
+            *ACiD Tetris* (Jason Pimble & Scott Emerle / Dungeon Dwellers Design),
+            rebuilt from a reverse-engineering study. Runs at the original's 70.086 Hz.
+
+            **Just download and play** — these builds bundle **SABA** (*Super ACiD
+            Block Attack*), the authors' own freely-distributed re-release, so there's
+            nothing else to fetch.
+            - Windows (x64): unzip, run `saba-reborn.exe`.
+            - Linux (x64): extract, run `./saba-reborn`.
+
+            Prefer the original "ACiD Tetris" title screen? Drop ACiD Tetris's own
+            `ATET.DAT` next to the executable — a verified copy is on the Internet
+            Archive: https://archive.org/details/swizzle_demu_Acid
+
+            SABA is redistributed here unmodified per its own freeware terms; the
+            port's own code/binaries are 0BSD (do anything). See `NOTICE` in the download.

@@ -92,6 +92,11 @@ add_executable(acid_tetris_port WIN32
   third_party/miniz/miniz.c
 )
 
+# The shipped binary is named "saba-reborn" (no "tetris" in any release artifact);
+# by default it plays the trademark-safe SABA data the releases bundle. The CMake
+# target keeps its internal name.
+set_target_properties(acid_tetris_port PROPERTIES OUTPUT_NAME "saba-reborn")
+
 target_include_directories(acid_tetris_port PRIVATE include)
 # libmikmod does not export its (generated) header directory on its target, so
 # point at both the source include dir and the build tree where mikmod.h lands.
