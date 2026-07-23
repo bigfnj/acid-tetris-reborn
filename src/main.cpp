@@ -623,18 +623,24 @@ int main(int argc, char** argv) {
 
   bool running = true;
   int rendered_smoke_frames = 0;
-  // Precise fixed-RATE loop. The original ran one game update + one render per 320x200
-  // mode-13h vertical retrace (~70.086 Hz; RE 0x6c62 + port-0x3da retrace sync), so ALL
-  // its per-frame constants -- gameplay (gravity, soft-drop 0x8000/frame, 8-frame DAS)
-  // AND presentation (the 0x20/frame menu pulse, the 1-row/frame top-out dissolve, the
-  // palette fades) -- advance at that one rate. This port likewise does one Tick()+one
-  // Render() per iteration, so we pace the WHOLE loop to exactly 70.086 Hz off the
-  // high-resolution counter (sleep most of the frame, busy-wait the last ~1ms for
-  // precision, since SDL_Delay rounds up to the OS timer granularity ~= 15.6ms on
-  // Windows and would otherwise pin us to ~60fps). Result: correct real-world speed on
-  // any host regardless of display refresh. Smoke runs skip the limiter (frame-counted,
-  // run as fast as possible, deterministic).
-  const double kSimHz = 70.086;
+  // Precise fixed-RATE loop. The game advances one logic tick + one render per frame,
+  // and EVERY per-frame constant -- gameplay (gravity, soft-drop 0x8000/frame, 8-frame
+  // DAS) AND presentation (the 0x20/frame menu pulse, the 1-row/frame top-out dissolve,
+  // the palette fades) -- runs at this one rate, so it sets the whole game's real-time
+  // speed. We pace the WHOLE loop to it off the high-resolution counter (sleep most of
+  // the frame, busy-wait the last ~1ms for precision, since SDL_Delay rounds up to the
+  // OS timer granularity ~= 15.6ms on Windows). Smoke runs skip the limiter (frame-
+  // counted, deterministic).
+  //
+  // RATE = 60 Hz. RE 0x6c62 calibrates the tick to the VGA mode-13h vertical retrace,
+  // which is ~70 Hz on bare metal, and an earlier pass paced the port there -- but that
+  // finding flagged it needed a runtime check, and a side-by-side capture against the
+  // running game settles it: the reference plays the fixed 64-frame menu pulse in
+  // ~1.07s (== 60 Hz), and 70 Hz ran the whole port ~1.19x (70/60) too fast (pulse,
+  // particles, everything). Matching the running game's real-time speed => 60 Hz. This
+  // is wall-clock only; all frame-COUNT fingerprints (RNG, smokes, dynamic tests) are
+  // unchanged since they count ticks, not seconds.
+  const double kSimHz = 60.0;
   const Uint64 perf_freq = SDL_GetPerformanceFrequency();
   const Uint64 frame_ticks = static_cast<Uint64>(static_cast<double>(perf_freq) / kSimHz);
   Uint64 next_frame_deadline = SDL_GetPerformanceCounter();
@@ -729,7 +735,7 @@ int main(int argc, char** argv) {
         running = false;
       }
     }
-    // Pace the loop to exactly 70.086 Hz (skip for frame-counted smoke runs). Sleep the
+    // Pace the loop to exactly kSimHz (skip for frame-counted smoke runs). Sleep the
     // bulk of the remaining frame time, then busy-wait the final ~1ms so we hit the
     // deadline precisely rather than overshooting to the OS timer granularity.
     if (smoke_frames == 0) {
