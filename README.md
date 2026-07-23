@@ -31,8 +31,11 @@ At startup the port looks, in order, for:
    (it extracts `ATET.DAT` from inside), then
 3. the current directory, then a build-tree fallback.
 
-ACiD Tetris can be found on abandonware/DOS archives (for example, search
-"ACiD Tetris" on retrogames.cz); `ATET.DAT` is inside that download.
+ACiD Tetris was freeware. A preserved, verified-genuine copy is on the Internet
+Archive: <https://archive.org/details/swizzle_demu_Acid>. Download it, open the
+archive, and copy `ATET.DAT` out next to the executable (or just place the whole
+zip beside the executable and let the port pull `ATET.DAT` from it). It also
+turns up on other DOS/abandonware archives.
 
 ## Building
 
