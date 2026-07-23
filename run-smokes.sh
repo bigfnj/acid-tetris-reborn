@@ -12,6 +12,9 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 exe="${1:-}"
 if [ -z "$exe" ]; then
   for cand in \
+    "$here/build/Release/saba-reborn.exe" \
+    "$here/build-linux/saba-reborn" \
+    "$here/build/saba-reborn" \
     "$here/build/Release/acid_tetris_port.exe" \
     "$here/build-linux/acid_tetris_port" \
     "$here/build/acid_tetris_port"; do
