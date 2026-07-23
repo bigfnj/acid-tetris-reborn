@@ -28,11 +28,26 @@ the game's own ATET.DOC reads:
   CODE IS STRICTLY PROHIBITED.  WE ARE NOT RESPONSIBLE FOR ANY DAMAGE CAUSED TO
   YOU, YOUR COMPUTER, OR ANYTHING BY THIS PROGRAM.
 
-Because of those terms, this project ships NO part of the original game. It
-contains no ATET.DAT, no extracted or converted graphics/audio/music, and no
-original program code. To play, you supply your own copy of the game and this
-port decodes what it needs from it at runtime (see README.md). Nothing in the
-original data file is modified or redistributed by this repository.
+Because of those terms, the SOURCE REPOSITORY ships NO part of the original game:
+no ATET.DAT / saba.dat, no extracted or converted graphics/audio/music, and no
+original program code. The port decodes what it needs from a copy of the game you
+supply, at runtime (see README.md); nothing in the original data file is modified.
+
+SABA (Super ACiD Block Attack)
+------------------------------
+In 2002 the authors re-released the same game, renamed SABA, to avoid confusion
+with The Tetris Company's products. SABA is (C) 1997/2002 Jason Pimble & Scott
+Emerle (same credits as above) and is distributed by them as freeware. Its data
+file `saba.dat` is byte-identical to `ATET.DAT` except the title-screen logo, so
+this port plays identically from either.
+
+The pre-built RELEASE downloads (not the source repository) bundle SABA's intact,
+unmodified original archive `saba.zip` exactly as the authors distribute it
+(from dddgames.com), so the download is turnkey. That archive is redistributed
+whole and unaltered, per its own freeware terms; the port itself remains
+asset-free and simply reads `saba.dat` from the bundled archive at runtime. If you
+prefer the original "ACiD Tetris" title screen, you can drop in ACiD Tetris's own
+`ATET.DAT` instead (see README.md).
 
 Trademark
 ---------

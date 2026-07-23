@@ -8,10 +8,14 @@ The port was rebuilt from a reverse-engineering study of the original executable
 rather than a line-for-line decompile. The behavioural notes, specs, and RE
 findings behind it live in the companion repo, **acid-tetris-grimoire**.
 
-## Bring your own game data
+## Game data
 
-This repository contains **no** game assets — no `ATET.DAT`, no extracted
-graphics/audio/music, and no original program code. ACiD Tetris is freeware, but
+**Using a pre-built release?** It already bundles SABA (see below) — just unzip and
+run, nothing else to fetch. The rest of this section is for building from source or
+bringing your own copy of the game.
+
+This source repository contains **no** game assets — no `ATET.DAT` / `saba.dat`, no
+extracted graphics/audio/music, and no original program code. ACiD Tetris is freeware, but
 its own notice only permits distributing the intact original archive, so this
 port takes the ScummVM approach: you provide your own copy of the game, and the
 port decodes everything it needs from it **at runtime, in memory** (see
