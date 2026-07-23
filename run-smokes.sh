@@ -12,9 +12,6 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 exe="${1:-}"
 if [ -z "$exe" ]; then
   for cand in \
-    "$here/build/Release/saba-reborn.exe" \
-    "$here/build-linux/saba-reborn" \
-    "$here/build/saba-reborn" \
     "$here/build/Release/acid_tetris_port.exe" \
     "$here/build-linux/acid_tetris_port" \
     "$here/build/acid_tetris_port"; do
@@ -79,11 +76,12 @@ grep -q "Music: playing track 0" "$tmp/topout1400.txt" && pass "track 0 'Continu
 
 echo "[6] gameplay<->frontend screen fade"
 # Real New Game (no shortcut, fades on): Enter on the default menu row after the
-# boot splashes; the menu should fade out ~64 ticks, switch at black, fade in ~64.
-"$exe" --reset-setup --debug-state --scripted-input=280:enter,282:enter:up --smoke-frames=430 > "$tmp/fade.txt" 2>&1
+# boot splashes (~720+ frames now). The menu should fade out ~120 ticks, switch at
+# black, fade in ~120 (screen fades are ~2.0s = 120 frames at 60Hz).
+"$exe" --reset-setup --debug-state --scripted-input=820:enter,822:enter:up --smoke-frames=1120 > "$tmp/fade.txt" 2>&1
 fo=$(grep -c 'fade=out:' "$tmp/fade.txt"); fi=$(grep -c 'fade=in:' "$tmp/fade.txt")
-{ [ "$fo" -ge 60 ] && [ "$fo" -le 66 ] && [ "$fi" -ge 60 ] && [ "$fi" -le 66 ]; } \
-  && pass "New Game fade out=$fo in=$fi (~64t each)" || fail "fade timing off (out=$fo in=$fi)"
+{ [ "$fo" -ge 112 ] && [ "$fo" -le 126 ] && [ "$fi" -ge 112 ] && [ "$fi" -le 126 ]; } \
+  && pass "New Game fade out=$fo in=$fi (~120t each)" || fail "fade timing off (out=$fo in=$fi)"
 # Shortcuts stay fade-free for determinism.
 "$exe" --live-demo --debug-state --smoke-frames=5 2>&1 | grep -q 'fade=none' \
   && pass "shortcut (--live-demo) is fade-free" || fail "shortcut should not fade"

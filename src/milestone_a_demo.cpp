@@ -74,9 +74,16 @@ constexpr int kSleepyNoClearFrames = 60 * 45;
 constexpr int kAlertEventLifetime = 96;  // frames a one-shot mood face (clear/wake) stays up (~1.4s @70fps)
 constexpr int kHighScoreConcealFrames = 36;
 constexpr int kHighScoreTableRevealRows = 6;
-constexpr int kSplashPageFrames = 120;
-constexpr int kScreenFadeTicks = 0x40;   // 64: palette fade-out 0x64f0 / fade-in 0x6498
-constexpr int kSplashFadeTicks = 24;     // splash fade-in/out within a page (fits the 120-frame hold)
+// Boot-splash + fade durations measured from the running original (kryptos boot
+// capture at 60 Hz): each splash page fades in ~2.0s, holds ~2.0s, fades out ~2.0s
+// (~6.0s/page), and screen fades run ~2.0s. The port had ~0.4s splash fades and ~1.07s
+// screen fades -- "WAY too fast" -- because the fade tick-counts were guessed small to
+// fit a too-short 120-frame page. (RE 0x6498/0x64f0 = 0x40 palette STEPS, but the
+// running fade advances slower than one step/frame, so the wall-clock duration is ~2s;
+// the port models each fade as a linear ramp over the measured frame duration.)
+constexpr int kSplashPageFrames = 360;   // ~6.0s at 60 Hz: 2s fade-in + 2s hold + 2s fade-out
+constexpr int kScreenFadeTicks = 120;    // ~2.0s screen fade (title/menu + gameplay<->frontend)
+constexpr int kSplashFadeTicks = 120;    // ~2.0s splash fade-in/out within a page
 constexpr int kTopOutTimingFps = 60;
 // RE 0x1f8c/0x1fc6: the top-out dissolve sweeps exactly ONE pixel-row per frame down
 // the whole gameplay area (kBoardHeight*8 = 160 pixel rows), so the spray completes in

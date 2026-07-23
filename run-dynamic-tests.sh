@@ -10,9 +10,7 @@ set -u
 here="$(cd "$(dirname "$0")" && pwd)"
 exe="${1:-}"
 if [ -z "$exe" ]; then
-  for cand in \
-    "$here/build/Release/saba-reborn.exe" "$here/build/saba-reborn" \
-    "$here/build/Release/acid_tetris_port.exe" "$here/build/acid_tetris_port"; do
+  for cand in "$here/build/Release/acid_tetris_port.exe" "$here/build/acid_tetris_port"; do
     [ -x "$cand" ] && exe="$cand" && break
   done
 fi
@@ -40,7 +38,9 @@ descent_metric() { awk -F, '{y=$2; up=(NR>1 && y>py); if(up&&pup)c++; if(up)d++;
 # amplitude min==32 / max==64 and the ~64f period via rising edges through the midpoint.
 # The pulse only runs once the menu is up (after the ~240f splash), so sample the tail.
 echo "[1] selected-row pulse rate + amplitude"
-series="$("$exe" --no-fade --debug-state --smoke-frames=640 2>&1 | grep -oE 'pulse=[0-9]+' | grep -oE '[0-9]+$' | tail -360)"
+# The two boot splash pages now hold ~360 frames each (~6s/page at 60Hz), so the menu
+# appears after ~720+ frames; run long and sample the menu tail.
+series="$("$exe" --no-fade --debug-state --smoke-frames=1200 2>&1 | grep -oE 'pulse=[0-9]+' | grep -oE '[0-9]+$' | tail -360)"
 minv="$(echo "$series" | sort -n | head -1)"
 maxv="$(echo "$series" | sort -n | tail -1)"
 edges="$(echo "$series" | awk '{v=$1} NR>1 && pv<48 && v>=48 {e++} {pv=v} END{print e+0}')"
