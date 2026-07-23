@@ -1,0 +1,15 @@
+# Build output
+/build/
+/build-*/
+*.o
+*.obj
+
+# Runtime files
+SETUP.DAT
+*.dll
+
+# Game data is never committed. Bring your own (see README): a loose ATET.DAT or
+# an ACiD Tetris archive placed next to the executable.
+ATET.DAT
+*.zip
+!/**/*.zip.sha256

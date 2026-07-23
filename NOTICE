@@ -1,0 +1,47 @@
+ACiD Tetris Reborn — third-party and original-work notices
+===========================================================
+
+This port is an independent, non-commercial fan project. It is not affiliated
+with, endorsed by, or sponsored by the original authors, Dungeon Dwellers
+Design, or The Tetris Company.
+
+Original game
+-------------
+ACiD Tetris (C) Copyright 1997 Jason Pimble & Scott Emerle.
+  Program Code       (C) 1997 Jason Pimble
+  Program Graphics   (C) 1997 Scott Emerle
+  "I See It Now"     (C) 1997 Jon Dal "Mesonyx" Kristbjornsson
+  "Continuum"        (C) 1997 Liam "The Lemming" Hesse
+  "Tearing Up SpaceTime" (C) 1997 Liam "Lemming" Hesse
+  "Inner Walls Released" (C) 1997 Bobby "Blackwolf" Tamburrino
+  "Costumed"         (C) 1997 Christopher "Irrelevant" Emerle
+  "Simple Song"      (C) 1997 Scott "Windsinger" Emerle
+  Music System (tracker engine): MikMod, by Jean-Paul Mikkers.
+
+The original ACiD Tetris was distributed as freeware. The verbatim notice from
+the game's own ATET.DOC reads:
+
+  NOTICE: THIS PROGRAM IS DISTRIBUTED AS IS.  DISTRIBUTION IS ONLY ALLOWED BY
+  THE ORIGINAL SELF-EXTRACTING ZIP FILE.  THIS PROGRAM IS ABSOLUTELY FREE.  NO
+  PROFIT MAY BE GAINED BY THE DISTRIBUTION OR SELLING OF THIS SOFTWARE.  ANY
+  MODIFICATION MADE TO THE SELF EXTRACTION ZIP FILE, THIS DOCUMENT OR PROGRAM
+  CODE IS STRICTLY PROHIBITED.  WE ARE NOT RESPONSIBLE FOR ANY DAMAGE CAUSED TO
+  YOU, YOUR COMPUTER, OR ANYTHING BY THIS PROGRAM.
+
+Because of those terms, this project ships NO part of the original game. It
+contains no ATET.DAT, no extracted or converted graphics/audio/music, and no
+original program code. To play, you supply your own copy of the game and this
+port decodes what it needs from it at runtime (see README.md). Nothing in the
+original data file is modified or redistributed by this repository.
+
+Trademark
+---------
+"Tetris" is a registered trademark of The Tetris Company, LLC. This project
+uses the name only to identify the 1997 work it re-implements and claims no
+association. (The original was itself renamed "SABA" in 2002.)
+
+Third-party code
+----------------
+- miniz — public-domain / MIT-style (unlicense). See third_party/miniz/LICENSE.
+- SDL3 — zlib license. Fetched at build time from https://github.com/libsdl-org/SDL
+- libmikmod — LGPL. Fetched at build time from https://github.com/sezero/mikmod

@@ -1,0 +1,1 @@
+2:esc,20:down,24:down,28:down,32:down,36:down,40:down,44:down,48:enter

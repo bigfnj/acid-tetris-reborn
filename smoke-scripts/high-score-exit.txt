@@ -1,0 +1,1 @@
+5:esc,8:esc,11:esc,12:esc:up,130:enter,132:enter:up,190:enter
