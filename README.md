@@ -18,24 +18,33 @@ port decodes everything it needs from it **at runtime, in memory** (see
 `src/atet_data.cpp`). Nothing from the original data file is written out or
 modified.
 
-**All you need is the game's data file, `ATET.DAT`.** Drop it next to the
-`acid_tetris_port` executable and run — that single file is enough; the port
-reads every graphic, sound, and music track out of it. If you have the game as an
-archive instead of a loose file, you can just place the whole zip next to the
-executable and the port will pull `ATET.DAT` out of it for you.
+**All you need is the game's data file.** Drop it next to the `acid_tetris_port`
+executable and run — that single file is enough; the port reads every graphic,
+sound, and music track out of it. If you have the game as a zip instead of a loose
+file, just place the whole zip beside the executable and the port will pull the
+data out of it for you.
 
-At startup the port looks, in order, for:
+The port accepts **either release of the game**, because they are the same game:
 
-1. a loose `ATET.DAT` next to the executable, then
-2. an ACiD Tetris archive next to the executable — `AcidTetris.zip`, `ATETRIS.ZIP`
-   (it extracts `ATET.DAT` from inside), then
-3. the current directory, then a build-tree fallback.
+- **ACiD Tetris** (1997) — data file `ATET.DAT`; archives `AcidTetris.zip` /
+  `ATETRIS.ZIP`.
+- **SABA — "Super ACiD Block Attack"** (2002) — data file `saba.dat`; archive
+  `saba.zip`. This is the authors' own trademark-safe re-release; its data is
+  **byte-identical to ACiD Tetris except the title-screen logo**, so it plays
+  exactly the same.
 
-ACiD Tetris was freeware. A preserved, verified-genuine copy is on the Internet
-Archive: <https://archive.org/details/swizzle_demu_Acid>. Download it, open the
-archive, and copy `ATET.DAT` out next to the executable (or just place the whole
-zip beside the executable and let the port pull `ATET.DAT` from it). It also
-turns up on other DOS/abandonware archives.
+At startup the port looks next to the executable (then in the working directory)
+for any of those loose data files, then any of those archives, extracting the data
+file from within.
+
+Where to get it (both are freeware):
+
+- **SABA** — from the original authors, Dungeon Dwellers Design:
+  <http://www.dddgames.com/saba/>. This is the cleanest source (author-sanctioned,
+  no trademark baggage). Drop `saba.dat` (or `saba.zip`) beside the executable.
+- **ACiD Tetris** — a preserved, verified-genuine copy is on the Internet Archive:
+  <https://archive.org/details/swizzle_demu_Acid>. Copy `ATET.DAT` out of it (or
+  place the archive beside the executable).
 
 ## Building
 

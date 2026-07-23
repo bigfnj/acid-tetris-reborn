@@ -250,13 +250,17 @@ bool AtetData::LoadFromZip(const std::vector<Uint8>& zip_bytes, std::string* err
   if (!mz_zip_reader_init_mem(&zip, zip_bytes.data(), zip_bytes.size(), 0)) {
     return fail("Not a valid ZIP archive.");
   }
-  // IGNORE_PATH matches ATET.DAT by basename regardless of any folder prefix, and
-  // (CASE_SENSITIVE unset) case-insensitively, so a lowercase 'atet.dat' member
-  // in the intact ACiD Tetris archive is found.
-  const int index = mz_zip_reader_locate_file(&zip, "ATET.DAT", nullptr, MZ_ZIP_FLAG_IGNORE_PATH);
+  // IGNORE_PATH matches by basename regardless of any folder prefix, and
+  // (CASE_SENSITIVE unset) case-insensitively, so a lowercase 'atet.dat' member in
+  // the intact ACiD Tetris archive is found. SABA (the 2002 rename) packages the same
+  // data as 'saba.dat', so fall back to that -- the port plays from either.
+  int index = mz_zip_reader_locate_file(&zip, "ATET.DAT", nullptr, MZ_ZIP_FLAG_IGNORE_PATH);
+  if (index < 0) {
+    index = mz_zip_reader_locate_file(&zip, "saba.dat", nullptr, MZ_ZIP_FLAG_IGNORE_PATH);
+  }
   if (index < 0) {
     mz_zip_reader_end(&zip);
-    return fail("Archive does not contain ATET.DAT.");
+    return fail("Archive does not contain ATET.DAT or saba.dat.");
   }
   size_t out_size = 0;
   void* extracted = mz_zip_reader_extract_to_heap(&zip, static_cast<mz_uint>(index), &out_size, 0);

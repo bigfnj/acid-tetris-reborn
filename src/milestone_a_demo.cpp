@@ -875,12 +875,25 @@ bool MilestoneADemo::Initialize(SDL_Renderer* renderer, std::string* error_out, 
   for (const std::string& dir : search_dirs) {
     std::vector<Uint8> bytes;
     std::string ignored;
-    if (ReadBinaryAsset((dir + "ATET.DAT").c_str(), &bytes, &ignored) &&
-        atet_data_.LoadFromDat(bytes, &dat_error)) {
-      loaded = true;
+    // A loose data file. ACiD Tetris ships ATET.DAT; its 2002 rename SABA ("Super
+    // ACiD Block Attack", the trademark-safe re-release) ships saba.dat -- which is
+    // byte-identical to ATET.DAT except the title-screen logo (chunk 4), so the port
+    // plays identically from either (see AtetData / atet_data.cpp).
+    bool found = false;
+    for (const char* dat_name : {"ATET.DAT", "saba.dat", "SABA.DAT"}) {
+      if (ReadBinaryAsset((dir + dat_name).c_str(), &bytes, &ignored) &&
+          atet_data_.LoadFromDat(bytes, &dat_error)) {
+        loaded = true;
+        found = true;
+        break;
+      }
+    }
+    if (found) {
       break;
     }
-    for (const char* archive_name : {"AcidTetris.zip", "ATETRIS.ZIP", "acidtetris.zip"}) {
+    // Or an intact archive of either release; LoadFromZip extracts the data file.
+    for (const char* archive_name :
+         {"AcidTetris.zip", "ATETRIS.ZIP", "acidtetris.zip", "saba.zip", "SABA.ZIP"}) {
       if (ReadBinaryAsset((dir + archive_name).c_str(), &bytes, &ignored) &&
           atet_data_.LoadFromZip(bytes, &dat_error)) {
         loaded = true;
@@ -902,7 +915,8 @@ bool MilestoneADemo::Initialize(SDL_Renderer* renderer, std::string* error_out, 
   if (!loaded) {
     SetErrorMessage(error_out,
                     "Could not load the game data (" + dat_error +
-                        "). Place ATET.DAT or the ACiD Tetris archive (AcidTetris.zip) beside the executable.");
+                        "). Place ATET.DAT (or SABA's saba.dat), or an ACiD Tetris / SABA "
+                        "archive, beside the executable.");
     return false;
   }
 
