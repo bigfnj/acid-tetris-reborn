@@ -133,3 +133,12 @@ if(WIN32)
     COMMAND_EXPAND_LISTS
     VERBATIM)
 endif()
+
+# On Linux, bake an $ORIGIN rpath so the binary finds a co-located libSDL3.so.0 (the
+# way the Windows exe finds SDL3.dll beside it). A packaged release is then just the
+# bare native binary + the .so in one folder -- no launcher script / LD_LIBRARY_PATH.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  set_target_properties(acid_tetris_port PROPERTIES
+    BUILD_WITH_INSTALL_RPATH TRUE
+    INSTALL_RPATH "$ORIGIN")
+endif()
