@@ -69,8 +69,14 @@ chk_seed 7 2
 
 echo "[4] SFX mixer (pan + half-volume + engine curve)"
 "$exe" --live-demo --start-level=9 --piece-seed=7 --smoke-frames=900 > "$tmp/sfx.txt" 2>&1
-grep -q "SFX mix: slot=0 vol%=45 engine=28/64 pan=107 class=0" "$tmp/sfx.txt" \
-  && pass "piece-lock pan=107 half-vol(45)->engine 28" || fail "piece-lock pan/half-volume mismatch ($(grep -m1 -o 'SFX mix: slot=0.*' "$tmp/sfx.txt"))"
+# The first lock is the spawn T dropped in place on columns 4-6. The original pans the lock sound
+# from the piece's reference x, the origin of its authored 4x4 box (x = 3 here):
+# (3 - 5) * 21 + 0x80 = 86. This check used to grep for pan=107 anywhere in the log: 107 is the
+# leftmost-column formula the port shipped (audit finding SX-04), and a later horizontal I lock
+# (reference x 4) also prints 107, so the old grep could not tell the two formulas apart.
+first_lock="$(grep -m1 -o 'SFX mix: slot=0 vol%=[0-9]* engine=[0-9]*/64 pan=[0-9]* class=[0-9]*' "$tmp/sfx.txt")"
+[ "$first_lock" = "SFX mix: slot=0 vol%=45 engine=28/64 pan=86 class=0" ] \
+  && pass "first piece-lock pan=86 half-vol(45)->engine 28" || fail "piece-lock pan/half-volume mismatch (${first_lock:-none})"
 grep -q "SFX mix: slot=10 vol%=90 engine=57/64" "$tmp/sfx.txt" \
   && pass "line-clear engine curve 90->57" || fail "engine curve mismatch"
 

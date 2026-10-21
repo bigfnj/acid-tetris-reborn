@@ -56,14 +56,16 @@ endif()
 # --- libmikmod: tracker music playback ---------------------------------------
 # The original ACiD Tetris used MikMod (its "Music System" credit names MikMod's
 # author) and embeds MikMod UN05 modules, so libmikmod reproduces the original
-# music engine. Build a static core with WinMM output on Windows. The libmikmod
-# docs target needs makeinfo, which is not required here; EXCLUDE_FROM_ALL keeps
-# it out of the default build so only the linked mikmod-static target is built.
+# music engine. Build a static core with no output driver of its own: the port
+# registers its own driver (src/audio_mixer.cpp), a MikMod 2.x-style mixer that
+# feeds SDL3 on every platform. The libmikmod docs target needs makeinfo, which
+# is not required here; EXCLUDE_FROM_ALL keeps it out of the default build so
+# only the linked mikmod-static target is built.
 set(ENABLE_SHARED OFF CACHE BOOL "" FORCE)
 set(ENABLE_STATIC ON  CACHE BOOL "" FORCE)
 set(ENABLE_DSOUND OFF CACHE BOOL "" FORCE)
 set(ENABLE_WASAPI OFF CACHE BOOL "" FORCE)
-set(ENABLE_WINMM  ON  CACHE BOOL "" FORCE)
+set(ENABLE_WINMM  OFF CACHE BOOL "" FORCE)
 set(ENABLE_SDL    OFF CACHE BOOL "" FORCE)
 set(ENABLE_OPENAL OFF CACHE BOOL "" FORCE)
 set(ENABLE_WAV    OFF CACHE BOOL "" FORCE)
@@ -78,6 +80,11 @@ FetchContent_Declare(
   EXCLUDE_FROM_ALL
   SYSTEM)
 FetchContent_MakeAvailable(libmikmod)
+# MikMod 2.x player semantics (period table, frequency constant, linear frequencies,
+# volume chain, E8x panning, start skip), compiled from a patched copy of mplayer.c
+# in the build tree and enabled at run time by the port; see the module for details.
+include(cmake/libmikmod_mm2_compat.cmake)
+atet_libmikmod_mm2_compat(mikmod-static "${libmikmod_SOURCE_DIR}/libmikmod")
 
 # WIN32 -> Windows GUI subsystem (no console window on double-click); ignored on
 # other platforms. The SDL_main entry shim (SDL3::SDL3main + <SDL3/SDL_main.h>)
@@ -85,10 +92,12 @@ FetchContent_MakeAvailable(libmikmod)
 add_executable(acid_tetris_port WIN32
   src/main.cpp
   src/atet_data.cpp
+  src/audio_mixer.cpp
   src/audio_probe.cpp
   src/indexed_asset_loader.cpp
   src/milestone_a_demo.cpp
   src/music_player.cpp
+  src/audit_instrument.cpp  # audit/instrument worktree only
   third_party/miniz/miniz.c
 )
 
@@ -111,7 +120,6 @@ if(TARGET SDL3::SDL3main)
   target_link_libraries(acid_tetris_port PRIVATE SDL3::SDL3main)
 endif()
 if(WIN32)
-  target_compile_definitions(acid_tetris_port PRIVATE ATET_PORT_HAVE_WINMM)
   target_sources(acid_tetris_port PRIVATE app_icon.rc)  # embeds the taskbar/Explorer icon
 endif()
 

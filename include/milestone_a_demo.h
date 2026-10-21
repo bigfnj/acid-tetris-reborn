@@ -14,9 +14,24 @@
 
 namespace atet {
 
+class JsonOut;  // audit_instrument.h (audit worktree only)
+
 class MilestoneADemo {
  public:
   MilestoneADemo() = default;
+
+  // ---- Audit instrumentation (audit/instrument worktree only; diagnostics) ----
+  // Called by main at the top of each loop iteration: resets per-step
+  // accumulators (RNG draws, gravity bracket, emitted events, particle spawns).
+  void AuditBeginStep(std::uint64_t step);
+  // Labels where emitted audio events originate: "input", "tick", "render".
+  void AuditSetStage(const char* stage) { audit_stage_ = stage; }
+  // Full post-iteration state snapshot (see harness/port/README.md for fields).
+  void AuditWriteState(JsonOut& json, bool include_rng_values) const;
+  // Presentation counters that Render() consumes/advances (sampled pre-render).
+  void AuditWritePresentation(JsonOut& json) const;
+  // Audio events pushed by EmitAudioEvent/EmitMusicEvent during this step.
+  void AuditWriteEmittedEvents(JsonOut& json) const;
   MilestoneADemo(const MilestoneADemo&) = delete;
   MilestoneADemo& operator=(const MilestoneADemo&) = delete;
 
@@ -34,7 +49,7 @@ class MilestoneADemo {
     int music_volume = 0;
     int sfx_volume = 0;
     int pan = 0x80;         // 0x6817 ECX: 0x80 centered, offsets bias left/right
-    int voice_class = 0;    // 0x6817 EDX: coarse playback-class offset (0 UI, 1 warning)
+    int voice_class = 0;    // 0x6817 EDX: SFX voice (0 lock and menu blips, 1 every other effect)
   };
 
   bool Initialize(SDL_Renderer* renderer, std::string* error_out, bool start_in_sound_setup = false);
@@ -54,6 +69,17 @@ class MilestoneADemo {
   [[nodiscard]] std::string debug_state_line() const;
   [[nodiscard]] int current_preset_index() const { return gameplay_preset_index_; }
   [[nodiscard]] bool quit_requested() const { return quit_requested_; }
+  // SETUP.DAT sound choices as loaded (or reset), for the audio mixer's start-up configuration
+  // (the original passes them to its sound init 0x668C). device 4 is "None".
+  struct SoundSetup {
+    int device = 0;
+    int mix_rate = 44100;
+    bool stereo = true;
+    bool sixteen_bit = true;
+  };
+  [[nodiscard]] SoundSetup sound_setup() const {
+    return SoundSetup{sound_device_index_, mixing_rate_hz_, stereo_flag_ != 0, bit_depth_flag_ != 0};
+  }
   void set_debug_state_logging(bool enabled) { debug_state_logging_ = enabled; }
   void set_audio_event_callback(std::function<void(const AudioEventNotification&)> callback) {
     audio_event_callback_ = std::move(callback);
@@ -277,10 +303,12 @@ class MilestoneADemo {
   void PersistSetupState() const;
   // sfx_volume_override < 0 uses the saved SFX volume; the piece-lock sound
   // passes half (the original halves the 0x6817 volume arg for that call only).
-  void EmitAudioEvent(const char* event_name, int slot, int pan = 0x80, int voice_class = 0, int sfx_volume_override = -1);
+  // voice_class < 0 takes the original's class for the slot: 0 for the lock and
+  // the menu blips (slots 0 and 1), 1 for every other effect (0x6817 EDX).
+  void EmitAudioEvent(const char* event_name, int slot, int pan = 0x80, int voice_class = -1, int sfx_volume_override = -1);
   void EmitMusicEvent(const char* event_name);
-  // Map a live piece column to a 0x6817 pan value around center (modeled: the
-  // exact original board-position-to-pan curve is not recovered).
+  // Lock-sound pan for the live piece (piece_x = live_piece_.x): 0x0D23-0x0D4E
+  // pan = (x - 5) * 21 + 0x80 on the piece's reference x, wrapped to 8 bits.
   [[nodiscard]] int PanForPieceColumn(int piece_x) const;
   void FlushAudioEvents();
   void StartCurrentMusic(const char* reason);
@@ -418,6 +446,38 @@ class MilestoneADemo {
   int top_out_dissolved_rows_ = 0;
 
   AtetData atet_data_;
+
+  // ---- Audit instrumentation state (never read by game logic) ----
+  struct AuditEmitted {
+    std::string stage;
+    std::string name;
+    bool is_sfx = false;
+    int slot = 0;
+    int track = 0;
+    int music_volume = 0;
+    int sfx_volume = 0;
+    int pan = 0x80;
+    int voice_class = 0;
+  };
+  std::uint64_t audit_step_ = 0;
+  const char* audit_stage_ = "setup";
+  std::vector<AuditEmitted> audit_emitted_;
+  int audit_rng_index_before_ = 0;
+  std::uint32_t audit_rng_draws_ = 0;
+  std::uint64_t audit_rng_hash_ = 0;
+  std::vector<std::uint32_t> audit_rng_values_;
+  bool audit_gravity_active_ = false;
+  int audit_gravity_rate_ = 0;
+  int audit_gravity_acc_before_ = 0;
+  int audit_descent_attempts_ = 0;
+  int audit_descent_successes_ = 0;
+  int audit_score_before_ = 0;
+  std::uint32_t audit_particles_spawned_ = 0;
+  std::uint32_t audit_particles_dropped_ = 0;
+  std::uint32_t audit_particles_retired_ = 0;
+  std::array<bool, 256> audit_pressed_{};
+  std::array<bool, 256> audit_released_{};
+  std::array<bool, 256> audit_held_at_step_start_{};
 };
 
 }  // namespace atet
