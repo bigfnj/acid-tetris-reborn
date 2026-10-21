@@ -14,9 +14,24 @@
 
 namespace atet {
 
+class JsonOut;  // audit_instrument.h (audit worktree only)
+
 class MilestoneADemo {
  public:
   MilestoneADemo() = default;
+
+  // ---- Audit instrumentation (audit/instrument worktree only; diagnostics) ----
+  // Called by main at the top of each loop iteration: resets per-step
+  // accumulators (RNG draws, gravity bracket, emitted events, particle spawns).
+  void AuditBeginStep(std::uint64_t step);
+  // Labels where emitted audio events originate: "input", "tick", "render".
+  void AuditSetStage(const char* stage) { audit_stage_ = stage; }
+  // Full post-iteration state snapshot (see harness/port/README.md for fields).
+  void AuditWriteState(JsonOut& json, bool include_rng_values) const;
+  // Presentation counters that Render() consumes/advances (sampled pre-render).
+  void AuditWritePresentation(JsonOut& json) const;
+  // Audio events pushed by EmitAudioEvent/EmitMusicEvent during this step.
+  void AuditWriteEmittedEvents(JsonOut& json) const;
   MilestoneADemo(const MilestoneADemo&) = delete;
   MilestoneADemo& operator=(const MilestoneADemo&) = delete;
 
@@ -43,7 +58,9 @@ class MilestoneADemo {
   void HandleKeyUp(SDL_Keycode key);
   void ResetBuildLocalSetupState();
   void BeginLiveGameplayDemo(int simulated_clear_count = 0);
-  void BeginTopOutDemo(int score, int lines);
+  // announce=false: the top-out sound was already played (a top-out armed in a clearing lock step
+  // plays it there and enters this scene only when the collapse ends).
+  void BeginTopOutDemo(int score, int lines, bool announce = true);
   void InjectFilledRowsForSmoke(int row_count);
   bool CaptureGameplaySnapshot(SDL_Renderer* renderer);
   void Tick();
@@ -58,7 +75,16 @@ class MilestoneADemo {
   void set_audio_event_callback(std::function<void(const AudioEventNotification&)> callback) {
     audio_event_callback_ = std::move(callback);
   }
-  void set_piece_seed(std::uint32_t seed) { piece_seed_ = seed == 0 ? 1 : seed; }
+  // --piece-seed=N: every New Game seeds the piece RNG with exactly N (0 included). Without it a
+  // New Game seeds with the logic tick counter, as the original's table fill 0x32B0 does with the
+  // 60 Hz tick count [0x2D2A3] (called from New Game 0x5E0 at 0x6F8).
+  void set_piece_seed(std::uint32_t seed) {
+    piece_seed_override_ = seed;
+    has_piece_seed_override_ = true;
+  }
+  // Logic steps since startup: the port's stand-in for the original's PIT tick counter [0x2D2A3]
+  // (installed at 0x16D, before the splash screens; incremented once per Tick()).
+  [[nodiscard]] std::uint32_t logic_tick() const { return logic_tick_; }
   void set_start_level_override(int level);
   // Disable the gameplay<->frontend/boot screen fades (used by --no-fade and by
   // the --live-demo/--topout-demo shortcuts for frame-deterministic smoke runs).
@@ -119,6 +145,10 @@ class MilestoneADemo {
     int lines = 0;
   };
 
+  // The falling piece as the original keeps it: id [0x2C71F] (0..6 = S Z J L T I O, the order of
+  // the authored table at 0x184E3), rotation [0x2C733] (0..3), reference position x [0x2C737] /
+  // y [0x2C71B]. Its cells are (x + dx, y + dy) with the table offsets, so x goes negative at the
+  // left wall and cells above the well (row < 0) are legal.
   struct LivePiece {
     int type = 0;
     int rotation = 0;
@@ -157,9 +187,13 @@ class MilestoneADemo {
     int lines = 0;
     int level = 0;
     int gravity_accumulator = 0;
-    int lock_frames = 0;
+    std::array<int, 4> repeat_timers{};
     int down_lockout_frames = 0;
     int collapse_frame = 0;
+    int collapse_step = 0;
+    int collapse_batch = 0;
+    bool live_piece_hidden = false;
+    bool top_out_after_collapse = false;
     int top_out_frame = 0;
     int warning_band = 0;
     std::array<int, 3> warning_cooldowns{};
@@ -238,21 +272,23 @@ class MilestoneADemo {
   bool HandleGameplayBinding(SDL_Keycode key);
   bool HandleHighScoreNameEntry(SDL_Keycode key);
   void CommitHighScoreNameEntry();
-  bool TryMoveLivePiece(int delta_x, int delta_y);
-  bool TryRotateLivePiece(int delta_rotation);
   bool CanPlaceLivePiece(const LivePiece& piece) const;
   void ResetLiveGameplayState();
   bool SpawnNextLivePiece();
-  void CommitLivePieceToBoard();
+  void CommitLivePieceToBoard(int lock_y);
   void StepLiveGameplay();
+  bool GameplayKeyHeld(int binding) const;
+  void StepGameplayInput();
   void StepFallingGameplay();
+  void LockLivePiece(int lock_y);
   void StepCollapseGameplay();
   void StepTopOutGameplay();
   int CurrentDropIncrement() const;
   void BeginLineCollapse(const std::vector<int>& rows);
+  std::vector<int> FullRowsAroundLock(int lock_y) const;
   std::vector<int> DetectFullRows() const;
   void ApplyLineClearScore(int clear_count);
-  void CollapseMarkedRows();
+  void CompactClearedRow(int row);
   void SeedLineClearDebris(const std::vector<int>& rows);
   // One of the ten level%10 row-clear emitters (0x14b4..0x1c40): draws the
   // family's RNG (for the burst families) and spawns a particle for the sampled
@@ -335,16 +371,29 @@ class MilestoneADemo {
   int live_score_ = 0;
   int live_lines_ = 0;
   int live_level_ = 0;
-  std::uint32_t piece_seed_ = 0x41C64E6D;
-  std::uint32_t gameplay_random_state_ = 0x41C64E6D;
+  // Seed of the RNG table in use: 0 from the startup fill, then the tick count (or --piece-seed) at
+  // each New Game.
+  std::uint32_t piece_seed_ = 0;
+  std::uint32_t piece_seed_override_ = 0;
+  bool has_piece_seed_override_ = false;
+  std::uint32_t logic_tick_ = 0;
+  std::uint32_t gameplay_random_state_ = 0;
   std::array<std::uint32_t, 8192> gameplay_random_table_{};
   int gameplay_random_index_ = 0;
   GameplayPhase gameplay_phase_ = GameplayPhase::kFalling;
   int gravity_accumulator_ = 0;
-  int lock_frames_ = 0;
+  // 0x9C8's repeat timers for Left [0x2C77F], Right [0x2C77B], A [0x2C777], S [0x2C773].
+  std::array<int, 4> repeat_timers_{};
+  // Down lockout [0x2C783]: armed with 0x348 by a clearing lock, counted down on live steps, cleared
+  // by any live step with Down up; soft drop needs it at 0.
   int down_lockout_frames_ = 0;
+  // Clear list [0x2C743] in scan order (bottom-up); later entries are bumped as rows compact.
   std::vector<int> pending_clear_rows_;
-  int collapse_frame_ = 0;
+  int collapse_frame_ = 0;            // collapse calls since the clearing lock
+  int collapse_step_ = 0;             // [0x2C78F] 0..7 within the current row
+  int collapse_batch_ = 0;            // [0x2C78B] index of the row being collapsed
+  bool live_piece_hidden_ = false;    // promoted during a clear, not drawn until its first live step
+  bool top_out_after_collapse_ = false;  // spawn failed in a clearing step: dissolve after the collapse
   int gameplay_top_out_frame_ = 0;
   int warning_band_ = 0;
   std::array<int, 3> warning_cooldowns_{};
@@ -418,6 +467,38 @@ class MilestoneADemo {
   int top_out_dissolved_rows_ = 0;
 
   AtetData atet_data_;
+
+  // ---- Audit instrumentation state (never read by game logic) ----
+  struct AuditEmitted {
+    std::string stage;
+    std::string name;
+    bool is_sfx = false;
+    int slot = 0;
+    int track = 0;
+    int music_volume = 0;
+    int sfx_volume = 0;
+    int pan = 0x80;
+    int voice_class = 0;
+  };
+  std::uint64_t audit_step_ = 0;
+  const char* audit_stage_ = "setup";
+  std::vector<AuditEmitted> audit_emitted_;
+  int audit_rng_index_before_ = 0;
+  std::uint32_t audit_rng_draws_ = 0;
+  std::uint64_t audit_rng_hash_ = 0;
+  std::vector<std::uint32_t> audit_rng_values_;
+  bool audit_gravity_active_ = false;
+  int audit_gravity_rate_ = 0;
+  int audit_gravity_acc_before_ = 0;
+  int audit_descent_attempts_ = 0;
+  int audit_descent_successes_ = 0;
+  int audit_score_before_ = 0;
+  std::uint32_t audit_particles_spawned_ = 0;
+  std::uint32_t audit_particles_dropped_ = 0;
+  std::uint32_t audit_particles_retired_ = 0;
+  std::array<bool, 256> audit_pressed_{};
+  std::array<bool, 256> audit_released_{};
+  std::array<bool, 256> audit_held_at_step_start_{};
 };
 
 }  // namespace atet

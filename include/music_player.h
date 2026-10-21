@@ -80,7 +80,19 @@ class MusicPlayer {
   // True while any ramp (fade in/out) or a pending track load is in flight.
   [[nodiscard]] bool fade_active() const { return ramp_mode_ != RampMode::kNone || pending_track_ >= 0; }
 
+  // ---- Audit instrumentation (audit/instrument worktree only) ----
+  // Capture mode: register only libmikmod's nosound driver (VC software mixer, no
+  // device) and do NOT mix inside Update(); the caller pulls exactly the frames it
+  // wants with CaptureMix(). Must be set before Initialize().
+  void SetCaptureMode(bool enabled) { capture_mode_ = enabled; }
+  // Mixes `frames` interleaved stereo int16 frames at md_mixfreq (44100 Hz) through
+  // libmikmod's software mixer (VC_WriteBytes), advancing the player accordingly.
+  size_t CaptureMix(std::int16_t* out, size_t frames);
+  // JSON object: ramp state + libmikmod module position/volume.
+  [[nodiscard]] std::string AuditJson() const;
+
  private:
+  bool capture_mode_ = false;
   enum class RampMode { kNone, kFadeIn, kFadeOut };
 
   bool LoadAndStart(int index, std::string* error_out);

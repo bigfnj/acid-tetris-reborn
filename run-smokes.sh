@@ -59,13 +59,20 @@ for pat in "topout=160" "topout=760" "hsboot=72"; do
 done
 
 echo "[3] deterministic RNG (cross-platform golden)"
-chk_seed(){ # seed expected
-  local got
-  got=$("$exe" --live-demo --piece-seed="$1" --debug-state --smoke-frames=40 2>&1 | grep -m1 -o 'piece=[0-9]*' | sed 's/piece=//')
-  [ "$got" = "$2" ] && pass "seed $1 -> piece $2" || fail "seed $1 -> piece $got (expected $2)"
+# The numeric id alone cannot see which SHAPE the id is bound to (audit PC-16: the old I,O,T,S,Z,J,L
+# table dealt the same ids as the original but drew other shapes), so the spawn cells are checked
+# too: original ids 0..6 = S Z J L T I O (table 0x184E3), spawn x=4 -> id 6 (O) on columns 6-7,
+# id 2 (J, ###/..#) on columns 5-7.
+chk_seed(){ # seed expected_id expected_cells(sorted)
+  local line got cells
+  line=$("$exe" --live-demo --piece-seed="$1" --debug-state --smoke-frames=40 2>&1 | grep -m1 'Debug state:')
+  got=$(echo "$line" | grep -o ' piece=[0-9]*' | sed 's/ piece=//')
+  cells=$(echo "$line" | grep -oE ' cells=[^ ]+' | sed 's/ cells=//' | tr '/' '\n' | sort | paste -sd/ -)
+  [ "$got" = "$2" ] && [ "$cells" = "$3" ] && pass "seed $1 -> piece $2 cells $3" \
+    || fail "seed $1 -> piece $got cells ${cells:-none} (expected $2 cells $3)"
 }
-chk_seed 42 6
-chk_seed 7 2
+chk_seed 42 6 "6:0/6:1/7:0/7:1"
+chk_seed 7 2 "5:0/6:0/7:0/7:1"
 
 echo "[4] SFX mixer (pan + half-volume + engine curve)"
 "$exe" --live-demo --start-level=9 --piece-seed=7 --smoke-frames=900 > "$tmp/sfx.txt" 2>&1

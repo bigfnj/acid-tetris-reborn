@@ -14,8 +14,26 @@
 #include <vector>
 
 #include "indexed_asset_loader.h"
+#include "audit_instrument.h"
+
+// Audit instrumentation: count the SDL draw API calls the demo issues per frame.
+// A function-like macro does not re-expand inside its own replacement, so the
+// inner call reaches the real SDL function.
+#define SDL_RenderTexture(...) (++::atet::g_audit.render_texture_calls, SDL_RenderTexture(__VA_ARGS__))
+#define SDL_RenderFillRect(...) (++::atet::g_audit.fill_rect_calls, SDL_RenderFillRect(__VA_ARGS__))
+#define SDL_SetRenderDrawColor(...) (++::atet::g_audit.draw_color_calls, SDL_SetRenderDrawColor(__VA_ARGS__))
 
 namespace atet {
+
+namespace {
+// Scoped perf-counter accumulator for the audit sub-phase timers.
+struct AuditScopedTicks {
+  explicit AuditScopedTicks(std::uint64_t* sink) : sink_(sink), start_(SDL_GetPerformanceCounter()) {}
+  ~AuditScopedTicks() { *sink_ += SDL_GetPerformanceCounter() - start_; }
+  std::uint64_t* sink_;
+  std::uint64_t start_;
+};
+}  // namespace
 
 namespace {
 
@@ -56,16 +74,20 @@ constexpr int kFrontendRowRevealIntervalFrames = 4;
 constexpr int kCreditsPageFrames = 360;
 constexpr int kFrontendHoldStartFrames = 12;
 constexpr int kFrontendHoldRepeatFrames = 4;
+// 0x9C8 (0xB33/0xB91/0xBFF/0xC6F): a Left/Right/A/S action reloads its repeat timer with 8.
 constexpr int kGameplayBindingRepeatFrames = 8;
 constexpr int kGameplayGravityThreshold = 0x10000;
-// RE gameplay-input-timing-pass: while Down is held the per-frame gravity increment
-// is overridden to 0x8000 (half the descent threshold) => one row every two frames.
+// 0x9C8 0xCB4..0xCBD: while Down is held and the Down lockout is 0 the per-step gravity increment
+// is replaced by 0x8000 (half the descent threshold) => one row every two steps.
 constexpr int kSoftDropIncrement = 0x8000;
-constexpr int kGameplayLockFrames = 24;
-constexpr int kGameplayCollapseFramesPerRow = 12;
+// 0x1D04: each cleared row is collapsed over 8 calls (0x1D68 cmp ebx,8), one call per step.
+constexpr int kCollapseStepsPerRow = 8;
+// 0x9C8 0xE6F..0xE76: a clearing lock arms the Down lockout [0x2C783] with 0x348 live steps.
+constexpr int kDownLockoutAfterClear = 0x348;
+// 0x1348 0x13C6..0x13DF: every promoted piece starts at x=4, y=0, rotation 0.
+constexpr int kSpawnX = 4;
 constexpr int kGameplayMaxDebrisParticles = 4096;  // 0x1000, matching the original particle-pool cap
 constexpr int kDebrisAgeFull = 0x400;              // age accumulator reaches this at end of life (4 stages of 0x100)
-constexpr int kGameplayDownLockoutFrames = 8;
 constexpr int kWarningLowRow = 8;
 constexpr int kWarningMediumRow = 5;
 constexpr int kWarningHighRow = 2;
@@ -155,14 +177,56 @@ struct DefaultHighScoreRecord {
   int lines;
 };
 
-constexpr std::array<std::array<CellOffset, 4>, 7> kTetrominoShapes = {{
-    {{{0, 0}, {1, 0}, {2, 0}, {3, 0}}},
-    {{{0, 0}, {1, 0}, {0, 1}, {1, 1}}},
-    {{{0, 0}, {1, 0}, {2, 0}, {1, 1}}},
-    {{{1, 0}, {2, 0}, {0, 1}, {1, 1}}},
-    {{{0, 0}, {1, 0}, {1, 1}, {2, 1}}},
-    {{{0, 0}, {0, 1}, {1, 1}, {2, 1}}},
-    {{{2, 0}, {0, 1}, {1, 1}, {2, 1}}},
+// The original's authored piece table (flat 0x184E3, 7 ids x 4 rotations x 4 cells of int32 (dx,dy),
+// 896 bytes, sha256 330c1ec9...; read by collision 0x12AC, lock 0x9C8 0xD6B and draw 0x10EC). Ids are
+// the RNG value % 7 and also select the chunk-3 tile and the statistics row: 0 S, 1 Z, 2 J, 3 L, 4 T,
+// 5 I, 6 O. Rotation +1 (key A) is clockwise on screen; S, Z and I have two distinct states, and the
+// offsets keep the pieces' turning cell fixed, so x/y never change on a turn. Cells are listed in the
+// table's own order.
+constexpr int kPieceCount = 7;
+constexpr std::array<std::array<std::array<CellOffset, 4>, 4>, kPieceCount> kPieceTable = {{
+    {{  // 0 S
+        {{{1, 1}, {2, 1}, {2, 0}, {3, 0}}},
+        {{{2, -1}, {2, 0}, {3, 0}, {3, 1}}},
+        {{{1, 1}, {2, 1}, {2, 0}, {3, 0}}},
+        {{{2, -1}, {2, 0}, {3, 0}, {3, 1}}},
+    }},
+    {{  // 1 Z
+        {{{1, 0}, {2, 0}, {2, 1}, {3, 1}}},
+        {{{3, -1}, {3, 0}, {2, 0}, {2, 1}}},
+        {{{1, 0}, {2, 0}, {2, 1}, {3, 1}}},
+        {{{3, -1}, {3, 0}, {2, 0}, {2, 1}}},
+    }},
+    {{  // 2 J
+        {{{1, 0}, {2, 0}, {3, 0}, {3, 1}}},
+        {{{2, -1}, {2, 0}, {2, 1}, {1, 1}}},
+        {{{1, 0}, {2, 0}, {3, 0}, {1, -1}}},
+        {{{2, -1}, {2, 0}, {2, 1}, {3, -1}}},
+    }},
+    {{  // 3 L
+        {{{1, 0}, {2, 0}, {3, 0}, {1, 1}}},
+        {{{2, -1}, {2, 0}, {2, 1}, {1, -1}}},
+        {{{1, 0}, {2, 0}, {3, 0}, {3, -1}}},
+        {{{2, -1}, {2, 0}, {2, 1}, {3, 1}}},
+    }},
+    {{  // 4 T
+        {{{1, 0}, {2, 0}, {3, 0}, {2, 1}}},
+        {{{2, -1}, {2, 0}, {2, 1}, {1, 0}}},
+        {{{1, 0}, {2, 0}, {3, 0}, {2, -1}}},
+        {{{2, -1}, {2, 0}, {2, 1}, {3, 0}}},
+    }},
+    {{  // 5 I
+        {{{0, 0}, {1, 0}, {2, 0}, {3, 0}}},
+        {{{2, -2}, {2, -1}, {2, 0}, {2, 1}}},
+        {{{0, 0}, {1, 0}, {2, 0}, {3, 0}}},
+        {{{2, -2}, {2, -1}, {2, 0}, {2, 1}}},
+    }},
+    {{  // 6 O
+        {{{2, 0}, {3, 0}, {2, 1}, {3, 1}}},
+        {{{2, 0}, {3, 0}, {2, 1}, {3, 1}}},
+        {{{2, 0}, {3, 0}, {2, 1}, {3, 1}}},
+        {{{2, 0}, {3, 0}, {2, 1}, {3, 1}}},
+    }},
 }};
 
 const std::array<GameplayPreset, 3> kGameplayPresets = {{
@@ -768,6 +832,14 @@ void DrawPieceTile(SDL_Renderer* renderer, SDL_Texture* atlas, int atlas_index, 
   SDL_RenderTexture(renderer, atlas, &source, &destination);
 }
 
+// Cells of piece `id` in `rotation`, straight from the authored table (0x12AC masks the rotation
+// with 3). Nothing is synthesised or re-anchored.
+std::array<CellOffset, 4> RotatedCells(int id, int rotation) {
+  return kPieceTable[static_cast<size_t>(NormalizeModulo(id, kPieceCount))][static_cast<size_t>(rotation & 3)];
+}
+
+// Debug overlay presets only (keys 1-3, not gameplay): rotation-0 cells moved to start at (0,0)
+// so the hand-placed preset pieces stay inside the well.
 void DrawTetromino(
     SDL_Renderer* renderer,
     SDL_Texture* atlas,
@@ -775,46 +847,39 @@ void DrawTetromino(
     int shape_index,
     int screen_x,
     int screen_y) {
-  const auto& shape = kTetrominoShapes[shape_index % static_cast<int>(kTetrominoShapes.size())];
-  for (const CellOffset& cell : shape) {
-    DrawPieceTile(
-        renderer,
-        atlas,
-        atlas_index,
-        screen_x + (cell.x * kPieceTileSize),
-        screen_y + (cell.y * kPieceTileSize));
-  }
-}
-
-std::array<CellOffset, 4> RotatedCells(int shape_index, int rotation) {
-  std::array<CellOffset, 4> cells = kTetrominoShapes[NormalizeModulo(shape_index, static_cast<int>(kTetrominoShapes.size()))];
-  rotation = NormalizeModulo(rotation, 4);
-  for (CellOffset& cell : cells) {
-    int x = cell.x;
-    int y = cell.y;
-    for (int step = 0; step < rotation; ++step) {
-      const int rotated_x = y;
-      const int rotated_y = -x;
-      x = rotated_x;
-      y = rotated_y;
-    }
-    cell = {x, y};
-  }
-
+  const std::array<CellOffset, 4> cells = RotatedCells(shape_index, 0);
   int min_x = cells[0].x;
   int min_y = cells[0].y;
   for (const CellOffset& cell : cells) {
     min_x = std::min(min_x, cell.x);
     min_y = std::min(min_y, cell.y);
   }
-
-  for (CellOffset& cell : cells) {
-    cell.x -= min_x;
-    cell.y -= min_y;
+  for (const CellOffset& cell : cells) {
+    DrawPieceTile(
+        renderer,
+        atlas,
+        atlas_index,
+        screen_x + ((cell.x - min_x) * kPieceTileSize),
+        screen_y + ((cell.y - min_y) * kPieceTileSize));
   }
-  return cells;
 }
 
+// NEXT preview, 0x1348 -> 0x10EC(0x1E, 0x38, next, 0): rotation-0 cells at (30 + 8dx, 56 + 8dy) with
+// the raw table offsets, so every piece's right edge is x 61 (3-wide pieces 38..61, the I 30..61,
+// the O 46..61).
+void DrawPreviewPiece(SDL_Renderer* renderer, SDL_Texture* atlas, int id) {
+  for (const CellOffset& cell : RotatedCells(id, 0)) {
+    DrawPieceTile(
+        renderer,
+        atlas,
+        NormalizeModulo(id, kPieceCount),
+        kPreviewX + (cell.x * kPieceTileSize),
+        kPreviewY + (cell.y * kPieceTileSize));
+  }
+}
+
+// The falling piece, 0x10EC: tile = id, cell (x+dx, y+dy) at (109 + 8(x+dx), 21 + 8(y+dy)); cells
+// above the well (screen y < 21, i.e. row < 0) are skipped (0x113C).
 void DrawLiveTetromino(
     SDL_Renderer* renderer,
     SDL_Texture* atlas,
@@ -822,12 +887,14 @@ void DrawLiveTetromino(
     int rotation,
     int board_x,
     int board_y) {
-  const std::array<CellOffset, 4> cells = RotatedCells(piece_type, rotation);
-  for (const CellOffset& cell : cells) {
+  for (const CellOffset& cell : RotatedCells(piece_type, rotation)) {
+    if (board_y + cell.y < 0) {
+      continue;
+    }
     DrawPieceTile(
         renderer,
         atlas,
-        NormalizeModulo(piece_type, static_cast<int>(kTetrominoShapes.size())),
+        NormalizeModulo(piece_type, kPieceCount),
         kGameplayClearX + ((board_x + cell.x) * kPieceTileSize),
         kGameplayClearY + ((board_y + cell.y) * kPieceTileSize));
   }
@@ -872,6 +939,7 @@ bool MilestoneADemo::Initialize(SDL_Renderer* renderer, std::string* error_out, 
   // ATETRIS.ZIP, ATET.DAT extracted via miniz), first next to the executable
   // (portable / release layout, robust to the build machine's drive letter), then
   // the working directory, then the build-tree ATET.DAT as a dev fallback.
+  const Uint64 audit_t_data = SDL_GetPerformanceCounter();
   std::string dat_error = "not found";
   bool loaded = false;
   std::vector<std::string> search_dirs;
@@ -892,6 +960,7 @@ bool MilestoneADemo::Initialize(SDL_Renderer* renderer, std::string* error_out, 
           atet_data_.LoadFromDat(bytes, &dat_error)) {
         loaded = true;
         found = true;
+        g_audit_startup.data_source = dir + dat_name;
         break;
       }
     }
@@ -904,6 +973,7 @@ bool MilestoneADemo::Initialize(SDL_Renderer* renderer, std::string* error_out, 
       if (ReadBinaryAsset((dir + archive_name).c_str(), &bytes, &ignored) &&
           atet_data_.LoadFromZip(bytes, &dat_error)) {
         loaded = true;
+        g_audit_startup.data_source = dir + archive_name;
         break;
       }
     }
@@ -917,8 +987,11 @@ bool MilestoneADemo::Initialize(SDL_Renderer* renderer, std::string* error_out, 
     if (ReadBinaryAsset(ATET_PORT_ATET_DAT_PATH, &bytes, &ignored) &&
         atet_data_.LoadFromDat(bytes, &dat_error)) {
       loaded = true;
+      g_audit_startup.data_source = std::string("compiled-fallback:") + ATET_PORT_ATET_DAT_PATH;
     }
   }
+  g_audit_startup.data_ticks = SDL_GetPerformanceCounter() - audit_t_data;
+  const Uint64 audit_t_textures = SDL_GetPerformanceCounter();
   if (!loaded) {
     SetErrorMessage(error_out,
                     "Could not load the game data (" + dat_error +
@@ -957,6 +1030,8 @@ bool MilestoneADemo::Initialize(SDL_Renderer* renderer, std::string* error_out, 
     }
   }
 
+  g_audit_startup.textures_ticks = SDL_GetPerformanceCounter() - audit_t_textures;
+  const Uint64 audit_t_tables = SDL_GetPerformanceCounter();
   if (!LoadFrontendFont(error_out)) {
     return false;
   }
@@ -968,6 +1043,8 @@ bool MilestoneADemo::Initialize(SDL_Renderer* renderer, std::string* error_out, 
   if (!LoadGameplayParticleAssets(error_out)) {
     return false;
   }
+  g_audit_startup.tables_ticks = SDL_GetPerformanceCounter() - audit_t_tables;
+  const Uint64 audit_t_setup = SDL_GetPerformanceCounter();
 
   scene_ = Scene::kFrontend;
   SetFrontendView(FrontendView::kMainMenu, 0);
@@ -993,16 +1070,25 @@ bool MilestoneADemo::Initialize(SDL_Renderer* renderer, std::string* error_out, 
   live_level_ = 0;
   gameplay_phase_ = GameplayPhase::kFalling;
   gravity_accumulator_ = 0;
-  lock_frames_ = 0;
+  repeat_timers_.fill(0);
   down_lockout_frames_ = 0;
   pending_clear_rows_.clear();
   collapse_frame_ = 0;
+  collapse_step_ = 0;
+  collapse_batch_ = 0;
+  live_piece_hidden_ = false;
+  top_out_after_collapse_ = false;
   gameplay_top_out_frame_ = 0;
   warning_band_ = 0;
   warning_cooldowns_.fill(0);
   debris_particles_.clear();
   live_snapshot_ = LiveSnapshot{};
   gameplay_snapshot_texture_valid_ = false;
+  // Startup: main fills the shared RNG table at 0x150 with srand([0x2D2A3]) = srand(0), before the
+  // PIT is installed at 0x16D; the tick counter starts from 0 there.
+  logic_tick_ = 0;
+  piece_seed_ = 0;
+  RefillGameplayRandomTable();
   last_clear_was_four_ = false;
   sleepy_ = false;
   frames_since_clear_ = 0;
@@ -1026,6 +1112,7 @@ bool MilestoneADemo::Initialize(SDL_Renderer* renderer, std::string* error_out, 
   if (error_out != nullptr) {
     error_out->clear();
   }
+  g_audit_startup.setup_ticks = SDL_GetPerformanceCounter() - audit_t_setup;
 
   return true;
 }
@@ -1040,11 +1127,13 @@ void MilestoneADemo::ResetBuildLocalSetupState() {
 }
 
 bool MilestoneADemo::HandleKeyDown(SDL_Keycode key) {
-  // Input is blocked while a gameplay<->frontend screen fade is in progress.
+  // The original's keyboard ISR 0x0800 keeps the held-key table current at all times, fades
+  // included, so a key pressed during the New Game fade-in is already held on the first gameplay
+  // step. Track it first; only the key's actions are blocked during a fade.
+  TrackKeyDown(key);
   if (screen_fade_ != ScreenFade::kNone) {
     return false;
   }
-  TrackKeyDown(key);
 
   if (scene_ == Scene::kSplash) {
     if (key == SDLK_RETURN || key == SDLK_SPACE || key == SDLK_ESCAPE || key == SDLK_BACKSPACE) {
@@ -1226,6 +1315,10 @@ void MilestoneADemo::HandleKeyUp(SDL_Keycode key) {
 }
 
 void MilestoneADemo::Tick() {
+  // One logic tick. The original's 60 Hz PIT counter [0x2D2A3] runs from startup through every
+  // screen and fade; New Game seeds the piece RNG from it (0x32B0).
+  ++logic_tick_;
+
   // While a screen fade is in progress the original busy-waits on the timer and
   // does not advance game logic; freeze everything except the fade (and audio
   // delivery) until it completes.
@@ -1263,23 +1356,9 @@ void MilestoneADemo::Tick() {
   }
 
   if (live_game_active_) {
-    // Soft-drop is polled per frame inside the gravity step (CurrentDropIncrement):
-    // while Down is held the accumulator increment is 0x8000, i.e. one row every two
-    // frames, matching the original. It is deliberately NOT a discrete per-frame row
-    // move here. The move/rotate auto-repeat below excludes binding 0 (Down).
+    // The whole gameplay step, input included (0x9C8): held-key state is read inside the step,
+    // before gravity, with the original's four 8-step repeat timers (StepGameplayInput).
     StepLiveGameplay();
-  }
-
-  for (const int binding_index : {1, 2, 3, 4}) {
-    const std::uint8_t scan_code = keyboard_bindings_[binding_index];
-    if (scan_code == 0 || !held_original_scancodes_[scan_code]) {
-      continue;
-    }
-
-    const int frames = held_original_scancode_frames_[scan_code];
-    if (frames > 0 && frames % kGameplayBindingRepeatFrames == 0) {
-      ApplyGameplayBinding(scan_code, false);
-    }
   }
   FlushAudioEvents();
 }
@@ -1412,17 +1491,27 @@ std::string MilestoneADemo::debug_state_line() const {
     phase = "topout";
   }
 
+  // Absolute cells of the live piece (table 0x184E3 offsets + reference position), e.g. 6:0/7:0/6:1/7:1.
+  std::string cells;
+  for (const CellOffset& cell : RotatedCells(live_piece_.type, live_piece_.rotation)) {
+    cells += (cells.empty() ? "" : "/") + std::to_string(live_piece_.x + cell.x) + ":" +
+             std::to_string(live_piece_.y + cell.y);
+  }
+
   std::ostringstream stream;
   stream << "Debug state: scene=" << scene_name()
          << " phase=" << phase
          << " piece=" << live_piece_.type << ":" << live_piece_.rotation
          << " pos=" << live_piece_.x << "," << live_piece_.y
+         << " cells=" << cells
          << " next=" << live_next_piece_type_
          << " score=" << live_score_
          << " lines=" << live_lines_
          << " level=" << live_level_
          << " gravity=" << gravity_accumulator_
-         << " lock=" << lock_frames_
+         << " lockout=" << down_lockout_frames_
+         << " seed=" << piece_seed_
+         << " tick=" << logic_tick_
          << " rng=" << gameplay_random_index_
          << " clears=" << pending_clear_rows_.size()
          << " collapse=" << collapse_frame_
@@ -1814,6 +1903,7 @@ void MilestoneADemo::RenderFrontendPointfield(SDL_Renderer* renderer) {
   if (frontend_banks_[frontend_current_bank_].empty() || frontend_banks_[frontend_next_bank_].empty()) {
     return;
   }
+  AuditScopedTicks audit_ticks(&g_audit.pointfield_ticks);
 
   const std::vector<FrontendPoint>& current_bank = frontend_banks_[frontend_current_bank_];
   const std::vector<FrontendPoint>& next_bank = frontend_banks_[frontend_next_bank_];
@@ -1868,6 +1958,7 @@ void MilestoneADemo::RenderFrontendPointfield(SDL_Renderer* renderer) {
     };
     SDL_RenderFillRect(renderer, &point_rect);
     occupied[screen_index] = 1;
+    ++g_audit.pointfield_points;
   }
 
   AdvanceFrontendPointfield();
@@ -1877,6 +1968,7 @@ void MilestoneADemo::RenderFrontendRows(
     SDL_Renderer* renderer,
     const std::vector<std::string>& rows,
     int selected_row) const {
+  AuditScopedTicks audit_ticks(&g_audit.frontend_rows_ticks);
   const int revealed_rows = VisibleFrontendRowCount(rows.size());
   const bool steady_selection_pulse = revealed_rows >= static_cast<int>(rows.size());
   const bool high_score_table =
@@ -1957,6 +2049,7 @@ void MilestoneADemo::RenderFrontendText(
           1.0f,
       };
       SDL_RenderTexture(renderer, frontend_font_atlas_.texture, &source, &destination);
+      ++g_audit.glyph_row_draws;
     }
 
     cursor_x += frontend_font_widths_[glyph_index] + 2;
@@ -2136,6 +2229,7 @@ void MilestoneADemo::TrackKeyDown(SDL_Keycode key) {
 
   if (!held_original_scancodes_[original_scancode]) {
     held_original_scancode_frames_[original_scancode] = 0;
+    audit_pressed_[original_scancode] = true;
   }
   held_original_scancodes_[original_scancode] = true;
 }
@@ -2146,6 +2240,9 @@ void MilestoneADemo::TrackKeyUp(SDL_Keycode key) {
     return;
   }
 
+  if (held_original_scancodes_[original_scancode]) {
+    audit_released_[original_scancode] = true;
+  }
   held_original_scancodes_[original_scancode] = false;
   held_original_scancode_frames_[original_scancode] = 0;
 }
@@ -2321,6 +2418,9 @@ void MilestoneADemo::EmitAudioEvent(const char* event_name, int slot, int pan, i
       sfx_volume_override >= 0 ? sfx_volume_override : sfx_volume_,
       pan,
       voice_class});
+  audit_emitted_.push_back(AuditEmitted{audit_stage_, event_name, true, slot, music_track_index_, music_volume_,
+                                        sfx_volume_override >= 0 ? sfx_volume_override : sfx_volume_, pan,
+                                        voice_class});
 }
 
 int MilestoneADemo::PanForPieceColumn(int piece_x) const {
@@ -2341,6 +2441,8 @@ void MilestoneADemo::EmitMusicEvent(const char* event_name) {
       music_track_index_,
       music_volume_,
       sfx_volume_});
+  audit_emitted_.push_back(
+      AuditEmitted{audit_stage_, event_name, false, 0, music_track_index_, music_volume_, sfx_volume_, 0x80, 0});
 }
 
 void MilestoneADemo::FlushAudioEvents() {
@@ -2518,7 +2620,7 @@ void MilestoneADemo::BeginHighScoreNameEntry(int score, int lines) {
   high_score_bootstrap_frames_ = use_state9_bootstrap ? kState9BootstrapFrames : 0;
 }
 
-void MilestoneADemo::BeginTopOutDemo(int score, int lines) {
+void MilestoneADemo::BeginTopOutDemo(int score, int lines, bool announce) {
   top_out_frame_ = 0;
   gameplay_top_out_frame_ = 0;
   top_out_dissolved_rows_ = 0;
@@ -2534,7 +2636,9 @@ void MilestoneADemo::BeginTopOutDemo(int score, int lines) {
   top_out_handoff_pending_ = false;
   gameplay_phase_ = GameplayPhase::kTopOutDissolve;
   live_game_available_ = false;
-  EmitAudioEvent("top-out", 5);
+  if (announce) {
+    EmitAudioEvent("top-out", 5);
+  }
   scene_ = Scene::kTopOut;
 }
 
@@ -2546,40 +2650,9 @@ void MilestoneADemo::BeginLiveGameplayDemo(int simulated_clear_count) {
   scene_ = Scene::kGameplay;
 }
 
-bool MilestoneADemo::TryMoveLivePiece(int delta_x, int delta_y) {
-  if (gameplay_phase_ != GameplayPhase::kFalling) {
-    return false;
-  }
-  LivePiece moved = live_piece_;
-  moved.x += delta_x;
-  moved.y += delta_y;
-  if (!CanPlaceLivePiece(moved)) {
-    return false;
-  }
-
-  live_piece_ = moved;
-  if (delta_x != 0 || delta_y < 0) {
-    lock_frames_ = 0;
-  }
-  return true;
-}
-
-bool MilestoneADemo::TryRotateLivePiece(int delta_rotation) {
-  if (gameplay_phase_ != GameplayPhase::kFalling) {
-    return false;
-  }
-  LivePiece rotated = live_piece_;
-  rotated.rotation = NormalizeModulo(rotated.rotation + delta_rotation, 4);
-  if (!CanPlaceLivePiece(rotated)) {
-    return false;
-  }
-
-  live_piece_ = rotated;
-  lock_frames_ = 0;
-  return true;
-}
-
 bool MilestoneADemo::CanPlaceLivePiece(const LivePiece& piece) const {
+  // 0x12AC(x, y, rot, id): a cell blocks when its column is outside 0..9, when its row is >= 20, or
+  // when its row is >= 0 and the board cell is set. Cells above the well (row < 0) are legal.
   const std::array<CellOffset, 4> cells = RotatedCells(piece.type, piece.rotation);
   for (const CellOffset& cell : cells) {
     const int board_x = piece.x + cell.x;
@@ -2602,16 +2675,20 @@ void MilestoneADemo::ResetLiveGameplayState() {
   live_piece_stats_.fill(0);
   live_score_ = 0;
   live_lines_ = 0;
+  // 0x5E0 (0x5FC): the running level starts at the menu's start level; after that only a ten-line
+  // crossing changes it (0xEA7).
   live_level_ = start_level_;
-  gameplay_random_state_ = piece_seed_;
-  gameplay_random_table_.fill(0);
-  gameplay_random_index_ = 0;
   gameplay_phase_ = GameplayPhase::kFalling;
   gravity_accumulator_ = 0;
-  lock_frames_ = 0;
+  // 0x9C8(1) called at 0x707: the four repeat timers and the Down lockout start at 0.
+  repeat_timers_.fill(0);
   down_lockout_frames_ = 0;
   pending_clear_rows_.clear();
   collapse_frame_ = 0;
+  collapse_step_ = 0;
+  collapse_batch_ = 0;
+  live_piece_hidden_ = false;
+  top_out_after_collapse_ = false;
   gameplay_top_out_frame_ = 0;
   warning_band_ = 0;
   warning_cooldowns_.fill(0);
@@ -2623,38 +2700,53 @@ void MilestoneADemo::ResetLiveGameplayState() {
   alert_effect_id_ = -1;
   alert_lifetime_ = 0;
   alert_reveal_frame_ = 0;
-  live_piece_ = LivePiece{0, 0, 4, 0};
+  // 0x5E0 -> 0x32B0 at 0x6F8: srand([0x2D2A3]), the tick counter, then refill the 8192-entry table,
+  // so every New Game deals a new sequence. --piece-seed pins the seed for tests and comparisons.
+  piece_seed_ = has_piece_seed_override_ ? piece_seed_override_ : logic_tick_;
   RefillGameplayRandomTable();
-  live_piece_ = LivePiece{RollNextPieceType(), 0, 4, 0};
+  // 0x70C: next = draw % 7; then 0x1348 promotes it (current = next, next = draw % 7, counted).
   live_next_piece_type_ = RollNextPieceType();
+  live_piece_ = LivePiece{0, 0, kSpawnX, 0};
   line_clear_demo_count_ = 0;
-  ++live_piece_stats_[static_cast<size_t>(live_piece_.type)];
+  SpawnNextLivePiece();
 }
 
 bool MilestoneADemo::SpawnNextLivePiece() {
-  live_piece_ = LivePiece{live_next_piece_type_, 0, 4, 0};
+  // 0x1348: current = next, next = rng % 7, statistics[current] += 1, x=4 y=0 rotation 0,
+  // accumulator 0. It never writes the Down lockout 0x2C783.
+  live_piece_ = LivePiece{live_next_piece_type_, 0, kSpawnX, 0};
   live_next_piece_type_ = RollNextPieceType();
   gravity_accumulator_ = 0;
-  lock_frames_ = 0;
-  down_lockout_frames_ = kGameplayDownLockoutFrames;
   ++live_piece_stats_[static_cast<size_t>(live_piece_.type)];
+  // 0x102D: the spawn is tested in the same step on the board as it is now; after a clearing lock
+  // that board has its full rows emptied but not yet compacted.
   if (!CanPlaceLivePiece(live_piece_)) {
-    BeginTopOutDemo(live_score_, live_lines_);
+    if (gameplay_phase_ == GameplayPhase::kCollapse) {
+      // 0x9C8 runs a pending collapse (0xA20) before it looks at the top-out (0xA3A), so the frozen
+      // stack is collapsed for 8 steps per row first and the dissolve starts after it. The rest of
+      // the top-out (0x1037..0x1065) happens now: the top-out face (alert 6, no expiry) replaces the
+      // clear's reward face and the top-out sound (slot 5) plays in this step.
+      top_out_after_collapse_ = true;
+      TriggerAlert(6, 1 << 30);
+      EmitAudioEvent("top-out", 5);
+    } else {
+      BeginTopOutDemo(live_score_, live_lines_);
+    }
     return false;
   }
   return true;
 }
 
-void MilestoneADemo::CommitLivePieceToBoard() {
-  const std::array<CellOffset, 4> cells = RotatedCells(live_piece_.type, live_piece_.rotation);
-  for (const CellOffset& cell : cells) {
+void MilestoneADemo::CommitLivePieceToBoard(int lock_y) {
+  // 0x9C8 0xD53..0xD8E: the cells go to row lock_y + dy; rows < 0 are dropped. (The original's logical
+  // board stores 1 and keeps the colours in the screen image; the port stores id + 1 so it can redraw.)
+  for (const CellOffset& cell : RotatedCells(live_piece_.type, live_piece_.rotation)) {
     const int board_x = live_piece_.x + cell.x;
-    const int board_y = live_piece_.y + cell.y;
+    const int board_y = lock_y + cell.y;
     if (board_x < 0 || board_x >= kBoardWidth || board_y < 0 || board_y >= kBoardHeight) {
       continue;
     }
-    live_board_cells_[static_cast<size_t>(board_y * kBoardWidth + board_x)] =
-        NormalizeModulo(live_piece_.type, static_cast<int>(kTetrominoShapes.size())) + 1;
+    live_board_cells_[static_cast<size_t>(board_y * kBoardWidth + board_x)] = NormalizeModulo(live_piece_.type, kPieceCount) + 1;
   }
 }
 
@@ -2668,9 +2760,6 @@ void MilestoneADemo::StepLiveGameplay() {
   if (!sleepy_ && frames_since_clear_ >= kSleepyNoClearFrames) {
     sleepy_ = true;
     EmitAudioEvent("sleepy-no-clear-timeout", 6);
-  }
-  if (down_lockout_frames_ > 0) {
-    --down_lockout_frames_;
   }
   for (int& cooldown : warning_cooldowns_) {
     if (gameplay_phase_ != GameplayPhase::kCollapse && cooldown > 0) {
@@ -2693,64 +2782,143 @@ void MilestoneADemo::StepLiveGameplay() {
   UpdateAlert();
 }
 
+bool MilestoneADemo::GameplayKeyHeld(int binding) const {
+  // The ISR-maintained held table, indexed by the SETUP.DAT binding (0 Down, 1 Left, 2 Right,
+  // 3 A = rotation +1, 4 S = rotation -1).
+  const std::uint8_t scan_code = keyboard_bindings_[static_cast<size_t>(binding)];
+  return scan_code != 0 && held_original_scancodes_[scan_code];
+}
+
+void MilestoneADemo::StepGameplayInput() {
+  // 0x9C8 0xA97..0xAF3: on every live step decrement the four repeat timers and the Down lockout.
+  for (int& timer : repeat_timers_) {
+    if (timer > 0) {
+      --timer;
+    }
+  }
+  if (down_lockout_frames_ > 0) {
+    --down_lockout_frames_;
+  }
+  // 0xAF9..0xC94, in this order: Left (x-1), Right (x+1), A (rotation+1), S (rotation-1). A key acts
+  // when held with its timer at 0 and then reloads 8 whether or not the target fitted; a released
+  // key's timer is 0, so presses act at once and a held key repeats every 8 steps. Only the target
+  // is tested (no kicks) and the gravity accumulator is never touched.
+  static constexpr int kDeltaX[4] = {-1, 1, 0, 0};
+  static constexpr int kDeltaRotation[4] = {0, 0, 1, -1};
+  for (int action = 0; action < 4; ++action) {
+    const bool held = GameplayKeyHeld(action + 1);
+    int& timer = repeat_timers_[static_cast<size_t>(action)];
+    if (held && timer == 0) {
+      LivePiece moved = live_piece_;
+      moved.x += kDeltaX[action];
+      moved.rotation = (moved.rotation + kDeltaRotation[action]) & 3;
+      if (CanPlaceLivePiece(moved)) {
+        live_piece_ = moved;
+      }
+      timer = kGameplayBindingRepeatFrames;
+    }
+    if (!held) {
+      timer = 0;
+    }
+  }
+}
+
 void MilestoneADemo::StepFallingGameplay() {
-  gravity_accumulator_ += CurrentDropIncrement();
-  bool moved_down = false;
-  while (gravity_accumulator_ >= kGameplayGravityThreshold) {
-    gravity_accumulator_ -= kGameplayGravityThreshold;
-    if (TryMoveLivePiece(0, 1)) {
-      moved_down = true;
-    } else {
-      break;
-    }
+  // A piece promoted by a clearing lock stayed hidden through the collapse; from its first live step
+  // on 0x9C8 erases, moves and redraws it.
+  live_piece_hidden_ = false;
+  StepGameplayInput();
+
+  // 0xC94..0xD03: Down held with the lockout at 0 replaces the increment by 0x8000, Down up clears the
+  // lockout, the increment is clamped to 0x10000, and on reaching 0x10000 the accumulator is SET TO 0
+  // (no remainder is kept) and the piece is tried one row down.
+  const int increment = CurrentDropIncrement();
+  if (!GameplayKeyHeld(0)) {
+    down_lockout_frames_ = 0;
+  }
+  audit_gravity_active_ = true;
+  audit_gravity_rate_ = increment;
+  audit_gravity_acc_before_ = gravity_accumulator_;
+  gravity_accumulator_ += increment;
+  LivePiece target = live_piece_;
+  if (gravity_accumulator_ >= kGameplayGravityThreshold) {
+    gravity_accumulator_ = 0;
+    ++target.y;
+    ++audit_descent_attempts_;
   }
 
-  LivePiece below = live_piece_;
-  ++below.y;
-  if (CanPlaceLivePiece(below)) {
-    if (moved_down) {
-      lock_frames_ = 0;
+  // 0xD09..0xD1D: the collision test runs at that position on every live step, not only when a row is
+  // due, and there is no grounded timer: a resting piece locks on its next gravity row (one period
+  // after landing, 2 steps under soft drop) whatever the player does meanwhile.
+  if (CanPlaceLivePiece(target)) {
+    if (target.y != live_piece_.y) {
+      ++audit_descent_successes_;
     }
+    live_piece_ = target;
     UpdateStackWarning(true);
     return;
   }
+  LockLivePiece(target.y - 1);
+}
 
-  ++lock_frames_;
-  if (lock_frames_ < kGameplayLockFrames) {
-    UpdateStackWarning(true);
-    return;
-  }
-
-  // Piece lock / board impact -> slot 0, spatialized by board column, and played
-  // at half the SFX volume (0x6817 caller at 0x0d4e: pan = (col-5)*21+0x80,
-  // volume arg = [0x2c6e7] / 2, class 0).
+void MilestoneADemo::LockLivePiece(int lock_y) {
+  // Piece lock / board impact -> slot 0, panned by the reference column and played at half the SFX
+  // volume (0x6817 caller at 0x0D4E: pan = (x-5)*21+0x80 with the reference x, volume [0x2C6E7]/2).
   EmitAudioEvent("piece-lock", 0, PanForPieceColumn(live_piece_.x), 0, sfx_volume_ / 2);
-  CommitLivePieceToBoard();
-  const std::vector<int> full_rows = DetectFullRows();
+  // 0xD60 dec ebp: the cells are written one row above the position that collided.
+  CommitLivePieceToBoard(lock_y);
+  const std::vector<int> full_rows = FullRowsAroundLock(lock_y);
   if (!full_rows.empty()) {
+    // 0xE4E..0x100C, all in this step: collapse init, Down lockout, level, reward, lines, score.
     BeginLineCollapse(full_rows);
-    return;
+    down_lockout_frames_ = kDownLockoutAfterClear;
+    ApplyLineClearScore(static_cast<int>(full_rows.size()));
+  } else {
+    UpdateStackWarning(true);
+    last_clear_was_four_ = false;
   }
-
-  UpdateStackWarning(true);
-  last_clear_was_four_ = false;
+  // 0x1011: the next piece is promoted, counted and tested in the lock step (0x107C keeps it undrawn
+  // while rows are pending).
   SpawnNextLivePiece();
 }
 
 void MilestoneADemo::StepCollapseGameplay() {
+  // 0x9C8 0xA20..0xA39: while rows are pending a step only calls 0x1D04(0): no input, gravity, repeat
+  // timers or Down lockout. Each call slides the stack above the current row down one pixel
+  // (RenderGameplay draws that from collapse_step_); the 8th call compacts the row in the board, adds
+  // one to the rows still queued (all above it) and starts the next. The promoted piece's first live
+  // step is the one after the last call: lock step + 8 * rows + 1.
   ++collapse_frame_;
-  if (collapse_frame_ < static_cast<int>(pending_clear_rows_.size()) * kGameplayCollapseFramesPerRow) {
+  ++collapse_step_;
+  if (collapse_step_ == kCollapseStepsPerRow) {
+    collapse_step_ = 0;
+    if (!top_out_after_collapse_) {
+      CompactClearedRow(pending_clear_rows_[static_cast<size_t>(collapse_batch_)]);
+      for (size_t later = static_cast<size_t>(collapse_batch_) + 1; later < pending_clear_rows_.size(); ++later) {
+        ++pending_clear_rows_[later];
+      }
+    }
+    ++collapse_batch_;
+  }
+  if (collapse_batch_ < static_cast<int>(pending_clear_rows_.size())) {
     UpdateStackWarning(false);
     return;
   }
 
-  CollapseMarkedRows();
-  ApplyLineClearScore(static_cast<int>(pending_clear_rows_.size()));
   pending_clear_rows_.clear();
+  collapse_batch_ = 0;
   collapse_frame_ = 0;
   gameplay_phase_ = GameplayPhase::kFalling;
+  if (top_out_after_collapse_) {
+    // The spawn failed in the clearing step: the original wiped its board there (0x1F8C(2)), so its
+    // collapse anchor sat on the empty-board line 152 and each call blanked one scanline of the bottom
+    // row (0x1E34 skips the copy) while the stack image stayed put. Now the dissolve starts.
+    top_out_after_collapse_ = false;
+    std::fill_n(live_board_cells_.begin() + (kBoardHeight - 1) * kBoardWidth, kBoardWidth, 0);
+    BeginTopOutDemo(live_score_, live_lines_, /*announce=*/false);  // sound already played in the lock step
+    return;
+  }
   UpdateStackWarning(true);
-  SpawnNextLivePiece();
 }
 
 void MilestoneADemo::StepTopOutGameplay() {
@@ -2761,24 +2929,29 @@ void MilestoneADemo::StepTopOutGameplay() {
 }
 
 int MilestoneADemo::CurrentDropIncrement() const {
-  // RE gameplay-input-timing-pass: natural gravity is (level<<9)+0x200 per frame, but
-  // while Down is held -- and the post-line-clear/spawn Down-lockout (0x2c783) has
-  // expired -- the per-frame increment is OVERRIDDEN to 0x8000, then clamped to the
-  // 0x10000 descent threshold. 0x8000 is half the threshold, so soft-drop descends one
-  // row every two frames (~35 rows/s at 70Hz). The prior port moved a whole row every
-  // frame (~70/s) ON TOP OF gravity, i.e. ~2x too fast -- the "way too fast" report.
-  const std::uint8_t down_scan_code = keyboard_bindings_[0];
-  const bool down_held =
-      down_scan_code != 0 && held_original_scancodes_[down_scan_code] && down_lockout_frames_ == 0;
-  const int increment = down_held ? kSoftDropIncrement : CurrentGravityRate();
+  // 0xCAB..0xCE5: the level's increment [0x2C717] = (level<<9)+0x200, replaced by 0x8000 while Down is
+  // held and the Down lockout is 0, clamped to the 0x10000 threshold.
+  const bool soft_drop = GameplayKeyHeld(0) && down_lockout_frames_ == 0;
+  const int increment = soft_drop ? kSoftDropIncrement : CurrentGravityRate();
   return std::min(increment, kGameplayGravityThreshold);
 }
 
 void MilestoneADemo::BeginLineCollapse(const std::vector<int>& rows) {
-  pending_clear_rows_ = rows;
-  collapse_frame_ = 0;
-  gameplay_phase_ = GameplayPhase::kCollapse;
+  // 0xE08..0xE32, per full row bottom-up: 0x1414 turns the row's pixels into particles (level%10
+  // helper, pre-clear level), then the row is zeroed in the board (not compacted) and appended to the
+  // clear list. The particle seeding reads the cells, so it runs before they are zeroed.
   SeedLineClearDebris(rows);
+  for (const int row : rows) {
+    std::fill_n(live_board_cells_.begin() + row * kBoardWidth, kBoardWidth, 0);
+  }
+  pending_clear_rows_ = rows;
+  // 0x1D04(1): collapse step and batch start at 0.
+  collapse_frame_ = 0;
+  collapse_step_ = 0;
+  collapse_batch_ = 0;
+  gameplay_phase_ = GameplayPhase::kCollapse;
+  // 0x107C: no live piece is drawn while rows are pending.
+  live_piece_hidden_ = true;
   const int clear_count = static_cast<int>(rows.size());
   // Capture the pre-clear state that selects the reward/wake mood face.
   const bool was_sleepy = sleepy_;
@@ -2801,9 +2974,32 @@ void MilestoneADemo::BeginLineCollapse(const std::vector<int>& rows) {
   TriggerAlert(AlertIdForClear(clear_count, was_four, was_sleepy), kAlertEventLifetime);
 }
 
-std::vector<int> MilestoneADemo::DetectFullRows() const {
+std::vector<int> MilestoneADemo::FullRowsAroundLock(int lock_y) const {
+  // 0xDB8..0xE3F: rows lock_y+1 down to lock_y-2 (every row the piece can occupy), bottom-up; the clear
+  // list keeps that order, which is also the collapse order.
   std::vector<int> rows;
-  for (int y = 0; y < kBoardHeight; ++y) {
+  for (int row = lock_y + 1; row >= lock_y - 2; --row) {
+    if (row < 0 || row >= kBoardHeight) {
+      continue;
+    }
+    bool full = true;
+    for (int x = 0; x < kBoardWidth; ++x) {
+      if (live_board_cells_[static_cast<size_t>(row * kBoardWidth + x)] == 0) {
+        full = false;
+        break;
+      }
+    }
+    if (full) {
+      rows.push_back(row);
+    }
+  }
+  return rows;
+}
+
+std::vector<int> MilestoneADemo::DetectFullRows() const {
+  // Row-injection helper only (the lock scans four rows, FullRowsAroundLock); bottom-up like the lock.
+  std::vector<int> rows;
+  for (int y = kBoardHeight - 1; y >= 0; --y) {
     bool full = true;
     for (int x = 0; x < kBoardWidth; ++x) {
       if (live_board_cells_[static_cast<size_t>(y * kBoardWidth + x)] == 0) {
@@ -2819,41 +3015,28 @@ std::vector<int> MilestoneADemo::DetectFullRows() const {
 }
 
 void MilestoneADemo::ApplyLineClearScore(int clear_count) {
+  // 0xE58..0xEA7 then 0xFAE..0xFEC: the level goes up by one when lines%10 + n >= 10 (gravity follows,
+  // +0x200 per level via CurrentGravityRate), then lines += n, then the score adds (level+1) *
+  // {100,300,600,1200}[n-1] with the level already raised. The start level is never re-read here.
   static constexpr std::array<int, 5> kBaseClearScores = {0, 100, 300, 600, 1200};
   clear_count = std::clamp(clear_count, 1, 4);
-  live_score_ += (live_level_ + 1) * kBaseClearScores[clear_count];
+  if (live_lines_ % 10 + clear_count >= 10) {
+    ++live_level_;
+  }
   live_lines_ += clear_count;
-  live_level_ = start_level_ + (live_lines_ / 10);
+  live_score_ += (live_level_ + 1) * kBaseClearScores[static_cast<size_t>(clear_count)];
 }
 
-void MilestoneADemo::CollapseMarkedRows() {
-  std::array<bool, kBoardHeight> clear_mask{};
-  for (const int row : pending_clear_rows_) {
-    if (row >= 0 && row < kBoardHeight) {
-      clear_mask[static_cast<size_t>(row)] = true;
-    }
+void MilestoneADemo::CompactClearedRow(int row) {
+  // 0x1D6D..0x1DBA, the 8th collapse call of a row: rows 0..row-1 move down one row, row 0 is zeroed.
+  for (int y = row; y > 0; --y) {
+    std::copy_n(live_board_cells_.begin() + (y - 1) * kBoardWidth, kBoardWidth, live_board_cells_.begin() + y * kBoardWidth);
   }
-
-  int write_y = kBoardHeight - 1;
-  for (int read_y = kBoardHeight - 1; read_y >= 0; --read_y) {
-    if (clear_mask[static_cast<size_t>(read_y)]) {
-      continue;
-    }
-    for (int x = 0; x < kBoardWidth; ++x) {
-      live_board_cells_[static_cast<size_t>(write_y * kBoardWidth + x)] =
-          live_board_cells_[static_cast<size_t>(read_y * kBoardWidth + x)];
-    }
-    --write_y;
-  }
-  while (write_y >= 0) {
-    for (int x = 0; x < kBoardWidth; ++x) {
-      live_board_cells_[static_cast<size_t>(write_y * kBoardWidth + x)] = 0;
-    }
-    --write_y;
-  }
+  std::fill_n(live_board_cells_.begin(), kBoardWidth, 0);
 }
 
 void MilestoneADemo::SeedLineClearDebris(const std::vector<int>& rows) {
+  AuditScopedTicks audit_ticks(&g_audit.line_clear_seed_ticks);
   const int style = NormalizeModulo(live_level_, 10);
   for (const int row : rows) {
     if (row < 0 || row >= kBoardHeight) {
@@ -2941,8 +3124,10 @@ void MilestoneADemo::EmitLineClearParticle(int style, int col, int row8, int scr
 
 void MilestoneADemo::SpawnDebrisPolar(int screen_x, int screen_y, int speed, int angle, int lifetime, int color) {
   if (debris_particles_.size() >= kGameplayMaxDebrisParticles) {
+    ++audit_particles_dropped_;
     return;
   }
+  ++audit_particles_spawned_;
   // Polar velocity (0x2f78): v = -(sine[idx] * speed) >> 7 with the original's
   // 0x8001 sine amplitude. sine_table_ here has amplitude 0x10000 (2x), so shift
   // by 8 to reproduce the same velocity scale. Position/velocity are 16.16.
@@ -2956,8 +3141,10 @@ void MilestoneADemo::SpawnDebrisPolar(int screen_x, int screen_y, int speed, int
 
 void MilestoneADemo::SpawnDebrisTarget(int screen_x, int screen_y, int target_x, int target_y, int lifetime, int color) {
   if (debris_particles_.size() >= kGameplayMaxDebrisParticles) {
+    ++audit_particles_dropped_;
     return;
   }
+  ++audit_particles_spawned_;
   // Target velocity (0x3034): v = (target - start) * 65536 / lifetime.
   const int life = std::max(1, lifetime);
   const int vx = ((target_x - screen_x) << 16) / life;
@@ -2967,6 +3154,8 @@ void MilestoneADemo::SpawnDebrisTarget(int screen_x, int screen_y, int target_x,
 }
 
 void MilestoneADemo::StepDebrisParticles() {
+  AuditScopedTicks audit_ticks(&g_audit.debris_step_ticks);
+  const size_t audit_before = debris_particles_.size();
   for (DebrisParticle& particle : debris_particles_) {
     particle.x += particle.vx;
     particle.y += particle.vy;
@@ -2978,9 +3167,13 @@ void MilestoneADemo::StepDebrisParticles() {
           debris_particles_.end(),
           [](const DebrisParticle& particle) { return particle.age >= kDebrisAgeFull; }),
       debris_particles_.end());
+  audit_particles_retired_ += static_cast<std::uint32_t>(audit_before - debris_particles_.size());
+  g_audit.debris_active = static_cast<std::uint32_t>(debris_particles_.size());
 }
 
 void MilestoneADemo::RenderDebrisParticles(SDL_Renderer* renderer) const {
+  AuditScopedTicks audit_ticks(&g_audit.debris_render_ticks);
+  g_audit.debris_active = static_cast<std::uint32_t>(debris_particles_.size());
   for (const DebrisParticle& particle : debris_particles_) {
     const int stage = std::clamp(particle.age >> 8, 0, 3);  // 4 stages of 0x100
     const Uint8 ramp_index = particle_ramps_[static_cast<size_t>(std::clamp(particle.color, 0, 255)) * 4 +
@@ -2997,6 +3190,7 @@ void MilestoneADemo::RenderDebrisParticles(SDL_Renderer* renderer) const {
         1.0f,
     };
     SDL_RenderFillRect(renderer, &debris_rect);
+    ++g_audit.debris_drawn;
   }
 }
 
@@ -3007,6 +3201,7 @@ void MilestoneADemo::RenderDebrisParticles(SDL_Renderer* renderer) const {
 // newly crosses into the dissolved region, spray the certified debris pool
 // upward from that row's filled cells.
 void MilestoneADemo::UpdateTopOutDissolve() {
+  AuditScopedTicks audit_ticks(&g_audit.topout_update_ticks);
   // RE 0x1fc6: the dissolve front advances ONE pixel-row per frame down the whole
   // gameplay area (kBoardHeight*8 pixel rows), spraying that row's debris as it passes.
   // A pixel-row cascade (not board-row bursts) is what makes the next row start
@@ -3191,9 +3386,9 @@ int MilestoneADemo::CurrentGravityRate() const {
 // decompilation (RE: sfx/rng findings). The table fill mirrors `0x32b0`:
 // srand(seed) via `0xed0f`, then fill an 8192-dword table (allocated 0x8000
 // bytes at `0x32f0`) with `(rand()<<16)|rand()` using the Watcom C `rand`
-// `0xeceb` (LCG 0x41C64E6D/0x3039, returning bits 16..30). The seed source is
-// the shared entropy global `0x2d2a3` (no recovered deterministic write, so
-// effectively timer-like); the port models it with a settable/default seed.
+// `0xeceb` (LCG 0x41C64E6D/0x3039, returning bits 16..30). The seed is the 60 Hz
+// tick counter `0x2d2a3` (written only at 0x65B3/0x6683): 0 for the startup fill at
+// 0x150, the current tick at every New Game; piece_seed_ holds the seed in use.
 void MilestoneADemo::RefillGameplayRandomTable() {
   gameplay_random_state_ = piece_seed_;
   gameplay_random_index_ = 0;
@@ -3218,7 +3413,13 @@ std::uint32_t MilestoneADemo::NextGameplayRandomU32() {
     gameplay_random_index_ = 0;
   }
 
-  return gameplay_random_table_[static_cast<size_t>(gameplay_random_index_)];
+  const std::uint32_t audit_value = gameplay_random_table_[static_cast<size_t>(gameplay_random_index_)];
+  ++audit_rng_draws_;
+  audit_rng_hash_ = Fnv1a64Update(audit_rng_hash_, &audit_value, sizeof(audit_value));
+  if (audit_rng_values_.size() < 16384) {
+    audit_rng_values_.push_back(audit_value);
+  }
+  return audit_value;
 }
 
 void MilestoneADemo::SaveLiveSnapshot() {
@@ -3232,9 +3433,13 @@ void MilestoneADemo::SaveLiveSnapshot() {
   live_snapshot_.lines = live_lines_;
   live_snapshot_.level = live_level_;
   live_snapshot_.gravity_accumulator = gravity_accumulator_;
-  live_snapshot_.lock_frames = lock_frames_;
+  live_snapshot_.repeat_timers = repeat_timers_;
   live_snapshot_.down_lockout_frames = down_lockout_frames_;
   live_snapshot_.collapse_frame = collapse_frame_;
+  live_snapshot_.collapse_step = collapse_step_;
+  live_snapshot_.collapse_batch = collapse_batch_;
+  live_snapshot_.live_piece_hidden = live_piece_hidden_;
+  live_snapshot_.top_out_after_collapse = top_out_after_collapse_;
   live_snapshot_.top_out_frame = gameplay_top_out_frame_;
   live_snapshot_.warning_band = warning_band_;
   live_snapshot_.warning_cooldowns = warning_cooldowns_;
@@ -3256,9 +3461,13 @@ void MilestoneADemo::RestoreLiveSnapshot() {
   live_lines_ = live_snapshot_.lines;
   live_level_ = live_snapshot_.level;
   gravity_accumulator_ = live_snapshot_.gravity_accumulator;
-  lock_frames_ = live_snapshot_.lock_frames;
+  repeat_timers_ = live_snapshot_.repeat_timers;
   down_lockout_frames_ = live_snapshot_.down_lockout_frames;
   collapse_frame_ = live_snapshot_.collapse_frame;
+  collapse_step_ = live_snapshot_.collapse_step;
+  collapse_batch_ = live_snapshot_.collapse_batch;
+  live_piece_hidden_ = live_snapshot_.live_piece_hidden;
+  top_out_after_collapse_ = live_snapshot_.top_out_after_collapse;
   gameplay_top_out_frame_ = live_snapshot_.top_out_frame;
   warning_band_ = live_snapshot_.warning_band;
   warning_cooldowns_ = live_snapshot_.warning_cooldowns;
@@ -3268,7 +3477,9 @@ void MilestoneADemo::RestoreLiveSnapshot() {
 }
 
 int MilestoneADemo::RollNextPieceType() {
-  return static_cast<int>(NextGameplayRandomU32() % kTetrominoShapes.size());
+  // 0x1368..0x1380 (and 0x70C): the next piece id is the drawn value % 7 (signed idiv; values are
+  // below 2^31).
+  return static_cast<int>(NextGameplayRandomU32() % kPieceCount);
 }
 
 void MilestoneADemo::SimulateLiveLineClear(int clear_count) {
@@ -3276,7 +3487,10 @@ void MilestoneADemo::SimulateLiveLineClear(int clear_count) {
 }
 
 void MilestoneADemo::InjectFilledRowsForSmoke(int row_count) {
-  if (!live_game_active_) {
+  // Smoke/debug helper (--live-demo, keys C and B): fill the bottom rows and clear them through the
+  // same bookkeeping as a clearing lock (particles, collapse, Down lockout, level, reward, lines,
+  // score) but without a lock or a promotion. Ignored while a collapse or top-out is running.
+  if (!live_game_active_ || gameplay_phase_ != GameplayPhase::kFalling) {
     return;
   }
   row_count = std::clamp(row_count, 1, 4);
@@ -3286,7 +3500,10 @@ void MilestoneADemo::InjectFilledRowsForSmoke(int row_count) {
       live_board_cells_[static_cast<size_t>(board_y * kBoardWidth + x)] = ((x + row) % 7) + 1;
     }
   }
-  BeginLineCollapse(DetectFullRows());
+  const std::vector<int> rows = DetectFullRows();
+  BeginLineCollapse(rows);
+  down_lockout_frames_ = kDownLockoutAfterClear;
+  ApplyLineClearScore(static_cast<int>(rows.size()));
 }
 
 int MilestoneADemo::CurrentRunScore() const {
@@ -3316,25 +3533,12 @@ bool MilestoneADemo::ApplyGameplayBinding(std::uint8_t original_scancode, bool a
   }
 
   if (live_game_active_) {
-    if (allow_down && original_scancode == keyboard_bindings_[0]) {
-      // Down is consumed here but does not move a row on press; the soft-drop is
-      // driven per frame by the gravity accumulator (CurrentDropIncrement) off the
-      // held-key state, matching the original's polled 0x8000-per-frame model.
-      return true;
-    }
-    if (original_scancode == keyboard_bindings_[1]) {
-      return TryMoveLivePiece(-1, 0);
-    }
-    if (original_scancode == keyboard_bindings_[2]) {
-      return TryMoveLivePiece(1, 0);
-    }
-    if (original_scancode == keyboard_bindings_[3]) {
-      return TryRotateLivePiece(-1);
-    }
-    if (original_scancode == keyboard_bindings_[4]) {
-      return TryRotateLivePiece(1);
-    }
-    return false;
+    // In a live game the five bound keys act only through the held-key table that the gameplay step
+    // reads (0x9C8 samples it once per step: a press and release between two steps is never seen,
+    // and a press is acted on by the next step). The press is consumed here so it reaches no other
+    // handler.
+    return std::find(keyboard_bindings_.begin(), keyboard_bindings_.end(), original_scancode) !=
+           keyboard_bindings_.end();
   }
 
   if (original_scancode == keyboard_bindings_[1] || original_scancode == keyboard_bindings_[3]) {
@@ -3622,29 +3826,38 @@ void MilestoneADemo::RenderGameplay(SDL_Renderer* renderer) const {
       DrawCounter(renderer, digit_atlas_.texture, {kPieceStatX, kPieceStatRows[i], 4, live_piece_stats_[i]});
     }
 
-    DrawTetromino(
-        renderer,
-        piece_atlas_.texture,
-        live_next_piece_type_,
-        live_next_piece_type_,
-        kPreviewX,
-        kPreviewY);
+    DrawPreviewPiece(renderer, piece_atlas_.texture, live_next_piece_type_);
 
+    // Collapse look (0x1D04 / 0x1E34): the cleared rows were zeroed in the lock step (their pixels left
+    // as particles), and each collapse call moves the band between the stack top and the current
+    // cleared row down one scanline. Everything above that row is empty but the stack, so drawing
+    // the rows above it collapse_step_ pixels lower reproduces the memmove pixel for pixel; the 8th
+    // call compacts the board instead. If the spawn failed in the clearing step the stack stays put
+    // and each call blanks one scanline of the bottom row instead (empty-board anchor 152).
+    const bool collapsing = gameplay_phase_ == GameplayPhase::kCollapse &&
+                            collapse_batch_ < static_cast<int>(pending_clear_rows_.size());
+    const int slide_row = collapsing && !top_out_after_collapse_
+                              ? pending_clear_rows_[static_cast<size_t>(collapse_batch_)]
+                              : -1;
+    const int blanked_bottom_lines =
+        collapsing && top_out_after_collapse_ ? std::min(collapse_frame_, kPieceTileSize) : 0;
     for (int y = 0; y < kBoardHeight; ++y) {
-      bool collapse_row_hidden = false;
-      for (size_t clear_index = 0; clear_index < pending_clear_rows_.size(); ++clear_index) {
-        if (pending_clear_rows_[clear_index] == y &&
-            collapse_frame_ >= static_cast<int>(clear_index + 1) * kGameplayCollapseFramesPerRow) {
-          collapse_row_hidden = true;
-          break;
-        }
-      }
-      if (collapse_row_hidden) {
-        continue;
-      }
+      const int slide = y < slide_row ? collapse_step_ : 0;
+      const int skip_lines = y == kBoardHeight - 1 ? blanked_bottom_lines : 0;
       for (int x = 0; x < kBoardWidth; ++x) {
         const int cell = live_board_cells_[static_cast<size_t>(y * kBoardWidth + x)];
         if (cell <= 0) {
+          continue;
+        }
+        if (skip_lines > 0) {
+          if (skip_lines < kPieceTileSize && piece_atlas_.texture != nullptr) {
+            const SDL_FRect source = {static_cast<float>((cell - 1) * kPieceTileSize), static_cast<float>(skip_lines),
+                                      static_cast<float>(kPieceTileSize), static_cast<float>(kPieceTileSize - skip_lines)};
+            const SDL_FRect destination = {static_cast<float>(kGameplayClearX + (x * kPieceTileSize)),
+                                           static_cast<float>(kGameplayClearY + (y * kPieceTileSize) + skip_lines),
+                                           static_cast<float>(kPieceTileSize), static_cast<float>(kPieceTileSize - skip_lines)};
+            SDL_RenderTexture(renderer, piece_atlas_.texture, &source, &destination);
+          }
           continue;
         }
         DrawPieceTile(
@@ -3652,17 +3865,22 @@ void MilestoneADemo::RenderGameplay(SDL_Renderer* renderer) const {
             piece_atlas_.texture,
             cell - 1,
             kGameplayClearX + (x * kPieceTileSize),
-            kGameplayClearY + (y * kPieceTileSize));
+            kGameplayClearY + (y * kPieceTileSize) + slide);
       }
     }
 
-    DrawLiveTetromino(
-        renderer,
-        piece_atlas_.texture,
-        live_piece_.type,
-        live_piece_.rotation,
-        live_piece_.x,
-        live_piece_.y);
+    // 0x107C/0x10A1: the live piece is drawn at the end of every live step (also the one that starts
+    // a top-out, where the colliding new piece is drawn over the stack), never while rows are pending,
+    // and a piece promoted during a clear only from its first live step.
+    if (!live_piece_hidden_ && gameplay_phase_ != GameplayPhase::kCollapse) {
+      DrawLiveTetromino(
+          renderer,
+          piece_atlas_.texture,
+          live_piece_.type,
+          live_piece_.rotation,
+          live_piece_.x,
+          live_piece_.y);
+    }
 
     RenderDebrisParticles(renderer);
     RenderAlertTile(renderer);
@@ -3700,6 +3918,313 @@ void MilestoneADemo::RenderGameplay(SDL_Renderer* renderer) const {
         kGameplayClearX + (piece.x * kPieceTileSize),
         kGameplayClearY + (piece.y * kPieceTileSize));
   }
+}
+
+// ============================================================================
+// Audit instrumentation (audit/instrument worktree only). Read-only views of the
+// demo state plus per-step accumulators reset by AuditBeginStep.
+// ============================================================================
+namespace {
+
+const char* AuditActionName(size_t index) {
+  static constexpr const char* kNames[8] = {"up",          "down",         "left",    "right",
+                                            "rotate_left", "rotate_right", "confirm", "escape"};
+  return index < 8 ? kNames[index] : "?";
+}
+
+}  // namespace
+
+void MilestoneADemo::AuditBeginStep(std::uint64_t step) {
+  audit_step_ = step;
+  audit_stage_ = "input";
+  audit_emitted_.clear();
+  audit_rng_index_before_ = gameplay_random_index_;
+  audit_rng_draws_ = 0;
+  audit_rng_hash_ = kFnvOffsetBasis;
+  audit_rng_values_.clear();
+  audit_gravity_active_ = false;
+  audit_gravity_rate_ = 0;
+  audit_gravity_acc_before_ = gravity_accumulator_;
+  audit_descent_attempts_ = 0;
+  audit_descent_successes_ = 0;
+  audit_score_before_ = live_score_;
+  audit_particles_spawned_ = 0;
+  audit_particles_dropped_ = 0;
+  audit_particles_retired_ = 0;
+  audit_pressed_.fill(false);
+  audit_released_.fill(false);
+  audit_held_at_step_start_ = held_original_scancodes_;
+}
+
+void MilestoneADemo::AuditWritePresentation(JsonOut& json) const {
+  json.BeginObject()
+      .Key("splash_frame").Int(splash_frame_)
+      .Key("frontend_frame_counter").Int(frontend_frame_counter_)
+      .Key("frontend_view_frame").Int(frontend_view_frame_)
+      .Key("pulse").Int(PulseRevealAmount())
+      .Key("top_out_frame").Int(top_out_frame_)
+      .Key("top_out_dissolved_pixel_rows").Int(top_out_dissolved_rows_)
+      .Key("debris").UInt(debris_particles_.size())
+      .Key("fade_alpha").Int(screen_fade_alpha())
+      .EndObject();
+}
+
+void MilestoneADemo::AuditWriteEmittedEvents(JsonOut& json) const {
+  json.BeginArray();
+  for (const AuditEmitted& event : audit_emitted_) {
+    json.BeginObject().Key("stage").Str(event.stage).Key("kind").Str(event.is_sfx ? "sfx" : "music").Key("name").Str(
+        event.name);
+    if (event.is_sfx) {
+      json.Key("slot").Int(event.slot).Key("sfx_volume").Int(event.sfx_volume).Key("pan").Int(event.pan).Key(
+          "voice_class").Int(event.voice_class);
+    } else {
+      json.Key("track").Int(event.track).Key("music_volume").Int(event.music_volume);
+    }
+    json.EndObject();
+  }
+  json.EndArray();
+}
+
+void MilestoneADemo::AuditWriteState(JsonOut& json, bool include_rng_values) const {
+  const char* scene = "frontend";
+  switch (scene_) {
+    case Scene::kSplash: scene = "splash"; break;
+    case Scene::kFrontend: scene = "frontend"; break;
+    case Scene::kGameplay: scene = "gameplay"; break;
+    case Scene::kTopOut: scene = "topout"; break;
+  }
+  const char* view = "main_menu";
+  switch (frontend_view_) {
+    case FrontendView::kMainMenu: view = "main_menu"; break;
+    case FrontendView::kOptions: view = "options"; break;
+    case FrontendView::kKeyboardSetup: view = "keyboard_setup"; break;
+    case FrontendView::kHighScores: view = "high_scores"; break;
+    case FrontendView::kHighScoreEntry: view = "high_score_entry"; break;
+    case FrontendView::kCredits: view = "credits"; break;
+    case FrontendView::kSoundSetup: view = "sound_setup"; break;
+  }
+  const char* phase = "falling";
+  if (gameplay_phase_ == GameplayPhase::kCollapse) {
+    phase = "collapse";
+  } else if (gameplay_phase_ == GameplayPhase::kTopOutDissolve) {
+    phase = "topout_dissolve";
+  }
+  const char* fade = screen_fade_ == ScreenFade::kOut ? "out" : screen_fade_ == ScreenFade::kIn ? "in" : "none";
+  const char* pending = "none";
+  switch (pending_scene_) {
+    case PendingScene::kNone: pending = "none"; break;
+    case PendingScene::kFrontendFromGameplay: pending = "frontend_from_gameplay"; break;
+    case PendingScene::kGameplayNewGame: pending = "gameplay_new_game"; break;
+    case PendingScene::kGameplayResume: pending = "gameplay_resume"; break;
+  }
+
+  json.Key("scene").Str(scene).Key("scene_name").Str(scene_name());
+  json.Key("splash").BeginObject().Key("page").Int(splash_page_).Key("frame").Int(splash_frame_).EndObject();
+  json.Key("session")
+      .BeginObject()
+      .Key("live_game_active").Bool(live_game_active_)
+      .Key("live_game_available").Bool(live_game_available_)
+      .Key("quit_requested").Bool(quit_requested_)
+      .Key("gameplay_preset").Int(gameplay_preset_index_)
+      .EndObject();
+  json.Key("phase").Str(phase);
+
+  // Piece (port numbering; geometry from RotatedCells, i.e. what draw/collision use).
+  json.Key("piece").BeginObject().Key("id").Int(live_piece_.type).Key("rotation").Int(live_piece_.rotation).Key("x").Int(
+      live_piece_.x).Key("y").Int(live_piece_.y).Key("next").Int(live_next_piece_type_);
+  json.Key("cells").BeginArray();
+  for (const CellOffset& cell : RotatedCells(live_piece_.type, live_piece_.rotation)) {
+    json.BeginArray().Int(live_piece_.x + cell.x).Int(live_piece_.y + cell.y).EndArray();
+  }
+  json.EndArray();
+  json.Key("stats").BeginArray();
+  for (const int count : live_piece_stats_) {
+    json.Int(count);
+  }
+  json.EndArray().EndObject();
+
+  // Gravity bracket for this step (StepFallingGameplay); rate includes the 0x8000 soft-drop override.
+  json.Key("gravity").BeginObject().Key("stepped").Bool(audit_gravity_active_);
+  if (audit_gravity_active_) {
+    json.Key("rate").Int(audit_gravity_rate_).Key("acc_before").Int(audit_gravity_acc_before_);
+  } else {
+    json.Key("rate").Null().Key("acc_before").Null();
+  }
+  json.Key("acc_after").Int(gravity_accumulator_)
+      .Key("natural_rate").Int(CurrentGravityRate())
+      .Key("soft_drop_override").Bool(audit_gravity_active_ && audit_gravity_rate_ == kSoftDropIncrement &&
+                                      CurrentGravityRate() != kSoftDropIncrement)
+      .Key("descent_attempts").Int(audit_descent_attempts_)
+      .Key("descent_successes").Int(audit_descent_successes_)
+      .Key("lock_frames").Int(0)  // no grounded lock timer any more (GR-01); field kept for the trace schema
+      .Key("down_lockout").Int(down_lockout_frames_)
+      .EndObject();
+
+  // Input: the eight semantic actions (v1 trace order) mapped through the bindings.
+  const std::array<std::uint8_t, 8> action_scancodes = {
+      0xC8, keyboard_bindings_[0], keyboard_bindings_[1], keyboard_bindings_[2],
+      keyboard_bindings_[3], keyboard_bindings_[4], 0x1C, 0x01};
+  auto write_set = [&](const std::array<bool, 256>& states) {
+    json.BeginArray();
+    for (size_t i = 0; i < action_scancodes.size(); ++i) {
+      const std::uint8_t sc = action_scancodes[i];
+      if (sc != 0 && states[sc]) {
+        json.Str(AuditActionName(i));
+      }
+    }
+    json.EndArray();
+  };
+  json.Key("input").BeginObject();
+  json.Key("held_at_step_start");
+  write_set(audit_held_at_step_start_);
+  json.Key("held");
+  write_set(held_original_scancodes_);
+  json.Key("pressed");
+  write_set(audit_pressed_);
+  json.Key("released");
+  write_set(audit_released_);
+  json.Key("held_frames").BeginObject();
+  for (size_t i = 0; i < action_scancodes.size(); ++i) {
+    const std::uint8_t sc = action_scancodes[i];
+    json.Key(AuditActionName(i)).Int(sc != 0 && held_original_scancodes_[sc] ? held_original_scancode_frames_[sc] : 0);
+  }
+  json.EndObject();
+  // Gameplay repeats use 0x9C8's four timers (repeat_timers_: act at 0, reload 8 =
+  // kGameplayBindingRepeatFrames); held_frames above are the frontend counters (Left/Right edit
+  // repeats at 12 then every 4).
+  json.Key("das_period").Int(kGameplayBindingRepeatFrames);
+  json.Key("held_raw").BeginArray();
+  for (size_t sc = 0; sc < held_original_scancodes_.size(); ++sc) {
+    if (held_original_scancodes_[sc]) {
+      json.Int(static_cast<int>(sc));
+    }
+  }
+  json.EndArray().EndObject();
+
+  // RNG (consumption 0x3280 model): draws this step, FNV-1a64 over the raw LE u32 values.
+  json.Key("rng")
+      .BeginObject()
+      .Key("seed").UInt(piece_seed_)
+      .Key("state").UInt(gameplay_random_state_)
+      .Key("index_before").Int(audit_rng_index_before_)
+      .Key("index_after").Int(gameplay_random_index_)
+      .Key("draws").UInt(audit_rng_draws_)
+      .Key("values_fnv1a64").Str(Hex64(audit_rng_hash_));
+  json.Key("values");
+  if (include_rng_values || audit_rng_draws_ <= 8) {
+    json.BeginArray();
+    for (const std::uint32_t value : audit_rng_values_) {
+      json.UInt(value);
+    }
+    json.EndArray();
+  } else {
+    json.Null();
+  }
+  json.EndObject();
+
+  // Board: 20 rows top->bottom, 10 cells left->right, value = cell byte (0 empty,
+  // 1..7 = port piece type + 1). Hash = FNV-1a64 over the 200 bytes (v1 board domain).
+  std::uint64_t board_hash = kFnvOffsetBasis;
+  for (const int cell : live_board_cells_) {
+    const std::uint8_t byte = static_cast<std::uint8_t>(cell);
+    board_hash = Fnv1a64Update(board_hash, &byte, 1);
+  }
+  json.Key("board").BeginObject().Key("fnv1a64").Str(Hex64(board_hash)).Key("rows").BeginArray();
+  for (int y = 0; y < kBoardHeight; ++y) {
+    std::string row;
+    for (int x = 0; x < kBoardWidth; ++x) {
+      row += static_cast<char>('0' + std::clamp(live_board_cells_[static_cast<size_t>(y * kBoardWidth + x)], 0, 9));
+    }
+    json.Str(row);
+  }
+  json.EndArray().EndObject();
+
+  json.Key("score")
+      .BeginObject()
+      .Key("value").Int(live_score_)
+      .Key("lines").Int(live_lines_)
+      .Key("level").Int(live_level_)
+      .Key("start_level").Int(start_level_)
+      .Key("delta").Int(live_score_ - audit_score_before_)
+      .EndObject();
+
+  json.Key("clear").BeginObject().Key("rows").BeginArray();
+  for (const int row : pending_clear_rows_) {
+    json.Int(row);
+  }
+  json.EndArray().Key("collapse_frame").Int(collapse_frame_).EndObject();
+
+  json.Key("particles")
+      .BeginObject()
+      .Key("active").UInt(debris_particles_.size())
+      .Key("spawned").UInt(audit_particles_spawned_)
+      .Key("dropped_at_cap").UInt(audit_particles_dropped_)
+      .Key("retired").UInt(audit_particles_retired_)
+      .EndObject();
+
+  json.Key("warning")
+      .BeginObject()
+      .Key("band").Int(warning_band_)
+      .Key("cooldowns").BeginArray().Int(warning_cooldowns_[0]).Int(warning_cooldowns_[1]).Int(warning_cooldowns_[2]).EndArray()
+      .Key("sleepy").Bool(sleepy_)
+      .Key("frames_since_clear").Int(frames_since_clear_)
+      .EndObject();
+
+  json.Key("alert").BeginObject().Key("id");
+  if (alert_effect_id_ >= 0) {
+    json.Int(alert_effect_id_);
+  } else {
+    json.Null();
+  }
+  json.Key("lifetime").Int(alert_lifetime_).Key("reveal_frame").Int(alert_reveal_frame_).EndObject();
+
+  json.Key("topout")
+      .BeginObject()
+      .Key("frame").Int(top_out_frame_)
+      .Key("gameplay_frame").Int(gameplay_top_out_frame_)
+      .Key("dissolved_pixel_rows").Int(top_out_dissolved_rows_)
+      .Key("overlay_visible").Bool(scene_ == Scene::kTopOut && top_out_frame_ >= kTopOutOverlayStartFrame &&
+                                   top_out_frame_ < kTopOutOverlayEndFrame)
+      .Key("saved_under_valid").Bool(top_out_saved_under_valid_)
+      .Key("handoff_pending").Bool(top_out_handoff_pending_)
+      .EndObject();
+
+  json.Key("frontend")
+      .BeginObject()
+      .Key("view").Str(view)
+      .Key("selected_row").Int(frontend_selected_row_)
+      .Key("view_frame").Int(frontend_view_frame_)
+      .Key("frame_counter").Int(frontend_frame_counter_)
+      .Key("cycle_counter").Int(frontend_cycle_counter_)
+      .Key("bank").Int(frontend_current_bank_)
+      .Key("next_bank").Int(frontend_next_bank_)
+      .Key("pulse").Int(PulseRevealAmount())
+      .Key("visible_rows").Int(scene_ == Scene::kFrontend ? VisibleFrontendRowCount(CurrentFrontendRows().size()) : 0)
+      .Key("conceal_frames").Int(high_score_conceal_frames_)
+      .Key("hs_bootstrap_remaining").Int(HighScoreBootstrapRemainingFrames())
+      .Key("credits_page").Int(credits_page_)
+      .Key("credits_timer").Int(credits_page_timer_)
+      .Key("keyboard_capture_row").Int(keyboard_capture_row_)
+      .Key("entry_row").Int(high_score_entry_row_)
+      .Key("entry_name").Str(high_score_entry_name_)
+      .Key("commit_pending").Bool(high_score_entry_commit_pending_)
+      .EndObject();
+
+  json.Key("fade")
+      .BeginObject()
+      .Key("state").Str(fade)
+      .Key("frame").Int(screen_fade_frame_)
+      .Key("alpha").Int(screen_fade_alpha())
+      .Key("pending_scene").Str(pending)
+      .Key("enabled").Bool(fades_enabled_)
+      .EndObject();
+
+  json.Key("settings")
+      .BeginObject()
+      .Key("music_volume").Int(music_volume_)
+      .Key("sfx_volume").Int(sfx_volume_)
+      .Key("music_track_index").Int(music_track_index_)
+      .EndObject();
 }
 
 }  // namespace atet
