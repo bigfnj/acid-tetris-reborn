@@ -6,11 +6,19 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# MSVC: link the C/C++ runtime statically into the exe and into the fetched SDL3 and
+# libmikmod, so a Windows release starts on a clean install without the Visual C++
+# redistributable (a /MD build imports MSVCP140.dll and VCRUNTIME140.dll, which
+# Windows does not ship). Set before any target exists so every target inherits it.
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+
 include(FetchContent)
 
 option(ATET_PORT_FETCH_SDL3 "Fetch SDL3 automatically when it is not installed." ON)
 
-find_package(SDL3 CONFIG QUIET)
+# 3.4 is the oldest SDL with SDL_SetDefaultTextureScaleMode (main.cpp); an older
+# installed SDL3 is ignored and the pinned release below is fetched instead.
+find_package(SDL3 3.4 CONFIG QUIET)
 
 if(NOT SDL3_FOUND)
   if(NOT ATET_PORT_FETCH_SDL3)
@@ -89,6 +97,7 @@ add_executable(acid_tetris_port WIN32
   src/indexed_asset_loader.cpp
   src/milestone_a_demo.cpp
   src/music_player.cpp
+  src/audit_instrument.cpp  # audit/instrument worktree only
   third_party/miniz/miniz.c
 )
 
@@ -123,7 +132,10 @@ target_compile_definitions(acid_tetris_port PRIVATE
   # AcidTetris.zip / ATETRIS.ZIP (see README). This is only the last-resort relative
   # fallback path for that lookup; no reference assets are bundled or required.
   ATET_PORT_ATET_DAT_PATH="ATET.DAT"
-  ATET_PORT_SETUP_DAT_PATH="${CMAKE_CURRENT_BINARY_DIR}/SETUP.DAT"
+  # No SETUP.DAT path is compiled in: the game resolves it at run time beside the
+  # data file it loaded, with a logged per-user fallback (see ResolveSetupDatPath in
+  # src/milestone_a_demo.cpp). A build-directory path here made every distributed
+  # build lose its settings and high scores.
 )
 
 # On Windows the port links SDL3 as a shared library, so SDL3.dll must sit next

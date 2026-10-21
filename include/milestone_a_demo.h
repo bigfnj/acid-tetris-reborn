@@ -14,9 +14,24 @@
 
 namespace atet {
 
+class JsonOut;  // audit_instrument.h (audit worktree only)
+
 class MilestoneADemo {
  public:
   MilestoneADemo() = default;
+
+  // ---- Audit instrumentation (audit/instrument worktree only; diagnostics) ----
+  // Called by main at the top of each loop iteration: resets per-step
+  // accumulators (RNG draws, gravity bracket, emitted events, particle spawns).
+  void AuditBeginStep(std::uint64_t step);
+  // Labels where emitted audio events originate: "input", "tick", "render".
+  void AuditSetStage(const char* stage) { audit_stage_ = stage; }
+  // Full post-iteration state snapshot (see harness/port/README.md for fields).
+  void AuditWriteState(JsonOut& json, bool include_rng_values) const;
+  // Presentation counters that Render() consumes/advances (sampled pre-render).
+  void AuditWritePresentation(JsonOut& json) const;
+  // Audio events pushed by EmitAudioEvent/EmitMusicEvent during this step.
+  void AuditWriteEmittedEvents(JsonOut& json) const;
   MilestoneADemo(const MilestoneADemo&) = delete;
   MilestoneADemo& operator=(const MilestoneADemo&) = delete;
 
@@ -55,6 +70,16 @@ class MilestoneADemo {
   [[nodiscard]] int current_preset_index() const { return gameplay_preset_index_; }
   [[nodiscard]] bool quit_requested() const { return quit_requested_; }
   void set_debug_state_logging(bool enabled) { debug_state_logging_ = enabled; }
+  // SETUP.DAT location. Initialize() resolves it at run time beside the game data
+  // file it loaded (the original keeps setup.dat with atet.dat in one folder) and
+  // falls back to a per-user folder, with a log line, when that spot is not
+  // writable. A non-empty override (main.cpp --setup-dat=PATH; the test scripts use
+  // it so they never touch a player's file) is used as given. Set before Initialize().
+  void set_setup_dat_override(std::string path) { setup_dat_override_ = std::move(path); }
+  [[nodiscard]] const std::string& setup_dat_path() const { return setup_dat_path_; }
+  // Developer/test keys (Tab, T, G, 1-3, H, O, C, B) act only when enabled
+  // (main.cpp --debug); the original game reads none of them.
+  void set_debug_keys_enabled(bool enabled) { debug_keys_enabled_ = enabled; }
   void set_audio_event_callback(std::function<void(const AudioEventNotification&)> callback) {
     audio_event_callback_ = std::move(callback);
   }
@@ -192,6 +217,7 @@ class MilestoneADemo {
   bool LoadFrontendFont(std::string* error_out);
   bool LoadFrontendPointfield(std::string* error_out);
   bool LoadGameplayParticleAssets(std::string* error_out);
+  void ResolveSetupDatPath(const std::string& data_dir);
   bool LoadSetupDat();
   bool SaveSetupDat() const;
 
@@ -359,6 +385,9 @@ class MilestoneADemo {
   int high_score_bootstrap_frames_ = 0;
   int high_score_conceal_frames_ = 0;
   bool debug_state_logging_ = false;
+  bool debug_keys_enabled_ = false;
+  std::string setup_dat_override_;
+  std::string setup_dat_path_;
   std::vector<AudioEvent> audio_events_;
   int line_clear_demo_count_ = 0;
 
@@ -418,6 +447,38 @@ class MilestoneADemo {
   int top_out_dissolved_rows_ = 0;
 
   AtetData atet_data_;
+
+  // ---- Audit instrumentation state (never read by game logic) ----
+  struct AuditEmitted {
+    std::string stage;
+    std::string name;
+    bool is_sfx = false;
+    int slot = 0;
+    int track = 0;
+    int music_volume = 0;
+    int sfx_volume = 0;
+    int pan = 0x80;
+    int voice_class = 0;
+  };
+  std::uint64_t audit_step_ = 0;
+  const char* audit_stage_ = "setup";
+  std::vector<AuditEmitted> audit_emitted_;
+  int audit_rng_index_before_ = 0;
+  std::uint32_t audit_rng_draws_ = 0;
+  std::uint64_t audit_rng_hash_ = 0;
+  std::vector<std::uint32_t> audit_rng_values_;
+  bool audit_gravity_active_ = false;
+  int audit_gravity_rate_ = 0;
+  int audit_gravity_acc_before_ = 0;
+  int audit_descent_attempts_ = 0;
+  int audit_descent_successes_ = 0;
+  int audit_score_before_ = 0;
+  std::uint32_t audit_particles_spawned_ = 0;
+  std::uint32_t audit_particles_dropped_ = 0;
+  std::uint32_t audit_particles_retired_ = 0;
+  std::array<bool, 256> audit_pressed_{};
+  std::array<bool, 256> audit_released_{};
+  std::array<bool, 256> audit_held_at_step_start_{};
 };
 
 }  // namespace atet

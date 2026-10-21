@@ -20,6 +20,18 @@ fi
 
 export SDL_VIDEODRIVER=offscreen SDL_AUDIODRIVER=dummy
 echo "== dynamic tests: $exe =="
+
+# Every run uses a suite-private SETUP.DAT seeded with the defaults, so the checks
+# never write the player's file beside the game data and never depend on its bindings
+# or volumes (a player binding Left to Z silently broke check [3]). $exe becomes a
+# wrapper that adds --setup-dat.
+tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+setup="$tmp/SETUP.DAT"
+command -v cygpath >/dev/null 2>&1 && setup="$(cygpath -m "$setup")"
+printf '#!/usr/bin/env bash\nexec "%s" --setup-dat="%s" "$@"\n' "$exe" "$setup" > "$tmp/port"
+chmod +x "$tmp/port"
+exe="$tmp/port"
+"$exe" --reset-setup --smoke-frames=1 > "$tmp/seed.txt" 2>&1
 fail=0
 pass() { echo "  PASS: $1"; }
 bad()  { echo "  FAIL: $1"; fail=1; }

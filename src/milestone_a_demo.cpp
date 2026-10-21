@@ -14,8 +14,26 @@
 #include <vector>
 
 #include "indexed_asset_loader.h"
+#include "audit_instrument.h"
+
+// Audit instrumentation: count the SDL draw API calls the demo issues per frame.
+// A function-like macro does not re-expand inside its own replacement, so the
+// inner call reaches the real SDL function.
+#define SDL_RenderTexture(...) (++::atet::g_audit.render_texture_calls, SDL_RenderTexture(__VA_ARGS__))
+#define SDL_RenderFillRect(...) (++::atet::g_audit.fill_rect_calls, SDL_RenderFillRect(__VA_ARGS__))
+#define SDL_SetRenderDrawColor(...) (++::atet::g_audit.draw_color_calls, SDL_SetRenderDrawColor(__VA_ARGS__))
 
 namespace atet {
+
+namespace {
+// Scoped perf-counter accumulator for the audit sub-phase timers.
+struct AuditScopedTicks {
+  explicit AuditScopedTicks(std::uint64_t* sink) : sink_(sink), start_(SDL_GetPerformanceCounter()) {}
+  ~AuditScopedTicks() { *sink_ += SDL_GetPerformanceCounter() - start_; }
+  std::uint64_t* sink_;
+  std::uint64_t start_;
+};
+}  // namespace
 
 namespace {
 
@@ -326,18 +344,54 @@ bool ReadBinaryAsset(const char* path, std::vector<Uint8>* bytes_out, std::strin
     return false;
   }
 
-  std::ifstream input(path, std::ios::binary);
-  if (!input) {
-    SetErrorMessage(error_out, "Failed to open binary asset: " + std::string(path));
+  // SDL_LoadFile takes a UTF-8 path on every platform. std::ifstream(const char*)
+  // reads the path in the ANSI code page on Windows, so data in a folder with a
+  // non-ASCII name (SDL_GetBasePath() is UTF-8) was never found.
+  size_t size = 0;
+  void* data = SDL_LoadFile(path, &size);
+  if (data == nullptr) {
+    SetErrorMessage(error_out, "Failed to open binary asset: " + std::string(path) + " (" + SDL_GetError() + ")");
     return false;
   }
 
-  bytes_out->assign(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
-  if (!input.good() && !input.eof()) {
-    SetErrorMessage(error_out, "Failed while reading binary asset: " + std::string(path));
+  const Uint8* begin = static_cast<const Uint8*>(data);
+  bytes_out->assign(begin, begin + size);
+  SDL_free(data);
+  return true;
+}
+
+// An absolute spelling of a search folder ("" = the working directory), always with
+// a trailing separator, for SETUP.DAT paths and log lines.
+std::string AbsoluteDir(const std::string& dir) {
+  if (!dir.empty()) {
+    return dir;  // SDL_GetBasePath() results are absolute and end with a separator
+  }
+  if (char* cwd = SDL_GetCurrentDirectory()) {
+    std::string result(cwd);
+    SDL_free(cwd);
+    return result;
+  }
+  return dir;  // still resolves against the working directory
+}
+
+// True when `path` can be written without changing an existing file: an existing
+// regular file must open for appending, a missing one must be creatable (the empty
+// probe is removed again, so a first run still finds no SETUP.DAT and writes the
+// defaults, as the original does).
+bool IsWritableFile(const std::string& path) {
+  SDL_PathInfo info;
+  const bool exists = SDL_GetPathInfo(path.c_str(), &info);
+  if (exists && info.type != SDL_PATHTYPE_FILE) {
     return false;
   }
-
+  SDL_IOStream* stream = SDL_IOFromFile(path.c_str(), "ab");
+  if (stream == nullptr) {
+    return false;
+  }
+  SDL_CloseIO(stream);
+  if (!exists) {
+    SDL_RemovePath(path.c_str());
+  }
   return true;
 }
 
@@ -872,8 +926,10 @@ bool MilestoneADemo::Initialize(SDL_Renderer* renderer, std::string* error_out, 
   // ATETRIS.ZIP, ATET.DAT extracted via miniz), first next to the executable
   // (portable / release layout, robust to the build machine's drive letter), then
   // the working directory, then the build-tree ATET.DAT as a dev fallback.
+  const Uint64 audit_t_data = SDL_GetPerformanceCounter();
   std::string dat_error = "not found";
   bool loaded = false;
+  std::string data_dir;  // folder of the data file actually loaded ("" = working directory)
   std::vector<std::string> search_dirs;
   if (const char* base_path = SDL_GetBasePath()) {
     search_dirs.emplace_back(base_path);
@@ -892,6 +948,8 @@ bool MilestoneADemo::Initialize(SDL_Renderer* renderer, std::string* error_out, 
           atet_data_.LoadFromDat(bytes, &dat_error)) {
         loaded = true;
         found = true;
+        data_dir = dir;
+        g_audit_startup.data_source = dir + dat_name;
         break;
       }
     }
@@ -904,6 +962,8 @@ bool MilestoneADemo::Initialize(SDL_Renderer* renderer, std::string* error_out, 
       if (ReadBinaryAsset((dir + archive_name).c_str(), &bytes, &ignored) &&
           atet_data_.LoadFromZip(bytes, &dat_error)) {
         loaded = true;
+        data_dir = dir;
+        g_audit_startup.data_source = dir + archive_name;
         break;
       }
     }
@@ -917,13 +977,23 @@ bool MilestoneADemo::Initialize(SDL_Renderer* renderer, std::string* error_out, 
     if (ReadBinaryAsset(ATET_PORT_ATET_DAT_PATH, &bytes, &ignored) &&
         atet_data_.LoadFromDat(bytes, &dat_error)) {
       loaded = true;
+      const std::string fallback = ATET_PORT_ATET_DAT_PATH;
+      const size_t separator = fallback.find_last_of("/\\");
+      data_dir = separator == std::string::npos ? std::string{} : fallback.substr(0, separator + 1);
+      g_audit_startup.data_source = std::string("compiled-fallback:") + ATET_PORT_ATET_DAT_PATH;
     }
   }
+  g_audit_startup.data_ticks = SDL_GetPerformanceCounter() - audit_t_data;
+  const Uint64 audit_t_textures = SDL_GetPerformanceCounter();
   if (!loaded) {
+    std::string searched;
+    for (const std::string& dir : search_dirs) {
+      searched += (searched.empty() ? "" : ", ") + AbsoluteDir(dir);
+    }
     SetErrorMessage(error_out,
                     "Could not load the game data (" + dat_error +
                         "). Place ATET.DAT (or SABA's saba.dat), or an ACiD Tetris / SABA "
-                        "archive, beside the executable.");
+                        "archive, beside the executable. Folders searched: " + searched);
     return false;
   }
 
@@ -957,6 +1027,8 @@ bool MilestoneADemo::Initialize(SDL_Renderer* renderer, std::string* error_out, 
     }
   }
 
+  g_audit_startup.textures_ticks = SDL_GetPerformanceCounter() - audit_t_textures;
+  const Uint64 audit_t_tables = SDL_GetPerformanceCounter();
   if (!LoadFrontendFont(error_out)) {
     return false;
   }
@@ -968,6 +1040,8 @@ bool MilestoneADemo::Initialize(SDL_Renderer* renderer, std::string* error_out, 
   if (!LoadGameplayParticleAssets(error_out)) {
     return false;
   }
+  g_audit_startup.tables_ticks = SDL_GetPerformanceCounter() - audit_t_tables;
+  const Uint64 audit_t_setup = SDL_GetPerformanceCounter();
 
   scene_ = Scene::kFrontend;
   SetFrontendView(FrontendView::kMainMenu, 0);
@@ -1013,6 +1087,7 @@ bool MilestoneADemo::Initialize(SDL_Renderer* renderer, std::string* error_out, 
   ResetSetupStateToDefaults();
   live_game_available_ = false;
   quit_requested_ = false;
+  ResolveSetupDatPath(data_dir);
   const bool loaded_setup = LoadSetupDat();
   if (!loaded_setup) {
     PersistSetupState();
@@ -1026,6 +1101,7 @@ bool MilestoneADemo::Initialize(SDL_Renderer* renderer, std::string* error_out, 
   if (error_out != nullptr) {
     error_out->clear();
   }
+  g_audit_startup.setup_ticks = SDL_GetPerformanceCounter() - audit_t_setup;
 
   return true;
 }
@@ -1088,18 +1164,23 @@ bool MilestoneADemo::HandleKeyDown(SDL_Keycode key) {
     return HandleHighScoreNameEntry(key);
   }
 
-  if (key == SDLK_TAB) {
+  // Developer/test shortcuts (Tab, T, G, 1-3 here; H, O, C, B in gameplay below):
+  // scene jumps, preset boards, injected line clears, a forced top-out or high-score
+  // entry. The original reads none of these keys (in play it polls only the five
+  // bindings, Esc and F5-F8), so they act only with --debug. Otherwise the key falls
+  // through to the normal handlers, and a binding on it gets its press.
+  if (debug_keys_enabled_ && key == SDLK_TAB) {
     scene_ = (scene_ == Scene::kFrontend) ? Scene::kGameplay : Scene::kFrontend;
     return true;
   }
 
-  if (key == SDLK_T) {
+  if (debug_keys_enabled_ && key == SDLK_T) {
     scene_ = Scene::kFrontend;
     SetFrontendView(FrontendView::kMainMenu, 0);
     return true;
   }
 
-  if (key == SDLK_G) {
+  if (debug_keys_enabled_ && key == SDLK_G) {
     if (!live_game_available_) {
       ResetLiveGameplayState();
       live_game_available_ = true;
@@ -1109,7 +1190,7 @@ bool MilestoneADemo::HandleKeyDown(SDL_Keycode key) {
     return true;
   }
 
-  if (key >= SDLK_1 && key <= SDLK_3) {
+  if (debug_keys_enabled_ && key >= SDLK_1 && key <= SDLK_3) {
     gameplay_preset_index_ = static_cast<int>(key - SDLK_1);
     live_game_active_ = false;
     scene_ = Scene::kGameplay;
@@ -1122,20 +1203,20 @@ bool MilestoneADemo::HandleKeyDown(SDL_Keycode key) {
       BeginSceneFade(PendingScene::kFrontendFromGameplay);
       return true;
     }
-    if (key == SDLK_H) {
+    if (debug_keys_enabled_ && key == SDLK_H) {
       BeginHighScoreNameEntry(CurrentRunScore(), CurrentRunLines());
       return true;
     }
-    if (key == SDLK_O) {
+    if (debug_keys_enabled_ && key == SDLK_O) {
       BeginTopOutDemo(CurrentRunScore(), CurrentRunLines());
       return true;
     }
-    if (key == SDLK_C && live_game_active_) {
+    if (debug_keys_enabled_ && key == SDLK_C && live_game_active_) {
       InjectFilledRowsForSmoke((line_clear_demo_count_ % 4) + 1);
       ++line_clear_demo_count_;
       return true;
     }
-    if (key == SDLK_B && live_game_active_) {
+    if (debug_keys_enabled_ && key == SDLK_B && live_game_active_) {
       // Debug: always inject a four-line clear. Press twice in a row to exercise
       // the back-to-back tetris reward (alert tile 8 + slot 11).
       InjectFilledRowsForSmoke(4);
@@ -1551,14 +1632,53 @@ bool MilestoneADemo::LoadGameplayParticleAssets(std::string* error_out) {
   return true;
 }
 
+void MilestoneADemo::ResolveSetupDatPath(const std::string& data_dir) {
+  if (!setup_dat_override_.empty()) {
+    setup_dat_path_ = setup_dat_override_;
+    SDL_Log("SETUP.DAT: %s (from --setup-dat)", setup_dat_path_.c_str());
+    return;
+  }
+
+  // The original opens the bare name "setup.dat" (load 0x36dc, save 0x3604), relative
+  // to the working directory where it also opens "atet.dat", so the two files always
+  // sit in one folder. Keep that: SETUP.DAT lives beside the data file actually
+  // loaded, which is the executable's folder in the release layout.
+  const std::string primary = AbsoluteDir(data_dir) + "SETUP.DAT";
+  if (IsWritableFile(primary)) {
+    setup_dat_path_ = primary;
+    SDL_Log("SETUP.DAT: %s", setup_dat_path_.c_str());
+    return;
+  }
+
+  // Read-only install (Program Files, read-only media) or something in the way:
+  // keep the settings in the per-user data folder instead and say so.
+  if (char* pref = SDL_GetPrefPath("", "saba-reborn")) {
+    setup_dat_path_ = std::string(pref) + "SETUP.DAT";
+    SDL_free(pref);
+    SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "SETUP.DAT: %s is not writable; using the per-user copy %s",
+                primary.c_str(), setup_dat_path_.c_str());
+    return;
+  }
+
+  setup_dat_path_ = primary;
+  SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+              "SETUP.DAT: %s is not writable and no per-user folder is available (%s); settings will not be saved",
+              primary.c_str(), SDL_GetError());
+}
+
 bool MilestoneADemo::LoadSetupDat() {
   std::vector<Uint8> bytes;
   std::string ignored_error;
-  if (!ReadBinaryAsset(ATET_PORT_SETUP_DAT_PATH, &bytes, &ignored_error)) {
+  if (setup_dat_path_.empty() || !ReadBinaryAsset(setup_dat_path_.c_str(), &bytes, &ignored_error)) {
     return false;
   }
 
-  if (bytes.size() != kSetupDatSize) {
+  // 0x36dc checks only that the file opens and that it starts with the 5-byte
+  // 'AciD'+NUL signature, then reads the fields in order with no size check: a short
+  // file leaves the later fields zero, a longer one is read up to byte 178. (This
+  // loader used to reject every size but 178, after which Initialize() overwrote the
+  // player's file with defaults.)
+  if (bytes.size() < kSetupSignature.size()) {
     return false;
   }
 
@@ -1567,6 +1687,7 @@ bool MilestoneADemo::LoadSetupDat() {
       return false;
     }
   }
+  bytes.resize(kSetupDatSize, 0);
 
   sound_device_index_ = std::clamp(
       static_cast<int>(ReadLittleEndian32(bytes, kSetupSoundDeviceOffset)),
@@ -1636,13 +1757,11 @@ bool MilestoneADemo::SaveSetupDat() const {
         static_cast<std::uint32_t>(std::max(0, high_scores_[index].lines)));
   }
 
-  std::ofstream output(ATET_PORT_SETUP_DAT_PATH, std::ios::binary | std::ios::trunc);
-  if (!output) {
+  if (setup_dat_path_.empty()) {
     return false;
   }
-
-  output.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
-  return output.good();
+  // SDL_SaveFile takes a UTF-8 path on every platform (see ReadBinaryAsset).
+  return SDL_SaveFile(setup_dat_path_.c_str(), bytes.data(), bytes.size());
 }
 
 bool MilestoneADemo::RenderGameplayToTexture(SDL_Renderer* renderer, SDL_Texture* texture) {
@@ -1814,6 +1933,7 @@ void MilestoneADemo::RenderFrontendPointfield(SDL_Renderer* renderer) {
   if (frontend_banks_[frontend_current_bank_].empty() || frontend_banks_[frontend_next_bank_].empty()) {
     return;
   }
+  AuditScopedTicks audit_ticks(&g_audit.pointfield_ticks);
 
   const std::vector<FrontendPoint>& current_bank = frontend_banks_[frontend_current_bank_];
   const std::vector<FrontendPoint>& next_bank = frontend_banks_[frontend_next_bank_];
@@ -1868,6 +1988,7 @@ void MilestoneADemo::RenderFrontendPointfield(SDL_Renderer* renderer) {
     };
     SDL_RenderFillRect(renderer, &point_rect);
     occupied[screen_index] = 1;
+    ++g_audit.pointfield_points;
   }
 
   AdvanceFrontendPointfield();
@@ -1877,6 +1998,7 @@ void MilestoneADemo::RenderFrontendRows(
     SDL_Renderer* renderer,
     const std::vector<std::string>& rows,
     int selected_row) const {
+  AuditScopedTicks audit_ticks(&g_audit.frontend_rows_ticks);
   const int revealed_rows = VisibleFrontendRowCount(rows.size());
   const bool steady_selection_pulse = revealed_rows >= static_cast<int>(rows.size());
   const bool high_score_table =
@@ -1957,6 +2079,7 @@ void MilestoneADemo::RenderFrontendText(
           1.0f,
       };
       SDL_RenderTexture(renderer, frontend_font_atlas_.texture, &source, &destination);
+      ++g_audit.glyph_row_draws;
     }
 
     cursor_x += frontend_font_widths_[glyph_index] + 2;
@@ -2136,6 +2259,7 @@ void MilestoneADemo::TrackKeyDown(SDL_Keycode key) {
 
   if (!held_original_scancodes_[original_scancode]) {
     held_original_scancode_frames_[original_scancode] = 0;
+    audit_pressed_[original_scancode] = true;
   }
   held_original_scancodes_[original_scancode] = true;
 }
@@ -2146,6 +2270,9 @@ void MilestoneADemo::TrackKeyUp(SDL_Keycode key) {
     return;
   }
 
+  if (held_original_scancodes_[original_scancode]) {
+    audit_released_[original_scancode] = true;
+  }
   held_original_scancodes_[original_scancode] = false;
   held_original_scancode_frames_[original_scancode] = 0;
 }
@@ -2303,8 +2430,9 @@ void MilestoneADemo::PersistSetupState() const {
   if (!SaveSetupDat()) {
     SDL_LogWarn(
         SDL_LOG_CATEGORY_APPLICATION,
-        "Failed to save SETUP.DAT state: %s",
-        ATET_PORT_SETUP_DAT_PATH);
+        "Failed to save SETUP.DAT state: %s (%s)",
+        setup_dat_path_.c_str(),
+        SDL_GetError());
   }
 }
 
@@ -2321,6 +2449,9 @@ void MilestoneADemo::EmitAudioEvent(const char* event_name, int slot, int pan, i
       sfx_volume_override >= 0 ? sfx_volume_override : sfx_volume_,
       pan,
       voice_class});
+  audit_emitted_.push_back(AuditEmitted{audit_stage_, event_name, true, slot, music_track_index_, music_volume_,
+                                        sfx_volume_override >= 0 ? sfx_volume_override : sfx_volume_, pan,
+                                        voice_class});
 }
 
 int MilestoneADemo::PanForPieceColumn(int piece_x) const {
@@ -2341,6 +2472,8 @@ void MilestoneADemo::EmitMusicEvent(const char* event_name) {
       music_track_index_,
       music_volume_,
       sfx_volume_});
+  audit_emitted_.push_back(
+      AuditEmitted{audit_stage_, event_name, false, 0, music_track_index_, music_volume_, sfx_volume_, 0x80, 0});
 }
 
 void MilestoneADemo::FlushAudioEvents() {
@@ -2694,12 +2827,17 @@ void MilestoneADemo::StepLiveGameplay() {
 }
 
 void MilestoneADemo::StepFallingGameplay() {
+  audit_gravity_active_ = true;
+  audit_gravity_rate_ = CurrentDropIncrement();
+  audit_gravity_acc_before_ = gravity_accumulator_;
   gravity_accumulator_ += CurrentDropIncrement();
   bool moved_down = false;
   while (gravity_accumulator_ >= kGameplayGravityThreshold) {
     gravity_accumulator_ -= kGameplayGravityThreshold;
+    ++audit_descent_attempts_;
     if (TryMoveLivePiece(0, 1)) {
       moved_down = true;
+      ++audit_descent_successes_;
     } else {
       break;
     }
@@ -2854,6 +2992,7 @@ void MilestoneADemo::CollapseMarkedRows() {
 }
 
 void MilestoneADemo::SeedLineClearDebris(const std::vector<int>& rows) {
+  AuditScopedTicks audit_ticks(&g_audit.line_clear_seed_ticks);
   const int style = NormalizeModulo(live_level_, 10);
   for (const int row : rows) {
     if (row < 0 || row >= kBoardHeight) {
@@ -2941,8 +3080,10 @@ void MilestoneADemo::EmitLineClearParticle(int style, int col, int row8, int scr
 
 void MilestoneADemo::SpawnDebrisPolar(int screen_x, int screen_y, int speed, int angle, int lifetime, int color) {
   if (debris_particles_.size() >= kGameplayMaxDebrisParticles) {
+    ++audit_particles_dropped_;
     return;
   }
+  ++audit_particles_spawned_;
   // Polar velocity (0x2f78): v = -(sine[idx] * speed) >> 7 with the original's
   // 0x8001 sine amplitude. sine_table_ here has amplitude 0x10000 (2x), so shift
   // by 8 to reproduce the same velocity scale. Position/velocity are 16.16.
@@ -2956,8 +3097,10 @@ void MilestoneADemo::SpawnDebrisPolar(int screen_x, int screen_y, int speed, int
 
 void MilestoneADemo::SpawnDebrisTarget(int screen_x, int screen_y, int target_x, int target_y, int lifetime, int color) {
   if (debris_particles_.size() >= kGameplayMaxDebrisParticles) {
+    ++audit_particles_dropped_;
     return;
   }
+  ++audit_particles_spawned_;
   // Target velocity (0x3034): v = (target - start) * 65536 / lifetime.
   const int life = std::max(1, lifetime);
   const int vx = ((target_x - screen_x) << 16) / life;
@@ -2967,6 +3110,8 @@ void MilestoneADemo::SpawnDebrisTarget(int screen_x, int screen_y, int target_x,
 }
 
 void MilestoneADemo::StepDebrisParticles() {
+  AuditScopedTicks audit_ticks(&g_audit.debris_step_ticks);
+  const size_t audit_before = debris_particles_.size();
   for (DebrisParticle& particle : debris_particles_) {
     particle.x += particle.vx;
     particle.y += particle.vy;
@@ -2978,9 +3123,13 @@ void MilestoneADemo::StepDebrisParticles() {
           debris_particles_.end(),
           [](const DebrisParticle& particle) { return particle.age >= kDebrisAgeFull; }),
       debris_particles_.end());
+  audit_particles_retired_ += static_cast<std::uint32_t>(audit_before - debris_particles_.size());
+  g_audit.debris_active = static_cast<std::uint32_t>(debris_particles_.size());
 }
 
 void MilestoneADemo::RenderDebrisParticles(SDL_Renderer* renderer) const {
+  AuditScopedTicks audit_ticks(&g_audit.debris_render_ticks);
+  g_audit.debris_active = static_cast<std::uint32_t>(debris_particles_.size());
   for (const DebrisParticle& particle : debris_particles_) {
     const int stage = std::clamp(particle.age >> 8, 0, 3);  // 4 stages of 0x100
     const Uint8 ramp_index = particle_ramps_[static_cast<size_t>(std::clamp(particle.color, 0, 255)) * 4 +
@@ -2997,6 +3146,7 @@ void MilestoneADemo::RenderDebrisParticles(SDL_Renderer* renderer) const {
         1.0f,
     };
     SDL_RenderFillRect(renderer, &debris_rect);
+    ++g_audit.debris_drawn;
   }
 }
 
@@ -3007,6 +3157,7 @@ void MilestoneADemo::RenderDebrisParticles(SDL_Renderer* renderer) const {
 // newly crosses into the dissolved region, spray the certified debris pool
 // upward from that row's filled cells.
 void MilestoneADemo::UpdateTopOutDissolve() {
+  AuditScopedTicks audit_ticks(&g_audit.topout_update_ticks);
   // RE 0x1fc6: the dissolve front advances ONE pixel-row per frame down the whole
   // gameplay area (kBoardHeight*8 pixel rows), spraying that row's debris as it passes.
   // A pixel-row cascade (not board-row bursts) is what makes the next row start
@@ -3218,7 +3369,13 @@ std::uint32_t MilestoneADemo::NextGameplayRandomU32() {
     gameplay_random_index_ = 0;
   }
 
-  return gameplay_random_table_[static_cast<size_t>(gameplay_random_index_)];
+  const std::uint32_t audit_value = gameplay_random_table_[static_cast<size_t>(gameplay_random_index_)];
+  ++audit_rng_draws_;
+  audit_rng_hash_ = Fnv1a64Update(audit_rng_hash_, &audit_value, sizeof(audit_value));
+  if (audit_rng_values_.size() < 16384) {
+    audit_rng_values_.push_back(audit_value);
+  }
+  return audit_value;
 }
 
 void MilestoneADemo::SaveLiveSnapshot() {
@@ -3700,6 +3857,312 @@ void MilestoneADemo::RenderGameplay(SDL_Renderer* renderer) const {
         kGameplayClearX + (piece.x * kPieceTileSize),
         kGameplayClearY + (piece.y * kPieceTileSize));
   }
+}
+
+// ============================================================================
+// Audit instrumentation (audit/instrument worktree only). Read-only views of the
+// demo state plus per-step accumulators reset by AuditBeginStep.
+// ============================================================================
+namespace {
+
+const char* AuditActionName(size_t index) {
+  static constexpr const char* kNames[8] = {"up",          "down",         "left",    "right",
+                                            "rotate_left", "rotate_right", "confirm", "escape"};
+  return index < 8 ? kNames[index] : "?";
+}
+
+}  // namespace
+
+void MilestoneADemo::AuditBeginStep(std::uint64_t step) {
+  audit_step_ = step;
+  audit_stage_ = "input";
+  audit_emitted_.clear();
+  audit_rng_index_before_ = gameplay_random_index_;
+  audit_rng_draws_ = 0;
+  audit_rng_hash_ = kFnvOffsetBasis;
+  audit_rng_values_.clear();
+  audit_gravity_active_ = false;
+  audit_gravity_rate_ = 0;
+  audit_gravity_acc_before_ = gravity_accumulator_;
+  audit_descent_attempts_ = 0;
+  audit_descent_successes_ = 0;
+  audit_score_before_ = live_score_;
+  audit_particles_spawned_ = 0;
+  audit_particles_dropped_ = 0;
+  audit_particles_retired_ = 0;
+  audit_pressed_.fill(false);
+  audit_released_.fill(false);
+  audit_held_at_step_start_ = held_original_scancodes_;
+}
+
+void MilestoneADemo::AuditWritePresentation(JsonOut& json) const {
+  json.BeginObject()
+      .Key("splash_frame").Int(splash_frame_)
+      .Key("frontend_frame_counter").Int(frontend_frame_counter_)
+      .Key("frontend_view_frame").Int(frontend_view_frame_)
+      .Key("pulse").Int(PulseRevealAmount())
+      .Key("top_out_frame").Int(top_out_frame_)
+      .Key("top_out_dissolved_pixel_rows").Int(top_out_dissolved_rows_)
+      .Key("debris").UInt(debris_particles_.size())
+      .Key("fade_alpha").Int(screen_fade_alpha())
+      .EndObject();
+}
+
+void MilestoneADemo::AuditWriteEmittedEvents(JsonOut& json) const {
+  json.BeginArray();
+  for (const AuditEmitted& event : audit_emitted_) {
+    json.BeginObject().Key("stage").Str(event.stage).Key("kind").Str(event.is_sfx ? "sfx" : "music").Key("name").Str(
+        event.name);
+    if (event.is_sfx) {
+      json.Key("slot").Int(event.slot).Key("sfx_volume").Int(event.sfx_volume).Key("pan").Int(event.pan).Key(
+          "voice_class").Int(event.voice_class);
+    } else {
+      json.Key("track").Int(event.track).Key("music_volume").Int(event.music_volume);
+    }
+    json.EndObject();
+  }
+  json.EndArray();
+}
+
+void MilestoneADemo::AuditWriteState(JsonOut& json, bool include_rng_values) const {
+  const char* scene = "frontend";
+  switch (scene_) {
+    case Scene::kSplash: scene = "splash"; break;
+    case Scene::kFrontend: scene = "frontend"; break;
+    case Scene::kGameplay: scene = "gameplay"; break;
+    case Scene::kTopOut: scene = "topout"; break;
+  }
+  const char* view = "main_menu";
+  switch (frontend_view_) {
+    case FrontendView::kMainMenu: view = "main_menu"; break;
+    case FrontendView::kOptions: view = "options"; break;
+    case FrontendView::kKeyboardSetup: view = "keyboard_setup"; break;
+    case FrontendView::kHighScores: view = "high_scores"; break;
+    case FrontendView::kHighScoreEntry: view = "high_score_entry"; break;
+    case FrontendView::kCredits: view = "credits"; break;
+    case FrontendView::kSoundSetup: view = "sound_setup"; break;
+  }
+  const char* phase = "falling";
+  if (gameplay_phase_ == GameplayPhase::kCollapse) {
+    phase = "collapse";
+  } else if (gameplay_phase_ == GameplayPhase::kTopOutDissolve) {
+    phase = "topout_dissolve";
+  }
+  const char* fade = screen_fade_ == ScreenFade::kOut ? "out" : screen_fade_ == ScreenFade::kIn ? "in" : "none";
+  const char* pending = "none";
+  switch (pending_scene_) {
+    case PendingScene::kNone: pending = "none"; break;
+    case PendingScene::kFrontendFromGameplay: pending = "frontend_from_gameplay"; break;
+    case PendingScene::kGameplayNewGame: pending = "gameplay_new_game"; break;
+    case PendingScene::kGameplayResume: pending = "gameplay_resume"; break;
+  }
+
+  json.Key("scene").Str(scene).Key("scene_name").Str(scene_name());
+  json.Key("splash").BeginObject().Key("page").Int(splash_page_).Key("frame").Int(splash_frame_).EndObject();
+  json.Key("session")
+      .BeginObject()
+      .Key("live_game_active").Bool(live_game_active_)
+      .Key("live_game_available").Bool(live_game_available_)
+      .Key("quit_requested").Bool(quit_requested_)
+      .Key("gameplay_preset").Int(gameplay_preset_index_)
+      .EndObject();
+  json.Key("phase").Str(phase);
+
+  // Piece (port numbering; geometry from RotatedCells, i.e. what draw/collision use).
+  json.Key("piece").BeginObject().Key("id").Int(live_piece_.type).Key("rotation").Int(live_piece_.rotation).Key("x").Int(
+      live_piece_.x).Key("y").Int(live_piece_.y).Key("next").Int(live_next_piece_type_);
+  json.Key("cells").BeginArray();
+  for (const CellOffset& cell : RotatedCells(live_piece_.type, live_piece_.rotation)) {
+    json.BeginArray().Int(live_piece_.x + cell.x).Int(live_piece_.y + cell.y).EndArray();
+  }
+  json.EndArray();
+  json.Key("stats").BeginArray();
+  for (const int count : live_piece_stats_) {
+    json.Int(count);
+  }
+  json.EndArray().EndObject();
+
+  // Gravity bracket for this step (StepFallingGameplay); rate includes the 0x8000 soft-drop override.
+  json.Key("gravity").BeginObject().Key("stepped").Bool(audit_gravity_active_);
+  if (audit_gravity_active_) {
+    json.Key("rate").Int(audit_gravity_rate_).Key("acc_before").Int(audit_gravity_acc_before_);
+  } else {
+    json.Key("rate").Null().Key("acc_before").Null();
+  }
+  json.Key("acc_after").Int(gravity_accumulator_)
+      .Key("natural_rate").Int(CurrentGravityRate())
+      .Key("soft_drop_override").Bool(audit_gravity_active_ && audit_gravity_rate_ == kSoftDropIncrement &&
+                                      CurrentGravityRate() != kSoftDropIncrement)
+      .Key("descent_attempts").Int(audit_descent_attempts_)
+      .Key("descent_successes").Int(audit_descent_successes_)
+      .Key("lock_frames").Int(lock_frames_)
+      .Key("down_lockout").Int(down_lockout_frames_)
+      .EndObject();
+
+  // Input: the eight semantic actions (v1 trace order) mapped through the bindings.
+  const std::array<std::uint8_t, 8> action_scancodes = {
+      0xC8, keyboard_bindings_[0], keyboard_bindings_[1], keyboard_bindings_[2],
+      keyboard_bindings_[3], keyboard_bindings_[4], 0x1C, 0x01};
+  auto write_set = [&](const std::array<bool, 256>& states) {
+    json.BeginArray();
+    for (size_t i = 0; i < action_scancodes.size(); ++i) {
+      const std::uint8_t sc = action_scancodes[i];
+      if (sc != 0 && states[sc]) {
+        json.Str(AuditActionName(i));
+      }
+    }
+    json.EndArray();
+  };
+  json.Key("input").BeginObject();
+  json.Key("held_at_step_start");
+  write_set(audit_held_at_step_start_);
+  json.Key("held");
+  write_set(held_original_scancodes_);
+  json.Key("pressed");
+  write_set(audit_pressed_);
+  json.Key("released");
+  write_set(audit_released_);
+  json.Key("held_frames").BeginObject();
+  for (size_t i = 0; i < action_scancodes.size(); ++i) {
+    const std::uint8_t sc = action_scancodes[i];
+    json.Key(AuditActionName(i)).Int(sc != 0 && held_original_scancodes_[sc] ? held_original_scancode_frames_[sc] : 0);
+  }
+  json.EndObject();
+  // Gameplay auto-repeat fires in Tick when held_frames > 0 && held_frames % 8 == 0
+  // (kGameplayBindingRepeatFrames); the frontend Left/Right edit repeats at 12 then every 4.
+  json.Key("das_period").Int(kGameplayBindingRepeatFrames);
+  json.Key("held_raw").BeginArray();
+  for (size_t sc = 0; sc < held_original_scancodes_.size(); ++sc) {
+    if (held_original_scancodes_[sc]) {
+      json.Int(static_cast<int>(sc));
+    }
+  }
+  json.EndArray().EndObject();
+
+  // RNG (consumption 0x3280 model): draws this step, FNV-1a64 over the raw LE u32 values.
+  json.Key("rng")
+      .BeginObject()
+      .Key("seed").UInt(piece_seed_)
+      .Key("state").UInt(gameplay_random_state_)
+      .Key("index_before").Int(audit_rng_index_before_)
+      .Key("index_after").Int(gameplay_random_index_)
+      .Key("draws").UInt(audit_rng_draws_)
+      .Key("values_fnv1a64").Str(Hex64(audit_rng_hash_));
+  json.Key("values");
+  if (include_rng_values || audit_rng_draws_ <= 8) {
+    json.BeginArray();
+    for (const std::uint32_t value : audit_rng_values_) {
+      json.UInt(value);
+    }
+    json.EndArray();
+  } else {
+    json.Null();
+  }
+  json.EndObject();
+
+  // Board: 20 rows top->bottom, 10 cells left->right, value = cell byte (0 empty,
+  // 1..7 = port piece type + 1). Hash = FNV-1a64 over the 200 bytes (v1 board domain).
+  std::uint64_t board_hash = kFnvOffsetBasis;
+  for (const int cell : live_board_cells_) {
+    const std::uint8_t byte = static_cast<std::uint8_t>(cell);
+    board_hash = Fnv1a64Update(board_hash, &byte, 1);
+  }
+  json.Key("board").BeginObject().Key("fnv1a64").Str(Hex64(board_hash)).Key("rows").BeginArray();
+  for (int y = 0; y < kBoardHeight; ++y) {
+    std::string row;
+    for (int x = 0; x < kBoardWidth; ++x) {
+      row += static_cast<char>('0' + std::clamp(live_board_cells_[static_cast<size_t>(y * kBoardWidth + x)], 0, 9));
+    }
+    json.Str(row);
+  }
+  json.EndArray().EndObject();
+
+  json.Key("score")
+      .BeginObject()
+      .Key("value").Int(live_score_)
+      .Key("lines").Int(live_lines_)
+      .Key("level").Int(live_level_)
+      .Key("start_level").Int(start_level_)
+      .Key("delta").Int(live_score_ - audit_score_before_)
+      .EndObject();
+
+  json.Key("clear").BeginObject().Key("rows").BeginArray();
+  for (const int row : pending_clear_rows_) {
+    json.Int(row);
+  }
+  json.EndArray().Key("collapse_frame").Int(collapse_frame_).EndObject();
+
+  json.Key("particles")
+      .BeginObject()
+      .Key("active").UInt(debris_particles_.size())
+      .Key("spawned").UInt(audit_particles_spawned_)
+      .Key("dropped_at_cap").UInt(audit_particles_dropped_)
+      .Key("retired").UInt(audit_particles_retired_)
+      .EndObject();
+
+  json.Key("warning")
+      .BeginObject()
+      .Key("band").Int(warning_band_)
+      .Key("cooldowns").BeginArray().Int(warning_cooldowns_[0]).Int(warning_cooldowns_[1]).Int(warning_cooldowns_[2]).EndArray()
+      .Key("sleepy").Bool(sleepy_)
+      .Key("frames_since_clear").Int(frames_since_clear_)
+      .EndObject();
+
+  json.Key("alert").BeginObject().Key("id");
+  if (alert_effect_id_ >= 0) {
+    json.Int(alert_effect_id_);
+  } else {
+    json.Null();
+  }
+  json.Key("lifetime").Int(alert_lifetime_).Key("reveal_frame").Int(alert_reveal_frame_).EndObject();
+
+  json.Key("topout")
+      .BeginObject()
+      .Key("frame").Int(top_out_frame_)
+      .Key("gameplay_frame").Int(gameplay_top_out_frame_)
+      .Key("dissolved_pixel_rows").Int(top_out_dissolved_rows_)
+      .Key("overlay_visible").Bool(scene_ == Scene::kTopOut && top_out_frame_ >= kTopOutOverlayStartFrame &&
+                                   top_out_frame_ < kTopOutOverlayEndFrame)
+      .Key("saved_under_valid").Bool(top_out_saved_under_valid_)
+      .Key("handoff_pending").Bool(top_out_handoff_pending_)
+      .EndObject();
+
+  json.Key("frontend")
+      .BeginObject()
+      .Key("view").Str(view)
+      .Key("selected_row").Int(frontend_selected_row_)
+      .Key("view_frame").Int(frontend_view_frame_)
+      .Key("frame_counter").Int(frontend_frame_counter_)
+      .Key("cycle_counter").Int(frontend_cycle_counter_)
+      .Key("bank").Int(frontend_current_bank_)
+      .Key("next_bank").Int(frontend_next_bank_)
+      .Key("pulse").Int(PulseRevealAmount())
+      .Key("visible_rows").Int(scene_ == Scene::kFrontend ? VisibleFrontendRowCount(CurrentFrontendRows().size()) : 0)
+      .Key("conceal_frames").Int(high_score_conceal_frames_)
+      .Key("hs_bootstrap_remaining").Int(HighScoreBootstrapRemainingFrames())
+      .Key("credits_page").Int(credits_page_)
+      .Key("credits_timer").Int(credits_page_timer_)
+      .Key("keyboard_capture_row").Int(keyboard_capture_row_)
+      .Key("entry_row").Int(high_score_entry_row_)
+      .Key("entry_name").Str(high_score_entry_name_)
+      .Key("commit_pending").Bool(high_score_entry_commit_pending_)
+      .EndObject();
+
+  json.Key("fade")
+      .BeginObject()
+      .Key("state").Str(fade)
+      .Key("frame").Int(screen_fade_frame_)
+      .Key("alpha").Int(screen_fade_alpha())
+      .Key("pending_scene").Str(pending)
+      .Key("enabled").Bool(fades_enabled_)
+      .EndObject();
+
+  json.Key("settings")
+      .BeginObject()
+      .Key("music_volume").Int(music_volume_)
+      .Key("sfx_volume").Int(sfx_volume_)
+      .Key("music_track_index").Int(music_track_index_)
+      .EndObject();
 }
 
 }  // namespace atet

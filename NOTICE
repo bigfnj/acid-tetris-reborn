@@ -4,8 +4,10 @@ ACiD Tetris Reborn — third-party and original-work notices
 This port is an independent, non-commercial fan project by BigFNj
 (https://github.com/bigfnj/acid-tetris-reborn). It is not affiliated with,
 endorsed by, or sponsored by the original authors, Dungeon Dwellers Design, or
-The Tetris Company. The port's own code and release binaries are released under
-0BSD (do anything, no attribution required); see LICENSE.
+The Tetris Company. The port's own source code is released under 0BSD (do
+anything, no attribution required); see LICENSE. Release binaries also contain
+the third-party components listed at the end of this file, under their own
+licences.
 
 Original game
 -------------
@@ -30,10 +32,14 @@ the game's own ATET.DOC reads:
   CODE IS STRICTLY PROHIBITED.  WE ARE NOT RESPONSIBLE FOR ANY DAMAGE CAUSED TO
   YOU, YOUR COMPUTER, OR ANYTHING BY THIS PROGRAM.
 
-Because of those terms, the SOURCE REPOSITORY ships NO part of the original game:
-no ATET.DAT / saba.dat, no extracted or converted graphics/audio/music, and no
-original program code. The port decodes what it needs from a copy of the game you
-supply, at runtime (see README.md); nothing in the original data file is modified.
+Because of those terms, the SOURCE REPOSITORY ships no game data (no ATET.DAT /
+saba.dat, no extracted audio or music) and no original program code, with two
+exceptions: app_icon.ico, which is built into the Windows executable, is a
+converted copy of one of the game's mood-face graphics (tile 0 of data chunk 6),
+and a few short texts and tables (menu strings, the credits pages, the default
+high-score table) are transcribed from the original program. The port decodes
+everything else from a copy of the game you supply, at runtime (see README.md);
+nothing in the original data file is modified.
 
 SABA (Super ACiD Block Attack)
 ------------------------------
@@ -41,15 +47,15 @@ In 2002 the authors re-released the same game, renamed SABA, to avoid confusion
 with The Tetris Company's products. SABA is (C) 1997/2002 Jason Pimble & Scott
 Emerle (same credits as above) and is distributed by them as freeware. Its data
 file `saba.dat` is byte-identical to `ATET.DAT` except the title-screen logo, so
-this port plays identically from either.
+this port plays the same game from either.
 
-The pre-built RELEASE downloads (not the source repository) bundle SABA's intact,
-unmodified original archive `saba.zip` exactly as the authors distribute it
-(from dddgames.com), so the download is turnkey. That archive is redistributed
-whole and unaltered, per its own freeware terms; the port itself remains
-asset-free and simply reads `saba.dat` from the bundled archive at runtime. If you
-prefer the original "ACiD Tetris" title screen, you can drop in ACiD Tetris's own
-`ATET.DAT` instead (see README.md).
+RELEASE downloads contain no game data by default. SABA's own notice allows
+distribution only as the original self-extracting archive and asks anyone who
+includes it in a collection to contact the authors, so the release workflow
+bundles SABA's intact, unmodified archive `saba.zip` only when the maintainer has
+that permission on record (its BUNDLE_SABA switch). The port itself stays
+asset-free and reads `saba.dat` from such an archive at runtime. You can always
+drop in ACiD Tetris's own `ATET.DAT` instead (see README.md).
 
 Trademark
 ---------
@@ -59,6 +65,18 @@ association. (The original was itself renamed "SABA" in 2002.)
 
 Third-party code
 ----------------
-- miniz — public-domain / MIT-style (unlicense). See third_party/miniz/LICENSE.
-- SDL3 — zlib license. Fetched at build time from https://github.com/libsdl-org/SDL
-- libmikmod — LGPL. Fetched at build time from https://github.com/sezero/mikmod
+Release downloads carry each licence text below in LICENSES/.
+- miniz 3.0.2 (vendored in third_party/miniz, compiled into the executable): MIT
+  licence, Copyright 2013-2014 RAD Game Tools and Valve Software, Copyright
+  2010-2014 Rich Geldreich and Tenacious Software LLC; see
+  third_party/miniz/LICENSE. Part of miniz.c also carries an Unlicense
+  public-domain dedication.
+- SDL3 3.4.4: zlib licence. Downloaded at build time from
+  https://github.com/libsdl-org/SDL and shipped beside the executable
+  (SDL3.dll / libSDL3.so).
+- libmikmod 3.3.13: GNU Library General Public License, version 2 or (at your
+  option) any later version. Downloaded at build time from
+  https://github.com/sezero/mikmod (tag libmikmod-3.3.13, its complete
+  corresponding source) and linked statically into the executable; this
+  repository's source and build files let you rebuild the port against a
+  modified libmikmod.

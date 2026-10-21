@@ -42,16 +42,33 @@ run(){ # name -> args...; captures to $tmp/name.txt, returns exit code
 
 echo "== exe: $exe =="
 
+# Every run reads and writes a suite-private SETUP.DAT, never the player's file beside
+# the game data: several scenarios reset it (--reset-setup) and one commits a
+# 'Player 17500 36' score. $exe becomes a wrapper that adds --setup-dat, and the file
+# is seeded with the defaults so every scenario starts from the same settings.
+setup="$tmp/SETUP.DAT"
+command -v cygpath >/dev/null 2>&1 && setup="$(cygpath -m "$setup")"
+printf '#!/usr/bin/env bash\nexec "%s" --setup-dat="%s" "$@"\n' "$exe" "$setup" > "$tmp/port"
+chmod +x "$tmp/port"
+exe="$tmp/port"
+"$exe" --reset-setup --smoke-frames=1 > "$tmp/seed.txt" 2>&1
+
 echo "[1] scenarios exit 0"
 declare -A rc
 rc[basic3]=$(run basic3 --smoke-frames=3)
-rc[lineclear]=$(run lineclear --live-demo --scripted-input=@"$ss/live-line-clear.txt" --smoke-frames=90)
+# The C key that injects rows is a developer key, active only with --debug.
+rc[lineclear]=$(run lineclear --debug --debug-state --live-demo --scripted-input=@"$ss/live-line-clear.txt" --smoke-frames=90)
 rc[pauseresume]=$(run pauseresume --live-demo --scripted-input=@"$ss/pause-resume.txt" --smoke-frames=100)
 rc[hiscore]=$(run hiscore --reset-setup --topout-demo --scripted-input=@"$ss/high-score-exit.txt" --smoke-frames=240 --debug-state)
 rc[topout1400]=$(run topout1400 --reset-setup --topout-demo --smoke-frames=1400)
 for n in basic3 lineclear pauseresume hiscore topout1400; do
   [ "${rc[$n]}" = "0" ] && pass "$n EXIT=0" || fail "$n EXIT=${rc[$n]}"
 done
+# The scenario must really inject: the C press on frame 8 restarts the collapse.
+# (Without --debug the key does nothing and frame 8 shows collapse=9.)
+tr -d '\r' < "$tmp/lineclear.txt" | grep 'Debug state:' | sed -n '9p' | grep -q 'collapse=1 ' \
+  && pass "lineclear: C injected rows on frame 8 (collapse restarted)" \
+  || fail "lineclear: C did not inject rows on frame 8 ($(tr -d '\r' < "$tmp/lineclear.txt" | grep 'Debug state:' | sed -n '9p' | grep -o 'collapse=[0-9]*'))"
 
 echo "[2] top-out fingerprint"
 for pat in "topout=160" "topout=760" "hsboot=72"; do
