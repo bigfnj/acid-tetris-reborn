@@ -15,9 +15,11 @@ SOFTWARE.
 
 --------------------------------------------------------------------------------
 
-The 0BSD grant above applies to this port's own code, build, and release binaries
-(do whatever you like with them, no attribution required). It does NOT cover the
+The 0BSD grant above applies to this port's own source code and build files (do
+whatever you like with them, no attribution required). It does NOT cover the
 original game this port re-implements. ACiD Tetris / SABA and all of their code,
 data, and assets are (C) 1997/2002 Jason Pimble & Scott Emerle / Dungeon Dwellers
 Design, distributed by them as freeware; see NOTICE. Third-party components retain
-their own licenses: miniz (third_party/miniz/LICENSE), SDL3 (zlib), libmikmod (LGPL).
+their own licenses. Release binaries contain libmikmod (GNU LGPL v2 or later,
+linked statically), miniz (MIT, third_party/miniz/LICENSE) and SDL3 (zlib), and
+release downloads carry their license texts in LICENSES/.

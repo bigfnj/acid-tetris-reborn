@@ -1,1 +1,1 @@
-2:esc,20:down,24:down,28:down,32:down,36:down,40:down,44:down,48:enter
+2:esc,3:esc:up,60:up,61:up:up,100:enter,101:enter:up

@@ -14,8 +14,26 @@
 #include <vector>
 
 #include "indexed_asset_loader.h"
+#include "audit_instrument.h"
+
+// Audit instrumentation: count the SDL draw API calls the demo issues per frame.
+// A function-like macro does not re-expand inside its own replacement, so the
+// inner call reaches the real SDL function.
+#define SDL_RenderTexture(...) (++::atet::g_audit.render_texture_calls, SDL_RenderTexture(__VA_ARGS__))
+#define SDL_RenderFillRect(...) (++::atet::g_audit.fill_rect_calls, SDL_RenderFillRect(__VA_ARGS__))
+#define SDL_SetRenderDrawColor(...) (++::atet::g_audit.draw_color_calls, SDL_SetRenderDrawColor(__VA_ARGS__))
 
 namespace atet {
+
+namespace {
+// Scoped perf-counter accumulator for the audit sub-phase timers.
+struct AuditScopedTicks {
+  explicit AuditScopedTicks(std::uint64_t* sink) : sink_(sink), start_(SDL_GetPerformanceCounter()) {}
+  ~AuditScopedTicks() { *sink_ += SDL_GetPerformanceCounter() - start_; }
+  std::uint64_t* sink_;
+  std::uint64_t start_;
+};
+}  // namespace
 
 namespace {
 
@@ -44,56 +62,78 @@ constexpr int kFrontendRenderHeight = 16;
 constexpr int kFrontendRowY = 0x64;
 constexpr int kFrontendRowStep = 0x11;
 constexpr int kFrontendTextCenterX = 0xA0;
-// High-score table columns (logical 320-space), measured from the running
-// original: names left-aligned, score and lines right-aligned into columns.
-constexpr int kHiscoreNameLeftX = 94;
-constexpr int kHiscoreScoreRightX = 230;
-constexpr int kHiscoreLinesRightX = 266;
-constexpr int kFrontendSteadyFrames = 0x258;
-constexpr int kFrontendMorphFrames = 0x80;
-constexpr int kFrontendObjectWarmupFrames = 12;
-constexpr int kFrontendRowRevealIntervalFrames = 4;
-constexpr int kCreditsPageFrames = 360;
-constexpr int kFrontendHoldStartFrames = 12;
-constexpr int kFrontendHoldRepeatFrames = 4;
+// High-score table (0x50b0): name, score and lines are each CENTRED (0x60cc with
+// ECX = 1) at x 0x69, 0xdc and 0x118; row 5 is empty and the footer is row 6 at
+// y 0xca (the generic row y for index 6).
+constexpr int kHiscoreNameCenterX = 0x69;
+constexpr int kHiscoreScoreCenterX = 0xDC;
+constexpr int kHiscoreLinesCenterX = 0x118;
+constexpr int kHiscoreFooterRow = 6;
+constexpr int kFrontendSteadyFrames = 0x258;   // 0x39c4: next bank picked at counter 600
+constexpr int kFrontendMorphFrames = 0x80;     // ... morph 128 steps, switch at 728
+constexpr int kFrontendRowCount = 8;
+// Frontend timing, all in logic ticks of the PIT clock (STATIC-EXACT, see
+// audit-2026-10 frontend-flow / timing-reconciled):
+constexpr int kRevealSteps = 0x30;             // 0x3df4 / 0x3ee4: 48 steps
+constexpr int kFadeTicks = 0x3F;               // 0x64f0 / 0x63b8 / 0x62e0 / 0x6498 exit at e >= 63
+constexpr int kFrontendRestLevel = kFadeTicks - 1;  // 0x63b8's last upload is level 62
+constexpr int kPulseStep = 0x20;               // 0x3fd8: +0x20 per steady tick
+constexpr int kPulsePhaseMask = 0x7FF;
+constexpr int kMusicChangeWaitTicks = 0x20;    // 0x6544: 0x699e(2, 0x20) and its busy wait
+constexpr int kExitMusicRampTicks = 0x40;      // state 3: 0x699e(2, 0x40)
+// Ticks between the WARNING's last upload and the 0x6544 call (chunk decode and
+// page clears at main 0x2eb-0x3cb). The Unicorn oracle (device None, zero-time
+// disk) measures 1; DOSBox-X at Pentium-133 speed takes about 5 more. Disk and
+// CPU time are not part of the code, so the zero-disk oracle value is used.
+constexpr int kBootLoadAllowanceTicks = 1;
+constexpr int kSplashFadeInEnd = 0x7F;         // 0x2998: fade-in e = 1..127
+constexpr int kSplashHoldTicks = 0x78;         // hold 120 ticks
+constexpr int kSplashFadeOutUploads = 0x80;    // fade-out e = 0..127 (128 uploads)
+constexpr int kCreditsHoldEnd = 0x12C;         // 0x4f38: conceal staged when the counter reaches 300
+// 0x9C8 (0xB33/0xB91/0xBFF/0xC6F): a Left/Right/A/S action reloads its repeat timer with 8.
 constexpr int kGameplayBindingRepeatFrames = 8;
 constexpr int kGameplayGravityThreshold = 0x10000;
-// RE gameplay-input-timing-pass: while Down is held the per-frame gravity increment
-// is overridden to 0x8000 (half the descent threshold) => one row every two frames.
+// 0x9C8 0xCB4..0xCBD: while Down is held and the Down lockout is 0 the per-step gravity increment
+// is replaced by 0x8000 (half the descent threshold) => one row every two steps.
 constexpr int kSoftDropIncrement = 0x8000;
-constexpr int kGameplayLockFrames = 24;
-constexpr int kGameplayCollapseFramesPerRow = 12;
+// 0x1D04: each cleared row is collapsed over 8 calls (0x1D68 cmp ebx,8), one call per step.
+constexpr int kCollapseStepsPerRow = 8;
+// 0x9C8 0xE6F..0xE76: a clearing lock arms the Down lockout [0x2C783] with 0x348 live steps.
+constexpr int kDownLockoutAfterClear = 0x348;
+// 0x1348 0x13C6..0x13DF: every promoted piece starts at x=4, y=0, rotation 0.
+constexpr int kSpawnX = 4;
 constexpr int kGameplayMaxDebrisParticles = 4096;  // 0x1000, matching the original particle-pool cap
 constexpr int kDebrisAgeFull = 0x400;              // age accumulator reaches this at end of life (4 stages of 0x100)
-constexpr int kGameplayDownLockoutFrames = 8;
-constexpr int kWarningLowRow = 8;
-constexpr int kWarningMediumRow = 5;
-constexpr int kWarningHighRow = 2;
-constexpr int kWarningCooldownFrames = 120;
-constexpr int kSleepyNoClearFrames = 60 * 45;
-constexpr int kAlertEventLifetime = 96;  // frames a one-shot mood face (clear/wake) stays up (~1.4s @70fps)
-constexpr int kHighScoreConcealFrames = 36;
-constexpr int kHighScoreTableRevealRows = 6;
-// Boot-splash + fade durations measured from the running original (kryptos boot
-// capture at 60 Hz): each splash page fades in ~2.0s, holds ~2.0s, fades out ~2.0s
-// (~6.0s/page), and screen fades run ~2.0s. The port had ~0.4s splash fades and ~1.07s
-// screen fades -- "WAY too fast" -- because the fade tick-counts were guessed small to
-// fit a too-short 120-frame page. (RE 0x6498/0x64f0 = 0x40 palette STEPS, but the
-// running fade advances slower than one step/frame, so the wall-clock duration is ~2s;
-// the port models each fade as a linear ramp over the measured frame duration.)
-constexpr int kSplashPageFrames = 360;   // ~6.0s at 60 Hz: 2s fade-in + 2s hold + 2s fade-out
-constexpr int kScreenFadeTicks = 120;    // ~2.0s screen fade (title/menu + gameplay<->frontend)
-constexpr int kSplashFadeTicks = 120;    // ~2.0s splash fade-in/out within a page
-constexpr int kTopOutTimingFps = 60;
-// RE 0x1f8c/0x1fc6: the top-out dissolve sweeps exactly ONE pixel-row per frame down
-// the whole gameplay area (kBoardHeight*8 = 160 pixel rows), so the spray completes in
-// ~160 frames (~2.3s at 70Hz), not the earlier 11s guess. With each particle living
-// 16..79 frames, dozens of rows are mid-explosion at once = a continuous cascade.
-constexpr int kTopOutDissolveFrames = kBoardHeight * kPieceTileSize;  // 160
-constexpr int kTopOutOverlayStartFrame = kTopOutDissolveFrames;       // GAME OVER right after
-constexpr int kTopOutOverlayEndFrame = kTopOutOverlayStartFrame + 10 * kTopOutTimingFps;  // ~hold
-constexpr int kTopOutHandoffFrame = kTopOutOverlayEndFrame + 20;
-constexpr int kState9BootstrapFrames = 72;
+// Stack warnings (0x21C4, start of every normal step): r = first occupied row - 1;
+// r < 2 high (face 5), r < 4 mid (face 4), r < 7 low (face 3). Every in-band step reloads
+// its band's cooldown (and the lower ones) to 300, so a face and its sound come once per
+// climb into a band whose cooldown has run out.
+constexpr int kWarningHighLimit = 2;
+constexpr int kWarningMidLimit = 4;
+constexpr int kWarningLowLimit = 7;
+constexpr int kWarningCooldownTicks = 0x12C;
+// Mood faces (0x2008 trigger / 0x206C update). Lifetimes count logic steps; the sleepy and
+// fast-follow tests compare the PIT tick counter 0x2D2A3 (Tick32(), which also runs through
+// menus and fades) with the tick of the last clear.
+constexpr int kAlertFaceX = 20;   // 0x1793D / 0x2138: working screen + 0xAF14 = (20,140)
+constexpr int kAlertFaceY = 140;
+constexpr int kAlertFaceSize = 50;
+constexpr Uint8 kAlertTransparentIndex = 0x20;
+constexpr int kAlertClearLifetime = 0xA0;    // clear, wake, fast-follow and warning faces
+constexpr int kAlertSleepyLifetime = 0x140;  // 0x10B8
+constexpr int kAlertInfiniteLifetime = -1;   // top-out face (0x1037)
+constexpr std::uint32_t kSleepyTicksSinceClear = 0x708;  // exactly 1800 ticks (0x10A6)
+constexpr std::uint32_t kFastFollowTicks = 0xA0;         // 0x0F5F / 0x0F83, unsigned compare
+constexpr std::array<int, 6> kAlertRevealRows = {50, 40, 30, 20, 10, 1};  // table 0x9B0, by counter - 1
+// (The old 120-frame splash/screen fade constants were fitted to a capture; every
+// frontend fade is now the original's tick-exact palette level, see kFadeTicks.)
+// Top-out (0x1F8C/0x1EDC): from the tick after the failed spawn, one 80-pixel scanline of
+// the well per tick (y = 21..180) is sprayed and erased; GAME OVER (0x22FC, 128x36 at
+// (85,83)) is drawn in the tick of the 160th. Nothing times out after that: the session
+// loop leaves the game-over screen only on an Esc release (0x4A3..0x4D6).
+constexpr int kTopOutDissolveFrames = kBoardHeight * kPieceTileSize;  // 160 scanlines
+constexpr int kGameOverX = 0x55;
+constexpr int kGameOverY = 0x53;
 constexpr int kFrontendRecordSize = 0x1C;
 constexpr int kFrontendRecordCount = 0x400;
 constexpr int kFrontendBankCount = 8;
@@ -114,10 +154,6 @@ constexpr int kSetupHighScoreOffset = 0x26;
 constexpr int kSetupHighScoreRecordSize = 0x1C;
 constexpr int kSetupHighScoreNameLength = 20;
 constexpr int kSetupHighScoreCount = 5;
-
-bool IsTopOutAdvanceKey(SDL_Keycode key) {
-  return key == SDLK_RETURN || key == SDLK_ESCAPE || key == SDLK_BACKSPACE || key == SDLK_SPACE;
-}
 
 struct CounterLayout {
   int x;
@@ -155,14 +191,56 @@ struct DefaultHighScoreRecord {
   int lines;
 };
 
-constexpr std::array<std::array<CellOffset, 4>, 7> kTetrominoShapes = {{
-    {{{0, 0}, {1, 0}, {2, 0}, {3, 0}}},
-    {{{0, 0}, {1, 0}, {0, 1}, {1, 1}}},
-    {{{0, 0}, {1, 0}, {2, 0}, {1, 1}}},
-    {{{1, 0}, {2, 0}, {0, 1}, {1, 1}}},
-    {{{0, 0}, {1, 0}, {1, 1}, {2, 1}}},
-    {{{0, 0}, {0, 1}, {1, 1}, {2, 1}}},
-    {{{2, 0}, {0, 1}, {1, 1}, {2, 1}}},
+// The original's authored piece table (flat 0x184E3, 7 ids x 4 rotations x 4 cells of int32 (dx,dy),
+// 896 bytes, sha256 330c1ec9...; read by collision 0x12AC, lock 0x9C8 0xD6B and draw 0x10EC). Ids are
+// the RNG value % 7 and also select the chunk-3 tile and the statistics row: 0 S, 1 Z, 2 J, 3 L, 4 T,
+// 5 I, 6 O. Rotation +1 (key A) is clockwise on screen; S, Z and I have two distinct states, and the
+// offsets keep the pieces' turning cell fixed, so x/y never change on a turn. Cells are listed in the
+// table's own order.
+constexpr int kPieceCount = 7;
+constexpr std::array<std::array<std::array<CellOffset, 4>, 4>, kPieceCount> kPieceTable = {{
+    {{  // 0 S
+        {{{1, 1}, {2, 1}, {2, 0}, {3, 0}}},
+        {{{2, -1}, {2, 0}, {3, 0}, {3, 1}}},
+        {{{1, 1}, {2, 1}, {2, 0}, {3, 0}}},
+        {{{2, -1}, {2, 0}, {3, 0}, {3, 1}}},
+    }},
+    {{  // 1 Z
+        {{{1, 0}, {2, 0}, {2, 1}, {3, 1}}},
+        {{{3, -1}, {3, 0}, {2, 0}, {2, 1}}},
+        {{{1, 0}, {2, 0}, {2, 1}, {3, 1}}},
+        {{{3, -1}, {3, 0}, {2, 0}, {2, 1}}},
+    }},
+    {{  // 2 J
+        {{{1, 0}, {2, 0}, {3, 0}, {3, 1}}},
+        {{{2, -1}, {2, 0}, {2, 1}, {1, 1}}},
+        {{{1, 0}, {2, 0}, {3, 0}, {1, -1}}},
+        {{{2, -1}, {2, 0}, {2, 1}, {3, -1}}},
+    }},
+    {{  // 3 L
+        {{{1, 0}, {2, 0}, {3, 0}, {1, 1}}},
+        {{{2, -1}, {2, 0}, {2, 1}, {1, -1}}},
+        {{{1, 0}, {2, 0}, {3, 0}, {3, -1}}},
+        {{{2, -1}, {2, 0}, {2, 1}, {3, 1}}},
+    }},
+    {{  // 4 T
+        {{{1, 0}, {2, 0}, {3, 0}, {2, 1}}},
+        {{{2, -1}, {2, 0}, {2, 1}, {1, 0}}},
+        {{{1, 0}, {2, 0}, {3, 0}, {2, -1}}},
+        {{{2, -1}, {2, 0}, {2, 1}, {3, 0}}},
+    }},
+    {{  // 5 I
+        {{{0, 0}, {1, 0}, {2, 0}, {3, 0}}},
+        {{{2, -2}, {2, -1}, {2, 0}, {2, 1}}},
+        {{{0, 0}, {1, 0}, {2, 0}, {3, 0}}},
+        {{{2, -2}, {2, -1}, {2, 0}, {2, 1}}},
+    }},
+    {{  // 6 O
+        {{{2, 0}, {3, 0}, {2, 1}, {3, 1}}},
+        {{{2, 0}, {3, 0}, {2, 1}, {3, 1}}},
+        {{{2, 0}, {3, 0}, {2, 1}, {3, 1}}},
+        {{{2, 0}, {3, 0}, {2, 1}, {3, 1}}},
+    }},
 }};
 
 const std::array<GameplayPreset, 3> kGameplayPresets = {{
@@ -222,9 +300,11 @@ const std::array<GameplayPreset, 3> kGameplayPresets = {{
     },
 }};
 
+// Track names exactly as the original's Music row strings (0x17b2b..0x17bab);
+// track 1 is "Tearing up Spacetime" there (FE-18).
 const std::array<const char*, 6> kMusicTracks = {
     "Continuum",
-    "Tearing Up SpaceTime",
+    "Tearing up Spacetime",
     "Inner Walls Released",
     "Costumed",
     "I See It Now",
@@ -250,14 +330,154 @@ const std::array<int, 7> kMixingRates = {
     44100,
 };
 
-const std::array<const char*, 6> kCreditsPages = {
-    "Acid Tetris\nCopyright 1997\nDungeon Dwellers Design",
-    "Programming:\nJason Pimble\nGraphics:\nScott Emerle",
-    "Music System:\nJean Paul Mikkers\nOrignal Concept\nDesign and Program By:\nAlexey Pazhitnov",
-    "Protected Mode Extender By:\nCharles Scheffold\nThomas Pytel",
-    "Music:\nChris Emerle\nScott Emerle\nLiam Hesse\nJon Dal Kristbjornsson\nBobby Tamburrino",
-    "Special Thanks To:\nPaul Mason\nCathleen Crandall\nJohn Hood",
-};
+// Credits: six pages of eight fixed row slots (0x4f38 copies 8 x 40 bytes per
+// page), blank slots included, and the copyright line keeps its trailing space.
+using CreditsPage = std::array<const char*, 8>;
+const std::array<CreditsPage, 6> kCreditsPages = {{
+    {"", "Acid Tetris", "", "Copyright 1997 ", "", "Dungeon Dwellers Design", "", ""},
+    {"", "Programming:", "Jason Pimble", "", "Graphics:", "Scott Emerle", "", ""},
+    {"", "Music System:", "Jean Paul Mikkers", "", "Orignal Concept", "Design and Program By:", "Alexey Pazhitnov", ""},
+    {"", "", "Protected Mode Extender By:", "", "Charles Scheffold", "Thomas Pytel", "", ""},
+    {"", "Music:", "Chris Emerle", "Scott Emerle", "Liam Hesse", "Jon Dal Kristbjornsson", "Bobby Tamburrino", ""},
+    {"", "Special Thanks To:", "", "Paul Mason", "Cathleen Crandall", "John Hood", "", ""},
+}};
+
+// Keyboard Setup key names: the original prints a 4-character name per scancode
+// (spaces included), indexed by the ISR code (E0 keys +0x80). Codes not listed
+// print four spaces.
+const char* KeyNameForCode(std::uint8_t code) {
+  switch (code) {
+    case 0x01: return "Esc ";
+    case 0x02: return " 1  ";
+    case 0x03: return " 2  ";
+    case 0x04: return " 3  ";
+    case 0x05: return " 4  ";
+    case 0x06: return " 5  ";
+    case 0x07: return " 6  ";
+    case 0x08: return " 7  ";
+    case 0x09: return " 8  ";
+    case 0x0A: return " 9  ";
+    case 0x0B: return " 0  ";
+    case 0x0C: return " -  ";
+    case 0x0D: return " =  ";
+    case 0x0E: return "BkSp";
+    case 0x0F: return "Tab ";
+    case 0x10: return " Q  ";
+    case 0x11: return " W  ";
+    case 0x12: return " E  ";
+    case 0x13: return " R  ";
+    case 0x14: return " T  ";
+    case 0x15: return " Y  ";
+    case 0x16: return " U  ";
+    case 0x17: return " I  ";
+    case 0x18: return " O  ";
+    case 0x19: return " P  ";
+    case 0x1A: return " [  ";
+    case 0x1B: return " ]  ";
+    case 0x1C: return "Entr";
+    case 0x1D: return "CtLt";
+    case 0x1E: return " A  ";
+    case 0x1F: return " S  ";
+    case 0x20: return " D  ";
+    case 0x21: return " F  ";
+    case 0x22: return " G  ";
+    case 0x23: return " H  ";
+    case 0x24: return " J  ";
+    case 0x25: return " K  ";
+    case 0x26: return " L  ";
+    case 0x27: return " ;  ";
+    case 0x28: return " '  ";
+    case 0x29: return " `  ";
+    case 0x2A: return "ShLt";
+    case 0x2B: return "   ";
+    case 0x2C: return " Z  ";
+    case 0x2D: return " X  ";
+    case 0x2E: return " C  ";
+    case 0x2F: return " V  ";
+    case 0x30: return " B  ";
+    case 0x31: return " N  ";
+    case 0x32: return " M  ";
+    case 0x33: return " ,  ";
+    case 0x34: return " .  ";
+    case 0x35: return " /  ";
+    case 0x36: return "ShRt";
+    case 0x37: return "* KP";
+    case 0x38: return "AtLt";
+    case 0x39: return "Spce";
+    case 0x3A: return "CapL";
+    case 0x3B: return " F1 ";
+    case 0x3C: return " F2 ";
+    case 0x3D: return " F3 ";
+    case 0x3E: return " F4 ";
+    case 0x3F: return " F5 ";
+    case 0x40: return " F6 ";
+    case 0x41: return " F7 ";
+    case 0x42: return " F8 ";
+    case 0x43: return " F9 ";
+    case 0x44: return "F10 ";
+    case 0x45: return "NmLk";
+    case 0x46: return "ScLk";
+    case 0x47: return "HmKP";
+    case 0x48: return "UpKP";
+    case 0x49: return "PUKP";
+    case 0x4A: return "- KP";
+    case 0x4B: return "LtKP";
+    case 0x4C: return "CnKP";
+    case 0x4D: return "RtKP";
+    case 0x4E: return "+ KP";
+    case 0x4F: return "EdKP";
+    case 0x50: return "DnKP";
+    case 0x51: return "PDKP";
+    case 0x52: return "InKP";
+    case 0x53: return "DlKP";
+    case 0x57: return "F11 ";
+    case 0x58: return "F12 ";
+    case 0xAA: return "PrSr";
+    case 0xB5: return "/ KP";
+    case 0xB8: return "AtRt";
+    case 0xC7: return "Home";
+    case 0xC8: return " Up ";
+    case 0xC9: return "PgUp";
+    case 0xCB: return "Left";
+    case 0xCD: return "Rght";
+    case 0xCF: return "End ";
+    case 0xD0: return "Down";
+    case 0xD1: return "PgDn";
+    case 0xD2: return "Inst";
+    case 0xD3: return "Del ";
+    case 0xDC: return "EnKP";
+    case 0xDD: return "CtRt";
+    default: return "    ";
+  }
+}
+
+// High-score name entry character tables (0x50b0 at 0x5502-0x55a1): T0 gates
+// which released keys type anything (lowercase), T1/T2 uppercase, T3 lowercase.
+// T1-T3 also map '.', which T0 never lets through.
+char NameEntryChar(int table, std::uint8_t code) {
+  static constexpr char kRow1[] = "1234567890";   // 0x02..0x0b
+  static constexpr char kRow2[] = "qwertyuiop";   // 0x10..0x19
+  static constexpr char kRow3[] = "asdfghjkl";    // 0x1e..0x26
+  static constexpr char kRow4[] = "zxcvbnm";      // 0x2c..0x32
+  char ch = 0;
+  if (code >= 0x02 && code <= 0x0B) {
+    ch = kRow1[code - 0x02];
+  } else if (code >= 0x10 && code <= 0x19) {
+    ch = kRow2[code - 0x10];
+  } else if (code >= 0x1E && code <= 0x26) {
+    ch = kRow3[code - 0x1E];
+  } else if (code >= 0x2C && code <= 0x32) {
+    ch = kRow4[code - 0x2C];
+  } else if (code == 0x39) {
+    ch = ' ';
+  } else if (code == 0x34 && table != 0) {
+    ch = '.';
+  }
+  if ((table == 1 || table == 2) && ch >= 'a' && ch <= 'z') {
+    ch = static_cast<char>(ch - 'a' + 'A');
+  }
+  return ch;
+}
 
 const std::array<const char*, 5> kKeyboardBindingLabels = {
     "Down",
@@ -326,18 +546,54 @@ bool ReadBinaryAsset(const char* path, std::vector<Uint8>* bytes_out, std::strin
     return false;
   }
 
-  std::ifstream input(path, std::ios::binary);
-  if (!input) {
-    SetErrorMessage(error_out, "Failed to open binary asset: " + std::string(path));
+  // SDL_LoadFile takes a UTF-8 path on every platform. std::ifstream(const char*)
+  // reads the path in the ANSI code page on Windows, so data in a folder with a
+  // non-ASCII name (SDL_GetBasePath() is UTF-8) was never found.
+  size_t size = 0;
+  void* data = SDL_LoadFile(path, &size);
+  if (data == nullptr) {
+    SetErrorMessage(error_out, "Failed to open binary asset: " + std::string(path) + " (" + SDL_GetError() + ")");
     return false;
   }
 
-  bytes_out->assign(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
-  if (!input.good() && !input.eof()) {
-    SetErrorMessage(error_out, "Failed while reading binary asset: " + std::string(path));
+  const Uint8* begin = static_cast<const Uint8*>(data);
+  bytes_out->assign(begin, begin + size);
+  SDL_free(data);
+  return true;
+}
+
+// An absolute spelling of a search folder ("" = the working directory), always with
+// a trailing separator, for SETUP.DAT paths and log lines.
+std::string AbsoluteDir(const std::string& dir) {
+  if (!dir.empty()) {
+    return dir;  // SDL_GetBasePath() results are absolute and end with a separator
+  }
+  if (char* cwd = SDL_GetCurrentDirectory()) {
+    std::string result(cwd);
+    SDL_free(cwd);
+    return result;
+  }
+  return dir;  // still resolves against the working directory
+}
+
+// True when `path` can be written without changing an existing file: an existing
+// regular file must open for appending, a missing one must be creatable (the empty
+// probe is removed again, so a first run still finds no SETUP.DAT and writes the
+// defaults, as the original does).
+bool IsWritableFile(const std::string& path) {
+  SDL_PathInfo info;
+  const bool exists = SDL_GetPathInfo(path.c_str(), &info);
+  if (exists && info.type != SDL_PATHTYPE_FILE) {
     return false;
   }
-
+  SDL_IOStream* stream = SDL_IOFromFile(path.c_str(), "ab");
+  if (stream == nullptr) {
+    return false;
+  }
+  SDL_CloseIO(stream);
+  if (!exists) {
+    SDL_RemovePath(path.c_str());
+  }
   return true;
 }
 
@@ -496,6 +752,67 @@ std::array<int, 2048> BuildSineTable() {
   return table;
 }
 
+// The original's table, built at startup by 0x27b8: chop(sin(i * 0.0030679616) *
+// 32769.0) for i < 0x200 (the two doubles at 0x17ae8 / 0x17af0, truncated toward
+// zero by __CHP + FISTP), mirrored into 2048 entries; peak 32768. The pointfield
+// 0x39c4 and the row pulses 0x3fd8 / 0x5868 read this amplitude.
+std::array<int, 2048> BuildOriginalSineTable() {
+  std::array<int, 2048> table{};
+  constexpr double kStep = 0.0030679616;
+  constexpr double kAmplitude = 32769.0;
+  for (int index = 0; index < 0x200; ++index) {
+    const int value = static_cast<int>(std::trunc(std::sin(static_cast<double>(index) * kStep) * kAmplitude));
+    table[index] = value;
+    table[0x3FF - index] = value;
+    table[0x400 + index] = -value;
+    table[0x7FF - index] = -value;
+  }
+  return table;
+}
+
+// 32-bit helpers matching the original's IMUL / SAR / IDIV.
+inline std::int32_t Wrap32(std::int64_t value) {
+  return static_cast<std::int32_t>(static_cast<std::uint32_t>(static_cast<std::uint64_t>(value)));
+}
+inline std::int32_t Mul32(std::int32_t a, std::int32_t b) {
+  return Wrap32(static_cast<std::int64_t>(a) * static_cast<std::int64_t>(b));
+}
+inline std::int32_t Add32(std::int32_t a, std::int32_t b) {
+  return Wrap32(static_cast<std::int64_t>(a) + static_cast<std::int64_t>(b));
+}
+inline std::int32_t Sub32(std::int32_t a, std::int32_t b) {
+  return Wrap32(static_cast<std::int64_t>(a) - static_cast<std::int64_t>(b));
+}
+inline std::int32_t Shl32(std::int32_t a, int bits) {
+  return static_cast<std::int32_t>(static_cast<std::uint32_t>(a) << bits);
+}
+
+// VGA 6-bit DAC value to the port's 8-bit colour; must stay identical to
+// ScaleVga6 in atet_data.cpp (the palettes the textures were built with).
+inline Uint8 Expand6To8(int component6) {
+  return static_cast<Uint8>(std::lround((static_cast<double>(std::clamp(component6, 0, 63)) / 63.0) * 255.0));
+}
+// 0x284c: every 6-bit palette byte becomes (c * level) >> 6 (level = 64 - d).
+inline int ScaleDac6(int component6, int level) {
+  return (component6 * std::clamp(level, 0, 64)) >> 6;
+}
+
+// The particle polar table exactly as 0x27B8 builds it: 512 values
+// chop(sin(i * 0.0030679616) * 32769.0) (doubles at 0x17AE8/0x17AF0), mirrored into 2048
+// entries, so t[1] = 100 and t[0x200] = 32768. The nearest value to an integer is 0.002
+// away, so double precision reproduces the original's x87 table on every platform.
+std::array<int, 2048> BuildParticleSineTable() {
+  std::array<int, 2048> table{};
+  for (int index = 0; index < 0x200; ++index) {
+    const int value = static_cast<int>(std::trunc(std::sin(index * 0.0030679616) * 32769.0));
+    table[index] = value;
+    table[0x3FF - index] = value;
+    table[0x400 + index] = -value;
+    table[0x7FF - index] = -value;
+  }
+  return table;
+}
+
 std::uint8_t OriginalScancodeForKey(SDL_Keycode key) {
   switch (key) {
     case SDLK_ESCAPE:
@@ -568,8 +885,11 @@ std::uint8_t OriginalScancodeForKey(SDL_Keycode key) {
     case SDLK_L:
       return 0x26;
     case SDLK_LSHIFT:
-    case SDLK_RSHIFT:
       return 0x2A;
+    case SDLK_RSHIFT:
+      return 0x36;  // the ISR keeps right Shift as its own code (name entry case rule)
+    case SDLK_CAPSLOCK:
+      return 0x3A;  // released Caps Lock toggles the name-entry case flag
     case SDLK_Z:
       return 0x2C;
     case SDLK_X:
@@ -597,54 +917,23 @@ std::uint8_t OriginalScancodeForKey(SDL_Keycode key) {
       return 0xCD;
     case SDLK_DOWN:
       return 0xD0;
+    // Keypad arrows are distinct codes (no E0 prefix); the menus accept 0x48/0x50
+    // and Options 0x4B/0x4D besides the grey arrows.
+    case SDLK_KP_8:
+      return 0x48;
+    case SDLK_KP_2:
+      return 0x50;
+    case SDLK_KP_4:
+      return 0x4B;
+    case SDLK_KP_6:
+      return 0x4D;
     default:
       return 0;
   }
 }
 
 std::string KeyNameForBinding(std::uint8_t scan_code) {
-  switch (scan_code) {
-    case 0xCB:
-      return "Left";
-    case 0xCD:
-      return "Right";
-    case 0xC8:
-      return "Up";
-    case 0xD0:
-      return "Down";
-    case 0x39:
-      return "Space";
-    case 0x1C:
-      return "Enter";
-    case 0x0F:
-      return "Tab";
-    case 0x0E:
-      return "Backspace";
-    case 0x2A:
-      return "Shift";
-    case 0x1D:
-      return "Ctrl";
-    case 0x38:
-      return "Alt";
-    default:
-      if (scan_code >= 0x02 && scan_code <= 0x0B) {
-        constexpr std::array<char, 10> digits = {'1', '2', '3', '4', '5', '6', '7', '8', '9', '0'};
-        return std::string(1, digits[scan_code - 0x02]);
-      }
-      if (scan_code >= 0x10 && scan_code <= 0x19) {
-        constexpr std::array<char, 10> row = {'Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P'};
-        return std::string(1, row[scan_code - 0x10]);
-      }
-      if (scan_code >= 0x1E && scan_code <= 0x26) {
-        constexpr std::array<char, 9> row = {'A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L'};
-        return std::string(1, row[scan_code - 0x1E]);
-      }
-      if (scan_code >= 0x2C && scan_code <= 0x32) {
-        constexpr std::array<char, 7> row = {'Z', 'X', 'C', 'V', 'B', 'N', 'M'};
-        return std::string(1, row[scan_code - 0x2C]);
-      }
-      return "Key";
-  }
+  return KeyNameForCode(scan_code);
 }
 
 int GlyphCodeForCharacter(unsigned char ch) {
@@ -706,20 +995,6 @@ std::string FormatCounterValue(int value, int digits) {
   return text;
 }
 
-std::string FormatPercentRow(const char* label, int value) {
-  return std::string(label) + std::to_string(std::clamp(value, 0, 100));
-}
-
-int MixingRateIndex(int rate_hz) {
-  for (size_t index = 0; index < kMixingRates.size(); ++index) {
-    if (kMixingRates[index] == rate_hz) {
-      return static_cast<int>(index);
-    }
-  }
-
-  return static_cast<int>(kMixingRates.size()) - 1;
-}
-
 void DrawTexture(SDL_Renderer* renderer, SDL_Texture* texture, int width, int height) {
   if (texture == nullptr) {
     return;
@@ -768,6 +1043,14 @@ void DrawPieceTile(SDL_Renderer* renderer, SDL_Texture* atlas, int atlas_index, 
   SDL_RenderTexture(renderer, atlas, &source, &destination);
 }
 
+// Cells of piece `id` in `rotation`, straight from the authored table (0x12AC masks the rotation
+// with 3). Nothing is synthesised or re-anchored.
+std::array<CellOffset, 4> RotatedCells(int id, int rotation) {
+  return kPieceTable[static_cast<size_t>(NormalizeModulo(id, kPieceCount))][static_cast<size_t>(rotation & 3)];
+}
+
+// Debug overlay presets only (keys 1-3, not gameplay): rotation-0 cells moved to start at (0,0)
+// so the hand-placed preset pieces stay inside the well.
 void DrawTetromino(
     SDL_Renderer* renderer,
     SDL_Texture* atlas,
@@ -775,46 +1058,39 @@ void DrawTetromino(
     int shape_index,
     int screen_x,
     int screen_y) {
-  const auto& shape = kTetrominoShapes[shape_index % static_cast<int>(kTetrominoShapes.size())];
-  for (const CellOffset& cell : shape) {
-    DrawPieceTile(
-        renderer,
-        atlas,
-        atlas_index,
-        screen_x + (cell.x * kPieceTileSize),
-        screen_y + (cell.y * kPieceTileSize));
-  }
-}
-
-std::array<CellOffset, 4> RotatedCells(int shape_index, int rotation) {
-  std::array<CellOffset, 4> cells = kTetrominoShapes[NormalizeModulo(shape_index, static_cast<int>(kTetrominoShapes.size()))];
-  rotation = NormalizeModulo(rotation, 4);
-  for (CellOffset& cell : cells) {
-    int x = cell.x;
-    int y = cell.y;
-    for (int step = 0; step < rotation; ++step) {
-      const int rotated_x = y;
-      const int rotated_y = -x;
-      x = rotated_x;
-      y = rotated_y;
-    }
-    cell = {x, y};
-  }
-
+  const std::array<CellOffset, 4> cells = RotatedCells(shape_index, 0);
   int min_x = cells[0].x;
   int min_y = cells[0].y;
   for (const CellOffset& cell : cells) {
     min_x = std::min(min_x, cell.x);
     min_y = std::min(min_y, cell.y);
   }
-
-  for (CellOffset& cell : cells) {
-    cell.x -= min_x;
-    cell.y -= min_y;
+  for (const CellOffset& cell : cells) {
+    DrawPieceTile(
+        renderer,
+        atlas,
+        atlas_index,
+        screen_x + ((cell.x - min_x) * kPieceTileSize),
+        screen_y + ((cell.y - min_y) * kPieceTileSize));
   }
-  return cells;
 }
 
+// NEXT preview, 0x1348 -> 0x10EC(0x1E, 0x38, next, 0): rotation-0 cells at (30 + 8dx, 56 + 8dy) with
+// the raw table offsets, so every piece's right edge is x 61 (3-wide pieces 38..61, the I 30..61,
+// the O 46..61).
+void DrawPreviewPiece(SDL_Renderer* renderer, SDL_Texture* atlas, int id) {
+  for (const CellOffset& cell : RotatedCells(id, 0)) {
+    DrawPieceTile(
+        renderer,
+        atlas,
+        NormalizeModulo(id, kPieceCount),
+        kPreviewX + (cell.x * kPieceTileSize),
+        kPreviewY + (cell.y * kPieceTileSize));
+  }
+}
+
+// The falling piece, 0x10EC: tile = id, cell (x+dx, y+dy) at (109 + 8(x+dx), 21 + 8(y+dy)); cells
+// above the well (screen y < 21, i.e. row < 0) are skipped (0x113C).
 void DrawLiveTetromino(
     SDL_Renderer* renderer,
     SDL_Texture* atlas,
@@ -822,12 +1098,14 @@ void DrawLiveTetromino(
     int rotation,
     int board_x,
     int board_y) {
-  const std::array<CellOffset, 4> cells = RotatedCells(piece_type, rotation);
-  for (const CellOffset& cell : cells) {
+  for (const CellOffset& cell : RotatedCells(piece_type, rotation)) {
+    if (board_y + cell.y < 0) {
+      continue;
+    }
     DrawPieceTile(
         renderer,
         atlas,
-        NormalizeModulo(piece_type, static_cast<int>(kTetrominoShapes.size())),
+        NormalizeModulo(piece_type, kPieceCount),
         kGameplayClearX + ((board_x + cell.x) * kPieceTileSize),
         kGameplayClearY + ((board_y + cell.y) * kPieceTileSize));
   }
@@ -872,8 +1150,10 @@ bool MilestoneADemo::Initialize(SDL_Renderer* renderer, std::string* error_out, 
   // ATETRIS.ZIP, ATET.DAT extracted via miniz), first next to the executable
   // (portable / release layout, robust to the build machine's drive letter), then
   // the working directory, then the build-tree ATET.DAT as a dev fallback.
+  const Uint64 audit_t_data = SDL_GetPerformanceCounter();
   std::string dat_error = "not found";
   bool loaded = false;
+  std::string data_dir;  // folder of the data file actually loaded ("" = working directory)
   std::vector<std::string> search_dirs;
   if (const char* base_path = SDL_GetBasePath()) {
     search_dirs.emplace_back(base_path);
@@ -892,6 +1172,8 @@ bool MilestoneADemo::Initialize(SDL_Renderer* renderer, std::string* error_out, 
           atet_data_.LoadFromDat(bytes, &dat_error)) {
         loaded = true;
         found = true;
+        data_dir = dir;
+        g_audit_startup.data_source = dir + dat_name;
         break;
       }
     }
@@ -904,6 +1186,8 @@ bool MilestoneADemo::Initialize(SDL_Renderer* renderer, std::string* error_out, 
       if (ReadBinaryAsset((dir + archive_name).c_str(), &bytes, &ignored) &&
           atet_data_.LoadFromZip(bytes, &dat_error)) {
         loaded = true;
+        data_dir = dir;
+        g_audit_startup.data_source = dir + archive_name;
         break;
       }
     }
@@ -917,13 +1201,23 @@ bool MilestoneADemo::Initialize(SDL_Renderer* renderer, std::string* error_out, 
     if (ReadBinaryAsset(ATET_PORT_ATET_DAT_PATH, &bytes, &ignored) &&
         atet_data_.LoadFromDat(bytes, &dat_error)) {
       loaded = true;
+      const std::string fallback = ATET_PORT_ATET_DAT_PATH;
+      const size_t separator = fallback.find_last_of("/\\");
+      data_dir = separator == std::string::npos ? std::string{} : fallback.substr(0, separator + 1);
+      g_audit_startup.data_source = std::string("compiled-fallback:") + ATET_PORT_ATET_DAT_PATH;
     }
   }
+  g_audit_startup.data_ticks = SDL_GetPerformanceCounter() - audit_t_data;
+  const Uint64 audit_t_textures = SDL_GetPerformanceCounter();
   if (!loaded) {
+    std::string searched;
+    for (const std::string& dir : search_dirs) {
+      searched += (searched.empty() ? "" : ", ") + AbsoluteDir(dir);
+    }
     SetErrorMessage(error_out,
                     "Could not load the game data (" + dat_error +
                         "). Place ATET.DAT (or SABA's saba.dat), or an ACiD Tetris / SABA "
-                        "archive, beside the executable.");
+                        "archive, beside the executable. Folders searched: " + searched);
     return false;
   }
 
@@ -957,6 +1251,8 @@ bool MilestoneADemo::Initialize(SDL_Renderer* renderer, std::string* error_out, 
     }
   }
 
+  g_audit_startup.textures_ticks = SDL_GetPerformanceCounter() - audit_t_textures;
+  const Uint64 audit_t_tables = SDL_GetPerformanceCounter();
   if (!LoadFrontendFont(error_out)) {
     return false;
   }
@@ -968,19 +1264,49 @@ bool MilestoneADemo::Initialize(SDL_Renderer* renderer, std::string* error_out, 
   if (!LoadGameplayParticleAssets(error_out)) {
     return false;
   }
+  g_audit_startup.tables_ticks = SDL_GetPerformanceCounter() - audit_t_tables;
+  const Uint64 audit_t_setup = SDL_GetPerformanceCounter();
 
   scene_ = Scene::kFrontend;
-  SetFrontendView(FrontendView::kMainMenu, 0);
+  frontend_view_ = FrontendView::kMainMenu;
+  frontend_selected_row_ = 0;
   gameplay_preset_index_ = 0;
   keyboard_capture_row_ = -1;
   held_original_scancodes_.fill(false);
   held_original_scancode_frames_.fill(0);
-  high_score_entry_row_ = -1;
-  high_score_entry_name_.clear();
-  high_score_entry_lowercase_ = false;
-  high_score_entry_commit_pending_ = false;
-  top_out_handoff_pending_ = false;
+  // Frontend flow state. The PIT tick counter [0x2d2a3] is the main loop's tick (Tick32()); the
+  // timer is installed just before the first splash, so the splash t0 is tick 0.
+  release_fifo_.fill(0);
+  flow_phase_ = FlowPhase::kNone;
+  flow_exit_ = FlowExit::kNone;
+  menu_pending_ = 0;
+  screen_exit_ = false;
+  main_menu_row_ = 0;      // 0x5f78 (0x5fcb): [0x1886f] = 0 at boot
+  pulse_phase_ = 0;        // [0x1990f] and [0x19913] are BSS
+  entry_pulse_phase_ = 0;
+  row_text_.fill(std::string());
+  row_amount_.fill(0);
+  state9_pending_ = false;
+  music_freeze_left_ = 0;
+  esc_hold_ticks_ = 0;
+  setup_dirty_ = false;
+  title_level_ = 0;
+  hs_mode_ = 0;
+  hs_slot_ = -1;
+  hs_stage_ = 0;
+  hs_buffer_.clear();
+  hs_len_ = 0;
+  hs_caps_ = false;
+  hs_commit_ = false;
+  hs_done_ = false;
+  // main 0x150: rng_table_fill runs srand([0x2d2a3]) before the PIT is installed
+  // (0x16d), so the table is always seeded with 0 at boot; 0x5fd8 -> 0x5ef4 then
+  // picks the first pointfield bank with rng_next() % 8 (= 5).
+  SeedBootRandomTable();
+  InitFrontendPointfield();
   top_out_frame_ = 0;
+  top_out_dissolved_rows_ = 0;
+  top_out_source_cells_.fill(0);
   top_out_score_ = 0;
   top_out_lines_ = 0;
   live_game_active_ = false;
@@ -993,39 +1319,53 @@ bool MilestoneADemo::Initialize(SDL_Renderer* renderer, std::string* error_out, 
   live_level_ = 0;
   gameplay_phase_ = GameplayPhase::kFalling;
   gravity_accumulator_ = 0;
-  lock_frames_ = 0;
+  repeat_timers_.fill(0);
   down_lockout_frames_ = 0;
   pending_clear_rows_.clear();
   collapse_frame_ = 0;
-  gameplay_top_out_frame_ = 0;
+  collapse_step_ = 0;
+  collapse_batch_ = 0;
+  live_piece_hidden_ = false;
+  top_out_after_collapse_ = false;
   warning_band_ = 0;
   warning_cooldowns_.fill(0);
-  debris_particles_.clear();
+  debris_particles_.clear();  // startup only (0x2DA0, single caller 0x126)
+  debris_hidden_after_frontend_ = false;
+  alert_corner_hold_ = false;
   live_snapshot_ = LiveSnapshot{};
   gameplay_snapshot_texture_valid_ = false;
+  // Startup: main fills the shared RNG table at 0x150 with srand([0x2D2A3]) = srand(0), before the
+  // PIT is installed at 0x16D; the tick counter (tick_count_, set by the main loop) starts from 0.
+  // That one fill is SeedBootRandomTable() above, which the pointfield's start bank already drew
+  // from; a second fill here would rewind the shared index.
+  piece_seed_ = 0;
   last_clear_was_four_ = false;
-  sleepy_ = false;
-  frames_since_clear_ = 0;
-  high_score_bootstrap_frames_ = 0;
-  high_score_conceal_frames_ = 0;
+  last_clear_tick_ = 0;
+  alert_effect_id_ = -1;
+  alert_lifetime_ = 0;
+  alert_reveal_counter_ = 0;
+  AlertCornerRestore();
   audio_events_.clear();
   line_clear_demo_count_ = 0;
   ResetSetupStateToDefaults();
   live_game_available_ = false;
   quit_requested_ = false;
+  ResolveSetupDatPath(data_dir);
   const bool loaded_setup = LoadSetupDat();
   if (!loaded_setup) {
     PersistSetupState();
   }
   if (start_in_sound_setup || !loaded_setup) {
-    SetFrontendView(FrontendView::kSoundSetup, 0);
-    scene_ = Scene::kFrontend;
+    // main 0x172-0x17c: 0x3830(5) right after the timer starts, before sound
+    // init and the splashes: the dispatcher entry runs over a black screen.
+    BeginDispatcherEntry(5, FrozenSource::kBlack);
   } else {
     BeginStartupSplashes();
   }
   if (error_out != nullptr) {
     error_out->clear();
   }
+  g_audit_startup.setup_ticks = SDL_GetPerformanceCounter() - audit_t_setup;
 
   return true;
 }
@@ -1040,102 +1380,74 @@ void MilestoneADemo::ResetBuildLocalSetupState() {
 }
 
 bool MilestoneADemo::HandleKeyDown(SDL_Keycode key) {
-  // Input is blocked while a gameplay<->frontend screen fade is in progress.
-  if (screen_fade_ != ScreenFade::kNone) {
-    return false;
-  }
+  // The keyboard ISR 0x800 records every make code whatever the game is doing
+  // (splashes, palette fades, reveals), so the held table is always updated.
   TrackKeyDown(key);
 
-  if (scene_ == Scene::kSplash) {
-    if (key == SDLK_RETURN || key == SDLK_SPACE || key == SDLK_ESCAPE || key == SDLK_BACKSPACE) {
-      splash_frame_ = kSplashPageFrames - 1;
-      AdvanceSplashTimers();
+  // Developer scene shortcuts (not in the original): opt-in with --debug.
+  if (debug_keys_enabled_ && scene_ != Scene::kTopOut && frontend_view_ != FrontendView::kHighScoreEntry) {
+    if (key == SDLK_TAB) {
+      if (scene_ == Scene::kGameplay) {
+        scene_ = Scene::kFrontend;
+        StartScreen(1);
+      } else {
+        scene_ = Scene::kGameplay;
+        flow_phase_ = FlowPhase::kNone;
+      }
       return true;
     }
-    return false;
+    if (key == SDLK_T) {
+      scene_ = Scene::kFrontend;
+      StartScreen(1);
+      return true;
+    }
+    if (key == SDLK_G) {
+      if (!live_game_available_) {
+        ResetLiveGameplayState();
+        live_game_available_ = true;
+      }
+      live_game_active_ = true;
+      scene_ = Scene::kGameplay;
+      flow_phase_ = FlowPhase::kNone;
+      return true;
+    }
+    if (key >= SDLK_1 && key <= SDLK_3) {
+      gameplay_preset_index_ = static_cast<int>(key - SDLK_1);
+      live_game_active_ = false;
+      scene_ = Scene::kGameplay;
+      flow_phase_ = FlowPhase::kNone;
+      return true;
+    }
   }
 
   if (scene_ == Scene::kTopOut) {
-    if (IsTopOutAdvanceKey(key)) {
-      if (top_out_frame_ < kTopOutOverlayStartFrame) {
-        top_out_frame_ = kTopOutOverlayStartFrame;
-        top_out_handoff_pending_ = false;
-        return true;
-      }
-      if (top_out_frame_ < kTopOutOverlayEndFrame) {
-        top_out_frame_ = kTopOutOverlayEndFrame;
-        top_out_handoff_pending_ = false;
-        return true;
-      }
-      top_out_handoff_pending_ = true;
-      return true;
-    }
-    return false;
-  }
-
-  if (scene_ == Scene::kFrontend && frontend_view_ == FrontendView::kKeyboardSetup &&
-      keyboard_capture_row_ >= 0) {
-    const std::uint8_t original_scancode = OriginalScancodeForKey(key);
-    if (key == SDLK_UNKNOWN || original_scancode == 0 || original_scancode == 0x01) {
-      return true;
-    }
-
-    CaptureKeyboardBinding(original_scancode);
+    // The keyboard ISR 0x800 records only key RELEASES for the session loop; a press, and
+    // any key but Esc, changes nothing on the dissolve or the GAME OVER screen. The Esc
+    // release is read from the release history at the start of the next tick (TickLogic).
+    // Keys are swallowed so main's debug probe stays silent.
     return true;
   }
 
-  if (scene_ == Scene::kFrontend && frontend_view_ == FrontendView::kHighScoreEntry) {
-    return HandleHighScoreNameEntry(key);
-  }
-
-  if (key == SDLK_TAB) {
-    scene_ = (scene_ == Scene::kFrontend) ? Scene::kGameplay : Scene::kFrontend;
-    return true;
-  }
-
-  if (key == SDLK_T) {
-    scene_ = Scene::kFrontend;
-    SetFrontendView(FrontendView::kMainMenu, 0);
-    return true;
-  }
-
-  if (key == SDLK_G) {
-    if (!live_game_available_) {
-      ResetLiveGameplayState();
-      live_game_available_ = true;
-    }
-    live_game_active_ = true;
-    scene_ = Scene::kGameplay;
-    return true;
-  }
-
-  if (key >= SDLK_1 && key <= SDLK_3) {
-    gameplay_preset_index_ = static_cast<int>(key - SDLK_1);
-    live_game_active_ = false;
-    scene_ = Scene::kGameplay;
-    return true;
-  }
-
-  if (scene_ == Scene::kGameplay) {
+  if (scene_ == Scene::kGameplay && flow_phase_ == FlowPhase::kNone) {
+    // In play Esc acts on its RELEASE (main 0x4a3: newest release == 0x01),
+    // checked once per tick in Tick(); the press itself does nothing.
     if (key == SDLK_ESCAPE) {
-      SaveLiveSnapshot();
-      BeginSceneFade(PendingScene::kFrontendFromGameplay);
       return true;
     }
-    if (key == SDLK_H) {
+    if (debug_keys_enabled_ && key == SDLK_H) {
       BeginHighScoreNameEntry(CurrentRunScore(), CurrentRunLines());
       return true;
     }
-    if (key == SDLK_O) {
+    if (debug_keys_enabled_ && key == SDLK_O) {
       BeginTopOutDemo(CurrentRunScore(), CurrentRunLines());
       return true;
     }
-    if (key == SDLK_C && live_game_active_) {
+    if (debug_keys_enabled_ && key == SDLK_C && live_game_active_) {
       InjectFilledRowsForSmoke((line_clear_demo_count_ % 4) + 1);
       ++line_clear_demo_count_;
       return true;
     }
-    if (key == SDLK_B && live_game_active_) {
+    if (debug_keys_enabled_ && key == SDLK_B && live_game_active_) {
       // Debug: always inject a four-line clear. Press twice in a row to exercise
       // the back-to-back tetris reward (alert tile 8 + slot 11).
       InjectFilledRowsForSmoke(4);
@@ -1147,92 +1459,39 @@ bool MilestoneADemo::HandleKeyDown(SDL_Keycode key) {
     return false;
   }
 
-  if (frontend_view_ == FrontendView::kHighScores) {
-    if (key == SDLK_RETURN || key == SDLK_ESCAPE || key == SDLK_BACKSPACE) {
-      const std::vector<std::string> rows = CurrentFrontendRows();
-      if (RevealedFrontendRowCount(rows.size()) >= static_cast<int>(rows.size())) {
-        BeginHighScoreConcealToMain();
-      }
-      return true;
-    }
-    return false;
-  }
-
-  if (frontend_view_ == FrontendView::kCredits) {
-    if (key == SDLK_RIGHT || key == SDLK_DOWN || key == SDLK_RETURN) {
-      credits_page_ = (credits_page_ + 1) % static_cast<int>(kCreditsPages.size());
-      credits_page_timer_ = 0;
-      return true;
-    }
-    if (key == SDLK_LEFT || key == SDLK_UP) {
-      credits_page_ = (credits_page_ + static_cast<int>(kCreditsPages.size()) - 1) %
-                      static_cast<int>(kCreditsPages.size());
-      credits_page_timer_ = 0;
-      return true;
-    }
-    if (key == SDLK_ESCAPE || key == SDLK_BACKSPACE) {
-      SetFrontendView(FrontendView::kMainMenu, 0);
-      return true;
-    }
-    return false;
-  }
-
-  if (key == SDLK_UP) {
-    MoveFrontendSelection(-1);
-    return true;
-  }
-
-  if (key == SDLK_DOWN) {
-    MoveFrontendSelection(1);
-    return true;
-  }
-
-  if (key == SDLK_LEFT || key == SDLK_RIGHT) {
-    return ApplyFrontendHorizontalEdit(key == SDLK_LEFT ? -1 : 1, true);
-  }
-
-  if (key == SDLK_RETURN) {
-    ActivateFrontendSelection();
-    return true;
-  }
-
-  if (key == SDLK_ESCAPE || key == SDLK_BACKSPACE) {
-    if (frontend_view_ == FrontendView::kMainMenu) {
-      quit_requested_ = true;
-    } else if (frontend_view_ == FrontendView::kSoundSetup) {
-      BeginStartupSplashes();
-    } else if (frontend_view_ == FrontendView::kKeyboardSetup) {
-      SetFrontendView(FrontendView::kOptions, 2);
-    } else {
-      SetFrontendView(FrontendView::kMainMenu, 0);
-    }
-    return true;
-  }
-
-  return false;
+  // Splashes and every frontend screen read the release history and the held
+  // table once per logic tick (Tick); a key-down never acts by itself.
+  return true;
 }
 
 void MilestoneADemo::HandleKeyUp(SDL_Keycode key) {
   TrackKeyUp(key);
-  if (scene_ == Scene::kTopOut && IsTopOutAdvanceKey(key) && top_out_handoff_pending_) {
-    top_out_handoff_pending_ = false;
-    BeginHighScoreNameEntry(top_out_score_, top_out_lines_);
-    return;
-  }
-  if (scene_ == Scene::kFrontend && frontend_view_ == FrontendView::kHighScoreEntry &&
-      key == SDLK_RETURN && high_score_entry_commit_pending_) {
-    CommitHighScoreNameEntry();
-  }
+  PushRelease(OriginalScancodeForKey(key));
 }
 
-void MilestoneADemo::Tick() {
-  // While a screen fade is in progress the original busy-waits on the timer and
-  // does not advance game logic; freeze everything except the fade (and audio
-  // delivery) until it completes.
-  if (screen_fade_ != ScreenFade::kNone) {
-    AdvanceScreenFade();
-    FlushAudioEvents();
+void MilestoneADemo::PushRelease(std::uint8_t original_scancode) {
+  // ISR 0x800: a break code (0xAA, the fake shift, is dropped) shifts the
+  // 32-byte history down and stores the code at the newest slot [31].
+  if (original_scancode == 0 || original_scancode == 0xAA) {
     return;
+  }
+  std::copy(release_fifo_.begin() + 1, release_fifo_.end(), release_fifo_.begin());
+  release_fifo_[31] = original_scancode;
+}
+
+void MilestoneADemo::TickLogic() {
+  // One logic step. The PIT counter [0x2d2a3] is the main loop's tick (set_tick_count, read through
+  // Tick32()): every step of one catch-up frame reads the same value, as the original's steps do.
+  const bool frame_start = frame_start_pending_;
+  frame_start_pending_ = false;
+  if (frame_start) {
+    frame_batch_done_ = false;
+  }
+
+  if (state9_pending_) {
+    // Game over -> 0x3830(9), requested by the top-out code since the last tick.
+    state9_pending_ = false;
+    BeginDispatcherEntry(9, state9_source_);
   }
 
   for (size_t scan_code = 0; scan_code < held_original_scancodes_.size(); ++scan_code) {
@@ -1243,18 +1502,51 @@ void MilestoneADemo::Tick() {
     ++held_original_scancode_frames_[scan_code];
   }
 
-  if (scene_ == Scene::kFrontend &&
-      (frontend_view_ == FrontendView::kOptions || frontend_view_ == FrontendView::kSoundSetup)) {
-    const bool left_held = held_original_scancodes_[0xCB];
-    const bool right_held = held_original_scancodes_[0xCD];
-    if (left_held != right_held) {
-      const std::uint8_t scan_code = left_held ? 0xCB : 0xCD;
-      const int frames = held_original_scancode_frames_[scan_code];
-      if (frames >= kFrontendHoldStartFrames &&
-          (frames - kFrontendHoldStartFrames) % kFrontendHoldRepeatFrames == 0) {
-        ApplyFrontendHorizontalEdit(left_held ? -1 : 1, false);
+  if (scene_ == Scene::kSplash || scene_ == Scene::kFrontend) {
+    // The catch-up steps of a frame (the 0x24d0 pacer's return, 1..6) each run one screen tick; a
+    // screen loop that sets its exit flag (a gate returned 1) is left at once, so the rest of the
+    // frame's steps run no screen logic.
+    if (!frame_batch_done_) {
+      TickFrontendOnce(frame_start);
+      if (scene_ == Scene::kGameplay || quit_requested_ || screen_exit_) {
+        frame_batch_done_ = true;
       }
     }
+    if (scene_ != Scene::kGameplay && scene_ != Scene::kTopOut) {
+      FlushAudioEvents();
+      return;
+    }
+    // The dispatcher exit finished in this step: main's session loop runs its first step in the
+    // same tick (0x488 / 0x4db), a gameplay step or, after Return to Game from an Esc during the
+    // dissolve, a game-over scene step, so fall through. The main loop counts this step as the
+    // first step of the pacer frame that follows the 0x6498 tick loop.
+  }
+
+  if (scene_ == Scene::kTopOut) {
+    // Session loop 0x4A3..0x4D6 at the start of the tick: a released Esc (the newest entry of the
+    // release history) clears the history and leaves before anything else of this tick runs.
+    if (PeekRelease() == 0x01) {
+      ClearReleases();
+      if (top_out_dissolved_rows_ >= kTopOutDissolveFrames) {
+        // After GAME OVER: 0x23AC (save-under back into the working screen only) and 0x3830(9):
+        // the displayed GAME OVER frame fades out (0x64f0), then state 9.
+        BeginHighScoreNameEntry(top_out_score_, top_out_lines_);
+        state9_pending_ = false;
+        BeginDispatcherEntry(9, FrozenSource::kTopOut);
+      } else {
+        // During the dissolve: 0x3830(1), the main menu, with the game still resumable (the live
+        // flag 0x2C72B drops only in the GAME OVER tick); Return to Game continues the dissolve.
+        SaveLiveSnapshot();
+        BeginDispatcherEntry(1, FrozenSource::kTopOut);
+      }
+      FlushAudioEvents();
+      return;
+    }
+    // One tick of the game-over scene: particles, one dissolve scanline (GAME OVER with the
+    // 160th), the face update. A catch-up frame advances it once per step.
+    StepTopOutScene();
+    FlushAudioEvents();
+    return;
   }
 
   if (scene_ != Scene::kGameplay) {
@@ -1262,45 +1554,127 @@ void MilestoneADemo::Tick() {
     return;
   }
 
-  if (live_game_active_) {
-    // Soft-drop is polled per frame inside the gravity step (CurrentDropIncrement):
-    // while Down is held the accumulator increment is 0x8000, i.e. one row every two
-    // frames, matching the original. It is deliberately NOT a discrete per-frame row
-    // move here. The move/rotate auto-repeat below excludes binding 0 (Down).
-    StepLiveGameplay();
+  // main 0x4a3-0x4d6: a released Esc (the newest entry of the release history)
+  // clears the history and enters the frontend (state 1) before any game logic
+  // of this tick runs.
+  if (PeekRelease() == 0x01) {
+    ClearReleases();
+    SaveLiveSnapshot();
+    BeginDispatcherEntry(1, FrozenSource::kGameplay);
+    FlushAudioEvents();
+    return;
   }
 
-  for (const int binding_index : {1, 2, 3, 4}) {
-    const std::uint8_t scan_code = keyboard_bindings_[binding_index];
-    if (scan_code == 0 || !held_original_scancodes_[scan_code]) {
-      continue;
-    }
-
-    const int frames = held_original_scancode_frames_[scan_code];
-    if (frames > 0 && frames % kGameplayBindingRepeatFrames == 0) {
-      ApplyGameplayBinding(scan_code, false);
-    }
+  if (live_game_active_) {
+    // The whole gameplay step, input included (0x9C8): held-key state is read inside the step,
+    // before gravity, with the original's four 8-step repeat timers (StepGameplayInput).
+    StepLiveGameplay();
   }
   FlushAudioEvents();
 }
 
-void MilestoneADemo::Render(SDL_Renderer* renderer) {
-  if (scene_ == Scene::kSplash) {
-    RenderSplash(renderer);
-    return;
-  }
+void MilestoneADemo::TickPresentation() {
+  // timing-core's split: the per-step counters the original advances after the frame's draw. Every
+  // frontend counter is advanced in the logic step before the draw (frontend-flow's order, matched
+  // frame by frame against the original), and the game-over scene steps itself in TickLogic
+  // (effects-alerts: nothing times out after GAME OVER), so nothing is left here; the hook stays
+  // for the main loop's step/draw contract.
+}
 
+bool MilestoneADemo::InBlockingPhase() const {
+  // The original's tick loops: one pass per tick, no flip and no 0x24d0 pacer call, so the pacer's
+  // baseline goes stale and its first return afterwards is capped at 6 (timing-core contract).
+  // The object fades 0x62e0 / 0x63b8, the reveal and conceal and every screen are pacer loops.
+  switch (flow_phase_) {
+    case FlowPhase::kSplash:           // 0x2998
+    case FlowPhase::kBootGap:          // chunk loads, then 0x6544's 32-tick wait
+    case FlowPhase::kEntryPaletteOut:  // 0x64f0
+    case FlowPhase::kExitPaletteIn:    // 0x6498
+      return true;
+    default:
+      return InNestedBlockingPhase();
+  }
+}
+
+bool MilestoneADemo::InNestedBlockingPhase() const {
+  // Tick loops entered from inside a screen-loop iteration, which then resumes (draw, flip, pacer):
+  // 0x6544 when the Music row changes the track, and the high-score footer frozen on a held Esc.
+  return flow_phase_ == FlowPhase::kMusicFreeze || esc_hold_ticks_ > 0;
+}
+
+bool MilestoneADemo::ConsumePacerResetRequest() {
+  // Deliver only once the dispatcher has returned: the original rebases right after 0x3830 returns,
+  // i.e. after the palette fade-in 0x6498, just before the first resumed gameplay step (0x4db-0x4ea).
+  if (!pacer_reset_pending_ || flow_phase_ != FlowPhase::kNone) {
+    return false;
+  }
+  pacer_reset_pending_ = false;
+  return true;
+}
+
+std::string MilestoneADemo::StepStateFingerprint() const {
+  // The logical step state Render() must not move (--check-render-purity draws every frame twice
+  // and compares this before and after). Render caches (palette-level textures, the frozen-picture
+  // capture) are left out on purpose.
+  std::ostringstream stream;
+  stream << "scene=" << static_cast<int>(scene_) << " view=" << static_cast<int>(frontend_view_)
+         << " flow=" << static_cast<int>(flow_phase_) << " t0=" << flow_t0_ << " fstep=" << flow_step_
+         << " dstate=" << dispatch_state_ << " exit=" << static_cast<int>(flow_exit_)
+         << " row=" << frontend_selected_row_ << " mrow=" << main_menu_row_ << " pend=" << menu_pending_
+         << " sexit=" << (screen_exit_ ? 1 : 0) << " pulse=" << pulse_phase_ << "," << entry_pulse_phase_
+         << " title=" << title_level_ << " splash=" << splash_page_ << ":" << splash_frame_ << ":"
+         << splash_stage_ << ":" << splash_level_ << " frame_counter=" << frontend_frame_counter_
+         << " cycle=" << frontend_cycle_counter_ << " bank=" << frontend_current_bank_ << ">"
+         << frontend_next_bank_ << " pointfield=" << frontend_pointfield_state_.origin_x << ","
+         << frontend_pointfield_state_.origin_y << "," << frontend_pointfield_state_.origin_z << ","
+         << frontend_pointfield_state_.angle_xy << "," << frontend_pointfield_state_.angle_z
+         << " view_frame=" << frontend_view_frame_ << " credits=" << credits_page_ << ":" << credits_mode_
+         << ":" << credits_counter_ << " hs=" << hs_mode_ << ":" << hs_slot_ << ":" << hs_stage_ << ":"
+         << hs_len_ << ":" << hs_buffer_ << " freeze=" << music_freeze_left_ << " eschold=" << esc_hold_ticks_
+         << " s9=" << (state9_pending_ ? 1 : 0) << " topout=" << top_out_frame_
+         << " dissolved=" << top_out_dissolved_rows_ << " alert=" << alert_effect_id_ << ":" << alert_lifetime_
+         << ":" << alert_reveal_counter_ << " hold=" << (alert_corner_hold_ ? 1 : 0)
+         << " debris_hidden=" << (debris_hidden_after_frontend_ ? 1 : 0) << " last_clear=" << last_clear_tick_
+         << " debris=" << debris_particles_.size() << " rng=" << gameplay_random_index_
+         << " events=" << audio_events_.size() << " amounts=";
+  for (const int amount : row_amount_) {
+    stream << amount << ",";
+  }
+  if (!debris_particles_.empty()) {
+    const DebrisParticle& first = debris_particles_.front();
+    stream << " debris0=" << first.x << "," << first.y << "," << first.age;
+  }
+  return stream.str();
+}
+
+void MilestoneADemo::Render(SDL_Renderer* renderer) {
   if (scene_ == Scene::kTopOut) {
     RenderTopOut(renderer);
     return;
   }
 
-  if (scene_ == Scene::kFrontend) {
-    RenderFrontend(renderer);
+  if (scene_ == Scene::kGameplay) {
+    RenderGameplay(renderer);
     return;
   }
 
-  RenderGameplay(renderer);
+  switch (flow_phase_) {
+    case FlowPhase::kSplash:
+      RenderSplash(renderer);
+      return;
+    case FlowPhase::kBootGap:
+      return;  // VRAM cleared: black
+    case FlowPhase::kEntryPaletteOut:
+    case FlowPhase::kExitPaletteIn:
+      if (frozen_capture_pending_) {
+        CaptureFrozenPicture(renderer);
+      }
+      RenderFrozenPicture(renderer, CurrentFrozenLevel());
+      return;
+    default:
+      RenderFrontend(renderer);
+      return;
+  }
 }
 
 bool MilestoneADemo::CaptureGameplaySnapshot(SDL_Renderer* renderer) {
@@ -1327,6 +1701,17 @@ bool MilestoneADemo::CaptureGameplaySnapshot(SDL_Renderer* renderer) {
 }
 
 void MilestoneADemo::Shutdown() {
+  // Edits are saved where the original saves (frontend exit, Exit Game); a window
+  // close has no DOS counterpart, so pending edits are flushed here instead of lost.
+  if (setup_dirty_) {
+    setup_dirty_ = false;
+    PersistSetupState();
+  }
+  if (frozen_texture_ != nullptr) {
+    SDL_DestroyTexture(frozen_texture_);
+    frozen_texture_ = nullptr;
+  }
+  frozen_texture_level_ = -1;
   const std::array<TextureAsset*, 8> textures = {
       &ddd_splash_,
       &warning_splash_,
@@ -1357,11 +1742,11 @@ void MilestoneADemo::Shutdown() {
     gameplay_snapshot_texture_ = nullptr;
   }
   gameplay_snapshot_texture_valid_ = false;
-  if (top_out_saved_under_texture_ != nullptr) {
-    SDL_DestroyTexture(top_out_saved_under_texture_);
-    top_out_saved_under_texture_ = nullptr;
+  if (alert_corner_texture_ != nullptr) {
+    SDL_DestroyTexture(alert_corner_texture_);
+    alert_corner_texture_ = nullptr;
   }
-  top_out_saved_under_valid_ = false;
+  alert_corner_dirty_ = true;
 
   title_indices_.clear();
   piece_atlas_indices_.clear();
@@ -1412,35 +1797,56 @@ std::string MilestoneADemo::debug_state_line() const {
     phase = "topout";
   }
 
+  // Absolute cells of the live piece (table 0x184E3 offsets + reference position), e.g. 6:0/7:0/6:1/7:1.
+  std::string cells;
+  for (const CellOffset& cell : RotatedCells(live_piece_.type, live_piece_.rotation)) {
+    cells += (cells.empty() ? "" : "/") + std::to_string(live_piece_.x + cell.x) + ":" +
+             std::to_string(live_piece_.y + cell.y);
+  }
+
   std::ostringstream stream;
   stream << "Debug state: scene=" << scene_name()
          << " phase=" << phase
          << " piece=" << live_piece_.type << ":" << live_piece_.rotation
          << " pos=" << live_piece_.x << "," << live_piece_.y
+         << " cells=" << cells
          << " next=" << live_next_piece_type_
          << " score=" << live_score_
          << " lines=" << live_lines_
          << " level=" << live_level_
          << " gravity=" << gravity_accumulator_
-         << " lock=" << lock_frames_
+         << " lockout=" << down_lockout_frames_
+         << " seed=" << piece_seed_
          << " rng=" << gameplay_random_index_
          << " clears=" << pending_clear_rows_.size()
          << " collapse=" << collapse_frame_
          << " topout=" << top_out_frame_
          << " front=" << frontend_view_frame_
-         << " hsboot=" << HighScoreBootstrapRemainingFrames()
-         << " rows=" << (scene_ == Scene::kFrontend ? VisibleFrontendRowCount(CurrentFrontendRows().size()) : 0)
-         << " conceal=" << high_score_conceal_frames_
-         << " commit=" << (high_score_entry_commit_pending_ ? 1 : 0)
+         << " hsboot=0"
+         << " rows=" << (scene_ == Scene::kFrontend ? VisibleRowCount() : 0)
+         << " conceal=" << (flow_phase_ == FlowPhase::kConceal ? kRevealSteps - flow_step_ : 0)
+         << " commit=" << (hs_commit_ ? 1 : 0)
          << " warning=" << warning_band_
          << " alert=" << alert_effect_id_
          << " pulse=" << PulseRevealAmount()
          << " debris=" << debris_particles_.size()
-         << " sleepy=" << (sleepy_ ? 1 : 0)
+         << " sleepy=" << (alert_effect_id_ == 11 ? 1 : 0)
          << " snapshot=" << (gameplay_snapshot_texture_valid_ ? 1 : 0)
-         << " savedunder=" << (top_out_saved_under_valid_ ? 1 : 0)
-         << " fade=" << (screen_fade_ == ScreenFade::kOut ? "out" : screen_fade_ == ScreenFade::kIn ? "in" : "none")
-         << ":" << screen_fade_frame_;
+         << " alertlife=" << alert_lifetime_
+         << " gameover=" << (scene_ == Scene::kTopOut && top_out_dissolved_rows_ >= kTopOutDissolveFrames ? 1 : 0)
+         << " fade="
+         << (flow_phase_ == FlowPhase::kEntryPaletteOut ? "pal-out"
+             : flow_phase_ == FlowPhase::kEntryTitleIn  ? "title-in"
+             : flow_phase_ == FlowPhase::kExitTitleOut  ? "title-out"
+             : flow_phase_ == FlowPhase::kExitPaletteIn ? "pal-in"
+             : flow_phase_ == FlowPhase::kQuitTitleOut  ? "quit-out"
+                                                        : "none")
+         << ":" << FlowFadeE()
+         << " flow=" << FlowPhaseName()
+         << " sel=" << (frontend_view_ == FrontendView::kMainMenu ? main_menu_row_ : frontend_selected_row_)
+         << " pend=" << menu_pending_
+         << " phase0x=" << std::hex << pulse_phase_ << std::dec
+         << " tlevel=" << CurrentTitleLevel();
   return stream.str();
 }
 
@@ -1493,6 +1899,11 @@ bool MilestoneADemo::LoadFrontendFont(std::string* error_out) {
   }
 
   sine_table_ = BuildSineTable();
+  original_sine_table_ = BuildOriginalSineTable();
+  scaled_title_palette_ = title_palette_;
+  rendered_title_level_ = 64;  // the textures were built at the full palette
+  rendered_splash_page_ = -1;
+  rendered_splash_level_ = -1;
   return true;
 }
 
@@ -1525,11 +1936,7 @@ bool MilestoneADemo::LoadFrontendPointfield(std::string* error_out) {
     }
   }
 
-  frontend_pointfield_state_ = FrontendPointfieldState{};
-  frontend_current_bank_ = 2;
-  frontend_next_bank_ = 0;
-  frontend_cycle_counter_ = 0;
-  frontend_frame_counter_ = 0;
+  // The 0x5ef4 state init (bank choice from the RNG) runs in InitFrontendPointfield.
   return true;
 }
 
@@ -1548,17 +1955,81 @@ bool MilestoneADemo::LoadGameplayParticleAssets(std::string* error_out) {
   std::copy(ramps.begin(), ramps.end(), particle_ramps_.begin());
 
   gameplay_palette_ = atet_data_.gameplay_palette();
+  particle_sine_table_ = BuildParticleSineTable();
+
+  // The face corner is a 50x50 piece of the working screen. 0x2188 saves the base screen
+  // under it once at startup; 0x2138 restores it when a face expires.
+  const AtetData::Indexed& base = atet_data_.gameplay_screen();
+  if (base.width < kAlertFaceX + kAlertFaceSize || base.height < kAlertFaceY + kAlertFaceSize ||
+      base.indices.size() < static_cast<size_t>(base.width) * static_cast<size_t>(base.height)) {
+    SetErrorMessage(error_out, "Gameplay screen too small for the alert corner.");
+    return false;
+  }
+  for (int row = 0; row < kAlertFaceSize; ++row) {
+    for (int col = 0; col < kAlertFaceSize; ++col) {
+      alert_corner_background_[static_cast<size_t>(row * kAlertFaceSize + col)] =
+          base.indices[static_cast<size_t>((kAlertFaceY + row) * base.width + kAlertFaceX + col)];
+    }
+  }
+  for (int tile = 0; tile < static_cast<int>(alert_tiles_.size()); ++tile) {
+    const AtetData::Indexed& face = atet_data_.alert_tile(tile);
+    if (face.width != kAlertFaceSize || face.height != kAlertFaceSize ||
+        face.indices.size() != static_cast<size_t>(kAlertFaceSize * kAlertFaceSize)) {
+      SetErrorMessage(error_out, "ATET.DAT chunk 6 alert tile is not 50x50.");
+      return false;
+    }
+  }
+  AlertCornerRestore();
   return true;
+}
+
+void MilestoneADemo::ResolveSetupDatPath(const std::string& data_dir) {
+  if (!setup_dat_override_.empty()) {
+    setup_dat_path_ = setup_dat_override_;
+    SDL_Log("SETUP.DAT: %s (from --setup-dat)", setup_dat_path_.c_str());
+    return;
+  }
+
+  // The original opens the bare name "setup.dat" (load 0x36dc, save 0x3604), relative
+  // to the working directory where it also opens "atet.dat", so the two files always
+  // sit in one folder. Keep that: SETUP.DAT lives beside the data file actually
+  // loaded, which is the executable's folder in the release layout.
+  const std::string primary = AbsoluteDir(data_dir) + "SETUP.DAT";
+  if (IsWritableFile(primary)) {
+    setup_dat_path_ = primary;
+    SDL_Log("SETUP.DAT: %s", setup_dat_path_.c_str());
+    return;
+  }
+
+  // Read-only install (Program Files, read-only media) or something in the way:
+  // keep the settings in the per-user data folder instead and say so.
+  if (char* pref = SDL_GetPrefPath("", "saba-reborn")) {
+    setup_dat_path_ = std::string(pref) + "SETUP.DAT";
+    SDL_free(pref);
+    SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "SETUP.DAT: %s is not writable; using the per-user copy %s",
+                primary.c_str(), setup_dat_path_.c_str());
+    return;
+  }
+
+  setup_dat_path_ = primary;
+  SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+              "SETUP.DAT: %s is not writable and no per-user folder is available (%s); settings will not be saved",
+              primary.c_str(), SDL_GetError());
 }
 
 bool MilestoneADemo::LoadSetupDat() {
   std::vector<Uint8> bytes;
   std::string ignored_error;
-  if (!ReadBinaryAsset(ATET_PORT_SETUP_DAT_PATH, &bytes, &ignored_error)) {
+  if (setup_dat_path_.empty() || !ReadBinaryAsset(setup_dat_path_.c_str(), &bytes, &ignored_error)) {
     return false;
   }
 
-  if (bytes.size() != kSetupDatSize) {
+  // 0x36dc checks only that the file opens and that it starts with the 5-byte
+  // 'AciD'+NUL signature, then reads the fields in order with no size check: a short
+  // file leaves the later fields zero, a longer one is read up to byte 178. (This
+  // loader used to reject every size but 178, after which Initialize() overwrote the
+  // player's file with defaults.)
+  if (bytes.size() < kSetupSignature.size()) {
     return false;
   }
 
@@ -1567,6 +2038,7 @@ bool MilestoneADemo::LoadSetupDat() {
       return false;
     }
   }
+  bytes.resize(kSetupDatSize, 0);
 
   sound_device_index_ = std::clamp(
       static_cast<int>(ReadLittleEndian32(bytes, kSetupSoundDeviceOffset)),
@@ -1636,13 +2108,11 @@ bool MilestoneADemo::SaveSetupDat() const {
         static_cast<std::uint32_t>(std::max(0, high_scores_[index].lines)));
   }
 
-  std::ofstream output(ATET_PORT_SETUP_DAT_PATH, std::ios::binary | std::ios::trunc);
-  if (!output) {
+  if (setup_dat_path_.empty()) {
     return false;
   }
-
-  output.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
-  return output.good();
+  // SDL_SaveFile takes a UTF-8 path on every platform (see ReadBinaryAsset).
+  return SDL_SaveFile(setup_dat_path_.c_str(), bytes.data(), bytes.size());
 }
 
 bool MilestoneADemo::RenderGameplayToTexture(SDL_Renderer* renderer, SDL_Texture* texture) {
@@ -1668,247 +2138,119 @@ bool MilestoneADemo::RenderGameplayToTexture(SDL_Renderer* renderer, SDL_Texture
 }
 
 void MilestoneADemo::RenderSplash(SDL_Renderer* renderer) {
+  // 0x2998 copies the picture into the displayed page while the palette is black
+  // and then only reprograms the DAC: the picture at the current palette level.
+  const int level = CurrentSplashLevel();
+  if (level <= 0) {
+    return;
+  }
+  EnsureSplashLevel(splash_page_, level);
   if (splash_page_ == 0) {
     DrawTexture(renderer, ddd_splash_.texture, ddd_splash_.width, ddd_splash_.height);
   } else {
     DrawTexture(renderer, warning_splash_.texture, warning_splash_.width, warning_splash_.height);
   }
-  AdvanceSplashTimers();
 }
 
-void MilestoneADemo::RenderTopOutBackdrop(SDL_Renderer* renderer) {
-  RenderGameplay(renderer);
-
-  const TextureAsset& topout_face = alert_tiles_[6];  // tile06 = shocked / game-over (RE alert ID 6)
-  DrawTextureAt(renderer, topout_face.texture, 24, 132, topout_face.width, topout_face.height);
-
-  const int dissolved_rows =
-      std::clamp((top_out_frame_ * kBoardHeight) / kTopOutDissolveFrames, 0, kBoardHeight);
+void MilestoneADemo::RenderTopOut(SDL_Renderer* renderer) const {
+  // The game-over scene is the working screen as the failed spawn left it, redrawn every
+  // frame from state (all stepping happens in Tick): HUD, the well as drawn (board plus the
+  // colliding piece when it was drawn) minus the scanlines 0x1EDC has already erased, the
+  // face corner, GAME OVER once the walk is done (0x22FC at (85,83), colour 0 transparent),
+  // and the debris plotted last (0x2F24 runs after every tick, over face and GAME OVER).
+  DrawTexture(renderer, gameplay_screen_.texture, gameplay_screen_.width, gameplay_screen_.height);
   SDL_SetRenderDrawColor(renderer, 0, 0, 0, SDL_ALPHA_OPAQUE);
-  for (int row = 0; row < dissolved_rows; ++row) {
-    const SDL_FRect row_rect = {
-        static_cast<float>(kGameplayClearX),
-        static_cast<float>(kGameplayClearY + (row * kPieceTileSize)),
-        static_cast<float>(kGameplayClearWidth),
-        static_cast<float>(kPieceTileSize),
-    };
-    SDL_RenderFillRect(renderer, &row_rect);
+  const SDL_FRect preview_clear = {static_cast<float>(kPreviewX), static_cast<float>(kPreviewY),
+                                   static_cast<float>(kPreviewWidth), static_cast<float>(kPreviewHeight)};
+  SDL_RenderFillRect(renderer, &preview_clear);
+  const SDL_FRect well_clear = {static_cast<float>(kGameplayClearX), static_cast<float>(kGameplayClearY),
+                                static_cast<float>(kGameplayClearWidth), static_cast<float>(kGameplayClearHeight)};
+  SDL_RenderFillRect(renderer, &well_clear);
+  if (live_game_active_) {
+    RenderLiveHud(renderer);
+  }
+  DrawBoardCells(renderer, top_out_source_cells_, false);
+
+  const int erased = std::clamp(top_out_dissolved_rows_, 0, kTopOutDissolveFrames);
+  if (erased > 0) {
+    SDL_SetRenderDrawColor(renderer, 0, 0, 0, SDL_ALPHA_OPAQUE);
+    const SDL_FRect erased_rect = {static_cast<float>(kGameplayClearX), static_cast<float>(kGameplayClearY),
+                                   static_cast<float>(kGameplayClearWidth), static_cast<float>(erased)};
+    SDL_RenderFillRect(renderer, &erased_rect);
   }
 
-  // Draw the dissolve fountain on top of the cleared (black) rows so the upward
-  // spray stays visible above the shrinking stack, matching the original.
-  RenderDebrisParticles(renderer);
-}
-
-bool MilestoneADemo::CaptureTopOutSavedUnder(SDL_Renderer* renderer) {
-  if (renderer == nullptr) {
-    return false;
+  RenderAlertTile(renderer);
+  if (top_out_dissolved_rows_ >= kTopOutDissolveFrames) {
+    DrawTextureAt(renderer, game_over_overlay_.texture, kGameOverX, kGameOverY, game_over_overlay_.width,
+                  game_over_overlay_.height);
   }
-
-  if (top_out_saved_under_texture_ == nullptr) {
-    top_out_saved_under_texture_ = SDL_CreateTexture(
-        renderer,
-        SDL_PIXELFORMAT_RGBA8888,
-        SDL_TEXTUREACCESS_TARGET,
-        kScreenWidth,
-        kScreenHeight);
-    if (top_out_saved_under_texture_ == nullptr) {
-      SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "Failed to create top-out saved-under texture: %s", SDL_GetError());
-      top_out_saved_under_valid_ = false;
-      return false;
-    }
+  if (!debris_hidden_after_frontend_) {
+    RenderDebrisParticles(renderer);
   }
-
-  SDL_Texture* previous_target = SDL_GetRenderTarget(renderer);
-  if (!SDL_SetRenderTarget(renderer, top_out_saved_under_texture_)) {
-    SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "Failed to set top-out saved-under target: %s", SDL_GetError());
-    top_out_saved_under_valid_ = false;
-    return false;
-  }
-
-  SDL_SetRenderDrawColor(renderer, 0, 0, 0, SDL_ALPHA_OPAQUE);
-  SDL_RenderClear(renderer);
-  RenderTopOutBackdrop(renderer);
-
-  if (!SDL_SetRenderTarget(renderer, previous_target)) {
-    SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "Failed to restore renderer target after top-out saved-under capture: %s", SDL_GetError());
-    top_out_saved_under_valid_ = false;
-    return false;
-  }
-
-  top_out_saved_under_valid_ = true;
-  return true;
-}
-
-void MilestoneADemo::RenderTopOut(SDL_Renderer* renderer) {
-  // The original game-over overlay is a real saved-under phase: the pixels
-  // beneath the GAME OVER overlay are saved once when the overlay first
-  // appears, the overlay is composited over that frozen backing, and the saved
-  // background is restored when the overlay is removed. It is not a live redraw
-  // of the dissolving gameplay each frame. Model that by capturing the backdrop
-  // into a backing texture on the first overlay-phase frame, then reusing it
-  // (frozen) through overlay removal until the high-score handoff.
-  const bool overlay_phase_reached = top_out_frame_ >= kTopOutOverlayStartFrame;
-  const bool overlay_visible =
-      top_out_frame_ >= kTopOutOverlayStartFrame && top_out_frame_ < kTopOutOverlayEndFrame;
-
-  if (!overlay_phase_reached) {
-    // Pre-overlay: the gameplay image is still dissolving live. Advance the
-    // dissolve fountain (spawn newly-cleared rows' debris + step particles)
-    // before rendering so this frame shows the spray.
-    top_out_saved_under_valid_ = false;
-    UpdateTopOutDissolve();
-    RenderTopOutBackdrop(renderer);
-    AdvanceTopOutTimers();
-    return;
-  }
-
-  if (!top_out_saved_under_valid_) {
-    CaptureTopOutSavedUnder(renderer);
-  }
-
-  if (top_out_saved_under_valid_) {
-    DrawTexture(renderer, top_out_saved_under_texture_, kScreenWidth, kScreenHeight);
-  } else {
-    // Fallback if a render-target texture is unavailable on this backend.
-    RenderTopOutBackdrop(renderer);
-  }
-
-  if (overlay_visible) {
-    DrawTextureAt(
-        renderer,
-        game_over_overlay_.texture,
-        96,
-        82,
-        game_over_overlay_.width,
-        game_over_overlay_.height);
-  }
-
-  AdvanceTopOutTimers();
 }
 
 void MilestoneADemo::RenderFrontend(SDL_Renderer* renderer) {
+  // Work buffer = title base + text rows; the chunk-7 points are drawn with
+  // set-if-empty after the text. All of it uses the title palette at the level
+  // the last object fade left (62/64 at rest, 0x63b8's final upload).
+  EnsureTitleLevel(CurrentTitleLevel());
   DrawTexture(renderer, title_screen_.texture, title_screen_.width, title_screen_.height);
   RenderFrontendPointfield(renderer);
-
-  const std::vector<std::string> rows = CurrentFrontendRows();
-  int selected_row = -1;
-  if (frontend_view_ == FrontendView::kMainMenu || frontend_view_ == FrontendView::kOptions ||
-      frontend_view_ == FrontendView::kKeyboardSetup || frontend_view_ == FrontendView::kSoundSetup) {
-    selected_row = frontend_selected_row_;
-  } else if (frontend_view_ == FrontendView::kHighScores && !rows.empty()) {
-    selected_row = static_cast<int>(rows.size()) - 1;
-  }
-
-  RenderFrontendRows(renderer, rows, selected_row);
-  // The chunk-7 objects keep animating during a screen fade (RenderFrontendPointfield
-  // above advances them, matching 0x62e0/0x63b8), but the reveal/menu timers are
-  // frozen while the fade runs so the rows appear only after the fade-in
-  // completes (the original runs the object fade first, then the menu loop).
-  if (screen_fade_ == ScreenFade::kNone) {
-    AdvanceFrontendTimers();
-  }
+  RenderFrontendRows(renderer);
 }
 
 void MilestoneADemo::RenderFrontendPointfield(SDL_Renderer* renderer) {
-  if (frontend_banks_[frontend_current_bank_].empty() || frontend_banks_[frontend_next_bank_].empty()) {
-    return;
+  AuditScopedTicks audit_ticks(&g_audit.pointfield_ticks);
+  if (frontend_frame_counter_ <= 0) {
+    return;  // 0x39c4 has not run yet: nothing projected
   }
-
-  const std::vector<FrontendPoint>& current_bank = frontend_banks_[frontend_current_bank_];
-  const std::vector<FrontendPoint>& next_bank = frontend_banks_[frontend_next_bank_];
-  const int morph_progress =
-      std::clamp(frontend_cycle_counter_ - kFrontendSteadyFrames, 0, kFrontendMorphFrames);
   std::vector<Uint8> occupied(kScreenWidth * kScreenHeight);
-  const std::int64_t sin_xy = sine_table_[frontend_pointfield_state_.angle_xy & 0x7FF] >> 4;
-  const std::int64_t cos_xy = sine_table_[(frontend_pointfield_state_.angle_xy + 0x200) & 0x7FF] >> 4;
-  const std::int64_t sin_z = sine_table_[frontend_pointfield_state_.angle_z & 0x7FF] >> 4;
-  const std::int64_t cos_z = sine_table_[(frontend_pointfield_state_.angle_z + 0x200) & 0x7FF] >> 4;
-
-  for (int point_index = 0; point_index < kFrontendRecordCount; ++point_index) {
-    FrontendPoint active_point = current_bank[point_index];
-    if (morph_progress > 0) {
-      const FrontendPoint& target_point = next_bank[point_index];
-      active_point.x += TruncDiv(static_cast<std::int64_t>(target_point.x - active_point.x) * morph_progress, 128);
-      active_point.y += TruncDiv(static_cast<std::int64_t>(target_point.y - active_point.y) * morph_progress, 128);
-      active_point.z += TruncDiv(static_cast<std::int64_t>(target_point.z - active_point.z) * morph_progress, 128);
-    }
-
-    const std::int64_t rotated = (cos_xy * active_point.x - sin_xy * active_point.y) >> 11;
-    const std::int64_t depth_y = sin_xy * active_point.x + cos_xy * active_point.y;
-    const std::int64_t projected_x_num = cos_z * rotated - sin_z * active_point.z + frontend_pointfield_state_.origin_x;
-    const std::int64_t projected_y_num = depth_y + frontend_pointfield_state_.origin_y;
-    const std::int64_t depth = active_point.z * cos_z + rotated * sin_z + frontend_pointfield_state_.origin_z;
-    const std::int64_t denominator = (depth + 0x14000000) >> 9;
-    if (denominator == 0) {
+  for (const ProjectedPoint& point : frontend_projected_) {
+    if (!point.valid) {
       continue;
     }
-
-    const int screen_x = TruncDiv(projected_x_num, denominator) + 0xA0;
-    const int screen_y = TruncDiv(projected_y_num, denominator) + 0x78;
-    if (screen_x < 0 || screen_x >= kScreenWidth || screen_y < 0 || screen_y >= kScreenHeight) {
+    // pix_set_if_empty (0x175c5): clipped to 320x240, drawn only on a pixel that is
+    // still 0 (title background or an earlier point); text drawn afterwards covers
+    // points exactly where a glyph pixel is non-zero, as in the work buffer.
+    if (point.x < 0 || point.x >= kScreenWidth || point.y < 0 || point.y >= kScreenHeight) {
       continue;
     }
-
-    const size_t screen_index = static_cast<size_t>(screen_y) * kScreenWidth + screen_x;
+    const size_t screen_index = static_cast<size_t>(point.y) * kScreenWidth + point.x;
     if (occupied[screen_index] || (!title_indices_.empty() && title_indices_[screen_index] != 0)) {
       continue;
     }
-
-    int shade = static_cast<int>(((denominator << 9) - 0x14000000) >> 23);
-    shade = std::clamp(shade, 0, 15);
-    const int color_index = std::clamp(kFrontendPointColorBase - shade, 0, 255);
-    const SDL_Color color = title_palette_[color_index];
+    const SDL_Color color = scaled_title_palette_[static_cast<size_t>(std::clamp(point.color, 0, 255))];
     SDL_SetRenderDrawColor(renderer, color.r, color.g, color.b, SDL_ALPHA_OPAQUE);
     const SDL_FRect point_rect = {
-        static_cast<float>(screen_x),
-        static_cast<float>(screen_y),
+        static_cast<float>(point.x),
+        static_cast<float>(point.y),
         1.0f,
         1.0f,
     };
     SDL_RenderFillRect(renderer, &point_rect);
     occupied[screen_index] = 1;
+    ++g_audit.pointfield_points;
   }
-
-  AdvanceFrontendPointfield();
 }
 
-void MilestoneADemo::RenderFrontendRows(
-    SDL_Renderer* renderer,
-    const std::vector<std::string>& rows,
-    int selected_row) const {
-  const int revealed_rows = VisibleFrontendRowCount(rows.size());
-  const bool steady_selection_pulse = revealed_rows >= static_cast<int>(rows.size());
+void MilestoneADemo::RenderFrontendRows(SDL_Renderer* renderer) const {
+  AuditScopedTicks audit_ticks(&g_audit.frontend_rows_ticks);
   const bool high_score_table =
       frontend_view_ == FrontendView::kHighScores || frontend_view_ == FrontendView::kHighScoreEntry;
-  for (size_t row_index = 0; row_index < rows.size(); ++row_index) {
-    if (static_cast<int>(row_index) >= revealed_rows || rows[row_index].empty()) {
+  for (int row = 0; row < kFrontendRowCount; ++row) {
+    const int amount = row_amount_[static_cast<size_t>(row)];
+    if (amount <= 0) {
+      continue;  // 0x60cc with amount 0 clears the row cell
+    }
+    const int y = kFrontendRowY + row * kFrontendRowStep;
+    if (high_score_table && row < 5) {
+      // 0x50b0 / 0x5868: name, score and lines, each centred on its column.
+      RenderFrontendText(renderer, row_text_[static_cast<size_t>(row)], kHiscoreNameCenterX, y, amount);
+      RenderFrontendText(renderer, hs_score_text_[static_cast<size_t>(row)], kHiscoreScoreCenterX, y, amount);
+      RenderFrontendText(renderer, hs_lines_text_[static_cast<size_t>(row)], kHiscoreLinesCenterX, y, amount);
       continue;
     }
-
-    const int reveal_amount =
-        steady_selection_pulse && static_cast<int>(row_index) == selected_row ? PulseRevealAmount() : 0x30;
-    const int y = kFrontendRowY + static_cast<int>(row_index) * kFrontendRowStep;
-
-    // High-score score rows draw as three aligned columns (name left, score and
-    // lines right) instead of a single centered string, matching the original.
-    // A left-align at X uses center_x = X + w/2; a right-align at X, X - w/2.
-    if (high_score_table && row_index < high_scores_.size()) {
-      const HighScoreRecord& record = high_scores_[row_index];
-      std::string name = record.name.empty() ? "Nobody" : record.name;
-      if (frontend_view_ == FrontendView::kHighScoreEntry &&
-          static_cast<int>(row_index) == high_score_entry_row_ && HighScoreEntryInputReady()) {
-        name = high_score_entry_name_.empty() ? "_" : high_score_entry_name_ + "_";
-      }
-      const std::string score = std::to_string(record.score);
-      const std::string lines = std::to_string(record.lines);
-      RenderFrontendText(renderer, name, kHiscoreNameLeftX + MeasureFrontendText(name) / 2, y, reveal_amount);
-      RenderFrontendText(renderer, score, kHiscoreScoreRightX - MeasureFrontendText(score) / 2, y, reveal_amount);
-      RenderFrontendText(renderer, lines, kHiscoreLinesRightX - MeasureFrontendText(lines) / 2, y, reveal_amount);
-      continue;
-    }
-
-    RenderFrontendText(renderer, rows[row_index], kFrontendTextCenterX, y, reveal_amount);
+    RenderFrontendText(renderer, row_text_[static_cast<size_t>(row)], kFrontendTextCenterX, y, amount);
   }
 }
 
@@ -1932,12 +2274,16 @@ void MilestoneADemo::RenderFrontendText(
     }
 
     const int glyph_index = glyph_code - 1;
+    // 0x60cc 0x617a: the '_' cursor glyph (0x42) is skipped while bit 4 of the
+    // tick counter is set (16 ticks shown, 16 hidden); x still advances.
+    if (glyph_code == 0x42 && (Tick32() & 0x10U) != 0) {
+      cursor_x += frontend_font_widths_[glyph_index] + 2;
+      continue;
+    }
     const int atlas_x = (glyph_index % kFrontendGlyphAtlasColumns) * kFrontendGlyphWidth;
     const int atlas_y = (glyph_index / kFrontendGlyphAtlasColumns) * kFrontendGlyphHeight;
     // 0x60cc renders into a fixed 16-row (kFrontendRenderHeight) window at the row's
-    // y, bottom-anchored. The pulse reveal never exceeds 0x40 (a 16px row), so the
-    // tallest breath exactly fills this window -- no clipping and, since 16 < the 17px
-    // row pitch, no overlap with the neighbouring rows.
+    // y, bottom-anchored (0x178b0 sampling). The pulse never exceeds 0x40 (16 px).
     for (int dest_row = 0; dest_row < kFrontendRenderHeight; ++dest_row) {
       const int sample_row = ((kFrontendRenderHeight - 1 - dest_row) * step) >> 16;
       if (sample_row < 0 || sample_row >= kFrontendGlyphHeight) {
@@ -1957,175 +2303,1476 @@ void MilestoneADemo::RenderFrontendText(
           1.0f,
       };
       SDL_RenderTexture(renderer, frontend_font_atlas_.texture, &source, &destination);
+      ++g_audit.glyph_row_draws;
     }
 
     cursor_x += frontend_font_widths_[glyph_index] + 2;
   }
 }
 
-void MilestoneADemo::AdvanceFrontendPointfield() {
-  frontend_pointfield_state_.origin_x += static_cast<std::int64_t>(sine_table_[frontend_pointfield_state_.phase_x & 0x7FF]) << 3;
-  frontend_pointfield_state_.origin_y += static_cast<std::int64_t>(sine_table_[frontend_pointfield_state_.phase_y & 0x7FF]) << 2;
-  frontend_pointfield_state_.origin_z += static_cast<std::int64_t>(sine_table_[frontend_pointfield_state_.phase_z & 0x7FF]) << 4;
+// ---------------------------------------------------------------------------
+// Palette levels (0x284c scaling) for the title, the splashes and the frozen
+// gameplay picture.
 
-  const int angle_xy_delta = sine_table_[frontend_pointfield_state_.angle_xy & 0x7FF] >> 14;
-  const int angle_z_delta = sine_table_[frontend_pointfield_state_.angle_z & 0x7FF] >> 14;
-  frontend_pointfield_state_.phase_x += angle_xy_delta + 3;
-  frontend_pointfield_state_.phase_y += angle_xy_delta + 2;
-  frontend_pointfield_state_.phase_z += angle_z_delta + 4;
-  frontend_pointfield_state_.angle_xy += 5;
-  frontend_pointfield_state_.angle_z += 2;
-
-  ++frontend_frame_counter_;
-  ++frontend_cycle_counter_;
-  if (frontend_cycle_counter_ >= kFrontendSteadyFrames + kFrontendMorphFrames) {
-    frontend_current_bank_ = frontend_next_bank_;
-    frontend_next_bank_ = (frontend_next_bank_ + 1) % kFrontendBankCount;
-    if (frontend_next_bank_ == frontend_current_bank_) {
-      frontend_next_bank_ = (frontend_next_bank_ + 1) % kFrontendBankCount;
+std::array<SDL_Color, 256> MilestoneADemo::ScaledPalette(int chunk_id, int level) const {
+  std::array<SDL_Color, 256> palette{};
+  const std::vector<Uint8>& chunk = atet_data_.chunk(chunk_id);
+  for (size_t index = 0; index < palette.size(); ++index) {
+    const size_t offset = index * 3;
+    if (offset + 2 >= chunk.size()) {
+      break;
     }
-    frontend_cycle_counter_ = 0;
+    palette[index] = SDL_Color{
+        Expand6To8(ScaleDac6(chunk[offset + 0], level)),
+        Expand6To8(ScaleDac6(chunk[offset + 1], level)),
+        Expand6To8(ScaleDac6(chunk[offset + 2], level)),
+        SDL_ALPHA_OPAQUE};
   }
+  return palette;
 }
 
-void MilestoneADemo::AdvanceFrontendTimers() {
-  ++frontend_view_frame_;
-  if (high_score_conceal_frames_ > 0) {
-    --high_score_conceal_frames_;
-    if (high_score_conceal_frames_ == 0) {
-      SetFrontendView(FrontendView::kMainMenu, 0);
-    }
-  }
-  if (frontend_view_ == FrontendView::kCredits) {
-    ++credits_page_timer_;
-    if (credits_page_timer_ >= kCreditsPageFrames) {
-      credits_page_ = (credits_page_ + 1) % static_cast<int>(kCreditsPages.size());
-      credits_page_timer_ = 0;
-      frontend_view_frame_ = 0;
-    }
-  }
-}
-
-void MilestoneADemo::AdvanceSplashTimers() {
-  ++splash_frame_;
-  if (splash_frame_ < kSplashPageFrames) {
+void MilestoneADemo::EnsureTitleLevel(int level) {
+  level = std::clamp(level, 0, 64);
+  if (level == rendered_title_level_) {
     return;
   }
-
-  splash_frame_ = 0;
-  ++splash_page_;
-  if (splash_page_ >= 2) {
-    CompleteStartupSplashes();
+  rendered_title_level_ = level;
+  scaled_title_palette_ = ScaledPalette(4, level);  // chunk 4 = title palette
+  if (title_screen_.texture != nullptr) {
+    const IndexedImage title = BuildIndexedImage(title_indices_, kScreenWidth, kScreenHeight, scaled_title_palette_, -1);
+    SDL_UpdateTexture(title_screen_.texture, nullptr, title.rgba_pixels.data(), title.width * 4);
+  }
+  if (frontend_font_atlas_.texture != nullptr) {
+    const AtetData::Indexed& font = atet_data_.font_atlas();
+    const IndexedImage atlas = BuildIndexedImage(font.indices, font.width, font.height, scaled_title_palette_, 0);
+    SDL_UpdateTexture(frontend_font_atlas_.texture, nullptr, atlas.rgba_pixels.data(), atlas.width * 4);
   }
 }
 
-void MilestoneADemo::AdvanceTopOutTimers() {
-  ++top_out_frame_;
-  if (top_out_frame_ >= kTopOutHandoffFrame) {
-    BeginHighScoreNameEntry(top_out_score_, top_out_lines_);
+void MilestoneADemo::EnsureSplashLevel(int page, int level) {
+  level = std::clamp(level, 0, 64);
+  if (page == rendered_splash_page_ && level == rendered_splash_level_) {
+    return;
+  }
+  rendered_splash_page_ = page;
+  rendered_splash_level_ = level;
+  const bool ddd = page == 0;
+  TextureAsset& asset = ddd ? ddd_splash_ : warning_splash_;
+  if (asset.texture == nullptr) {
+    return;
+  }
+  const AtetData::Indexed& image = ddd ? atet_data_.ddd_splash() : atet_data_.warning_splash();
+  const IndexedImage scaled =
+      BuildIndexedImage(image.indices, image.width, image.height, ScaledPalette(ddd ? 0 : 2, level), -1);
+  SDL_UpdateTexture(asset.texture, nullptr, scaled.rgba_pixels.data(), scaled.width * 4);
+}
+
+int MilestoneADemo::CurrentTitleLevel() const {
+  return std::clamp(title_level_, 0, 64);
+}
+
+int MilestoneADemo::CurrentSplashLevel() const {
+  return fades_enabled_ ? std::clamp(splash_level_, 0, 64) : 64;
+}
+
+int MilestoneADemo::FlowFadeE() const {
+  switch (flow_phase_) {
+    case FlowPhase::kEntryPaletteOut:
+    case FlowPhase::kEntryTitleIn:
+    case FlowPhase::kExitTitleOut:
+    case FlowPhase::kExitPaletteIn:
+    case FlowPhase::kQuitTitleOut:
+      return static_cast<int>(Tick32() - flow_t0_);
+    default:
+      return 0;
   }
 }
 
-void MilestoneADemo::ActivateFrontendSelection() {
-  if (frontend_view_ == FrontendView::kSoundSetup) {
-    switch (frontend_selected_row_) {
-      case 0:
-        sound_device_index_ = (sound_device_index_ + 1) % static_cast<int>(kSoundDeviceNames.size());
-        PersistSetupState();
-        return;
-      case 1:
-        mixing_rate_hz_ = kMixingRates[(MixingRateIndex(mixing_rate_hz_) + 1) % static_cast<int>(kMixingRates.size())];
-        PersistSetupState();
-        return;
-      case 2:
-        stereo_flag_ = stereo_flag_ == 0 ? 1 : 0;
-        PersistSetupState();
-        return;
-      case 3:
-        bit_depth_flag_ = bit_depth_flag_ == 0 ? 1 : 0;
-        PersistSetupState();
-        return;
-      case 4:
-        BeginStartupSplashes();
-        return;
-      case 5:
-        quit_requested_ = true;
-        return;
-      default:
-        return;
+int MilestoneADemo::CurrentFrozenLevel() const {
+  const int e = std::clamp(static_cast<int>(Tick32() - flow_t0_), 0, kFadeTicks);
+  if (flow_phase_ == FlowPhase::kEntryPaletteOut) {
+    return 64 - e;  // 0x64f0: (c * (64 - e)) >> 6, e = 0 shows the picture untouched
+  }
+  if (flow_phase_ == FlowPhase::kExitPaletteIn) {
+    return e;  // 0x6498: (c * e) >> 6; e = 0 is the tick 0x62e0 ended on (black)
+  }
+  return 64;
+}
+
+void MilestoneADemo::CaptureFrozenPicture(SDL_Renderer* renderer) {
+  frozen_capture_pending_ = false;
+  frozen_texture_level_ = -1;
+  frozen_rgba_.assign(static_cast<size_t>(kScreenWidth) * kScreenHeight * 4, 0);
+  for (size_t i = 3; i < frozen_rgba_.size(); i += 4) {
+    frozen_rgba_[i] = SDL_ALPHA_OPAQUE;
+  }
+  const bool entry = flow_phase_ == FlowPhase::kEntryPaletteOut;
+  if (frozen_source_ == FrozenSource::kBlack || renderer == nullptr) {
+    if (entry) {
+      // 0x3830 saves the work buffer at its entry (0x3835-0x3847). Before the first
+      // game it holds the game screen main decoded at start-up, with no counters:
+      // the first New Game fades in on the bare game screen (oracle ff-ngfade).
+      const AtetData::Indexed& game = atet_data_.gameplay_screen();
+      saved_screen_rgba_ =
+          BuildIndexedImage(game.indices, game.width, game.height, atet_data_.gameplay_palette(), -1).rgba_pixels;
     }
+    return;
   }
-
-  if (frontend_view_ == FrontendView::kMainMenu) {
-    switch (frontend_selected_row_) {
-      case 0:
-        BeginSceneFade(PendingScene::kGameplayNewGame);
-        return;
-      case 1:
-        SetFrontendView(FrontendView::kOptions, 0);
-        return;
-      case 2:
-        music_track_index_ = (music_track_index_ + 1) % static_cast<int>(kMusicTracks.size());
-        PersistSetupState();
-        StartCurrentMusic("music-track-change");
-        return;
-      case 3:
-        start_level_ = (start_level_ + 1) % 10;
-        return;
-      case 4:
-        SetFrontendView(FrontendView::kHighScores, 0);
-        return;
-      case 5:
-        SetFrontendView(FrontendView::kCredits, 0);
-        return;
-      case 6:
-        ScheduleExitFade();
-        quit_requested_ = true;
-        return;
-      case 7:
-        if (live_game_available_) {
-          BeginSceneFade(PendingScene::kGameplayResume);
+  SDL_Texture* target =
+      SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_TARGET, kScreenWidth, kScreenHeight);
+  if (target == nullptr) {
+    return;
+  }
+  SDL_Texture* previous_target = SDL_GetRenderTarget(renderer);
+  const auto render_into = [&](std::vector<Uint8>& dst) {
+    SDL_SetRenderDrawColor(renderer, 0, 0, 0, SDL_ALPHA_OPAQUE);
+    SDL_RenderClear(renderer);
+    if (frozen_source_ == FrozenSource::kTopOut) {
+      RenderTopOutFrozen(renderer);
+    } else {
+      RenderGameplay(renderer);
+    }
+    if (SDL_Surface* raw = SDL_RenderReadPixels(renderer, nullptr)) {
+      if (SDL_Surface* rgba = SDL_ConvertSurface(raw, SDL_PIXELFORMAT_RGBA32)) {
+        for (int y = 0; y < std::min(rgba->h, kScreenHeight); ++y) {
+          const auto* src = static_cast<const Uint8*>(rgba->pixels) + static_cast<size_t>(y) * rgba->pitch;
+          std::copy(src, src + static_cast<size_t>(std::min(rgba->w, kScreenWidth)) * 4,
+                    dst.begin() + static_cast<std::ptrdiff_t>(static_cast<size_t>(y) * kScreenWidth * 4));
         }
-        return;
-      default:
-        return;
+        SDL_DestroySurface(rgba);
+      }
+      SDL_DestroySurface(raw);
     }
+  };
+  if (SDL_SetRenderTarget(renderer, target)) {
+    // The entry fade 0x64f0 ramps the displayed page, debris included.
+    render_into(frozen_rgba_);
+    if (entry) {
+      // [0x2c69f], restored by the exit tail, is the working screen saved at 0x3835: it never holds
+      // particles (0x17875 restored them at the top of the frame, 0x2F24 plots after the ticks), so
+      // the exit fade-in 0x6498 shows a particle-free screen (FX-23).
+      saved_screen_rgba_ = frozen_rgba_;
+      const bool hidden = debris_hidden_after_frontend_;
+      debris_hidden_after_frontend_ = true;
+      render_into(saved_screen_rgba_);
+      debris_hidden_after_frontend_ = hidden;
+    }
+    SDL_SetRenderTarget(renderer, previous_target);
+  } else if (entry) {
+    saved_screen_rgba_ = frozen_rgba_;
   }
+  SDL_DestroyTexture(target);
+}
 
-  if (frontend_view_ == FrontendView::kOptions) {
-    if (frontend_selected_row_ == 0) {
-      music_volume_ = (music_volume_ + 10) % 110;
-      PersistSetupState();
-      ApplyMusicVolume();
-    } else if (frontend_selected_row_ == 1) {
-      sfx_volume_ = (sfx_volume_ + 10) % 110;
-      PersistSetupState();
-    } else if (frontend_selected_row_ == 2) {
-      SetFrontendView(FrontendView::kKeyboardSetup, 0);
-    } else if (frontend_selected_row_ == 3) {
-      SetFrontendView(FrontendView::kMainMenu, 0);
-    }
+void MilestoneADemo::RenderTopOutFrozen(SDL_Renderer* renderer) {
+  // The game-over picture as the screen shows it (RenderTopOut draws the scene from state and
+  // advances nothing): the dissolve so far, GAME OVER once it is up, and the debris.
+  RenderTopOut(renderer);
+}
+
+void MilestoneADemo::RenderFrozenPicture(SDL_Renderer* renderer, int level) {
+  level = std::clamp(level, 0, 64);
+  if (level <= 0 || frozen_rgba_.empty()) {
     return;
   }
+  if (frozen_texture_ == nullptr) {
+    frozen_texture_ =
+        SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STREAMING, kScreenWidth, kScreenHeight);
+    if (frozen_texture_ == nullptr) {
+      return;
+    }
+    SDL_SetTextureScaleMode(frozen_texture_, SDL_SCALEMODE_NEAREST);
+    SDL_SetTextureBlendMode(frozen_texture_, SDL_BLENDMODE_NONE);
+    frozen_texture_level_ = -1;
+  }
+  if (level != frozen_texture_level_) {
+    // Every colour of these pictures is a palette colour expanded from 6 bits, so
+    // the 6-bit value is recovered exactly and scaled as the DAC would be.
+    std::array<Uint8, 256> lut{};
+    for (int c8 = 0; c8 < 256; ++c8) {
+      const int c6 = static_cast<int>(std::lround(static_cast<double>(c8) * 63.0 / 255.0));
+      lut[static_cast<size_t>(c8)] = Expand6To8(ScaleDac6(c6, level));
+    }
+    std::vector<Uint8> scaled(frozen_rgba_.size());
+    for (size_t i = 0; i + 3 < frozen_rgba_.size(); i += 4) {
+      scaled[i + 0] = lut[frozen_rgba_[i + 0]];
+      scaled[i + 1] = lut[frozen_rgba_[i + 1]];
+      scaled[i + 2] = lut[frozen_rgba_[i + 2]];
+      scaled[i + 3] = SDL_ALPHA_OPAQUE;
+    }
+    SDL_UpdateTexture(frozen_texture_, nullptr, scaled.data(), kScreenWidth * 4);
+    frozen_texture_level_ = level;
+  }
+  DrawTexture(renderer, frozen_texture_, kScreenWidth, kScreenHeight);
+}
 
-  if (frontend_view_ == FrontendView::kKeyboardSetup) {
-    if (frontend_selected_row_ >= 0 && frontend_selected_row_ < static_cast<int>(keyboard_bindings_.size())) {
-      keyboard_capture_row_ = frontend_selected_row_;
-    } else if (frontend_selected_row_ == 5) {
-      SetFrontendView(FrontendView::kOptions, 2);
+// ---------------------------------------------------------------------------
+// Pointfield: 0x5ef4 init and 0x39c4 step, 32-bit like the original.
+
+void MilestoneADemo::SeedBootRandomTable() {
+  // rng_table_fill 0x32b0 with srand(0): (rand() << 16) | rand() into the table.
+  gameplay_random_state_ = 0;
+  gameplay_random_index_ = 0;
+  for (std::uint32_t& value : gameplay_random_table_) {
+    const std::uint32_t high = NextGameplayRandom15();
+    const std::uint32_t low = NextGameplayRandom15();
+    value = (high << 16) | low;
+  }
+}
+
+namespace {
+int SignedMod8(std::uint32_t value) {
+  // IDIV by 8 after CDQ: the remainder keeps the dividend's sign.
+  const std::int32_t v = static_cast<std::int32_t>(value);
+  return v % 8;
+}
+}  // namespace
+
+void MilestoneADemo::InitFrontendPointfield() {
+  frontend_pointfield_state_ = FrontendPointfieldState{};
+  frontend_next_bank_ = 0;
+  frontend_current_bank_ = std::clamp(SignedMod8(NextGameplayRandomU32()), 0, kFrontendBankCount - 1);
+  for (int i = 0; i < kFrontendRecordCount; ++i) {
+    frontend_active_points_[static_cast<size_t>(i)] =
+        frontend_banks_[static_cast<size_t>(frontend_current_bank_)].empty()
+            ? FrontendPoint{}
+            : frontend_banks_[static_cast<size_t>(frontend_current_bank_)][static_cast<size_t>(i)];
+  }
+  frontend_cycle_counter_ = 0;
+  frontend_frame_counter_ = 0;
+  for (ProjectedPoint& point : frontend_projected_) {
+    point = ProjectedPoint{};
+  }
+}
+
+void MilestoneADemo::StepFrontendPointfield() {
+  const auto& S = original_sine_table_;
+  FrontendPointfieldState& st = frontend_pointfield_state_;
+  const auto& cur_bank = frontend_banks_[static_cast<size_t>(frontend_current_bank_)];
+  if (cur_bank.empty()) {
+    return;
+  }
+  if (frontend_cycle_counter_ == kFrontendSteadyFrames) {
+    // Keep the queued bank unless it equals the current one; then draw from the
+    // shared game RNG until it differs. 0x3c70 stores the morph deltas.
+    while (frontend_next_bank_ == frontend_current_bank_) {
+      frontend_next_bank_ = std::clamp(SignedMod8(NextGameplayRandomU32()), 0, kFrontendBankCount - 1);
+    }
+    const auto& next_bank = frontend_banks_[static_cast<size_t>(frontend_next_bank_)];
+    for (int i = 0; i < kFrontendRecordCount; ++i) {
+      const FrontendPoint& c = cur_bank[static_cast<size_t>(i)];
+      const FrontendPoint& n = next_bank[static_cast<size_t>(i)];
+      frontend_morph_delta_[static_cast<size_t>(i)] = FrontendPoint{Sub32(n.x, c.x), Sub32(n.y, c.y), Sub32(n.z, c.z)};
+    }
+  }
+  if (frontend_cycle_counter_ > kFrontendSteadyFrames) {
+    // 0x3cdc: active = current + trunc(delta * p / 128).
+    const std::int32_t p = frontend_cycle_counter_ - kFrontendSteadyFrames;
+    for (int i = 0; i < kFrontendRecordCount; ++i) {
+      const FrontendPoint& c = cur_bank[static_cast<size_t>(i)];
+      const FrontendPoint& d = frontend_morph_delta_[static_cast<size_t>(i)];
+      frontend_active_points_[static_cast<size_t>(i)] = FrontendPoint{
+          Add32(c.x, TruncDiv(Mul32(d.x, p), 128)),
+          Add32(c.y, TruncDiv(Mul32(d.y, p), 128)),
+          Add32(c.z, TruncDiv(Mul32(d.z, p), 128))};
+    }
+  }
+  if (frontend_cycle_counter_ >= kFrontendSteadyFrames + kFrontendMorphFrames) {
+    frontend_cycle_counter_ = 0;
+    frontend_current_bank_ = frontend_next_bank_;
+  }
+  ++frontend_cycle_counter_;
+
+  const std::int32_t sin_a = S[static_cast<size_t>(st.angle_xy & 0x7FF)] >> 4;
+  const std::int32_t cos_a = S[static_cast<size_t>((st.angle_xy + 0x200) & 0x7FF)] >> 4;
+  const std::int32_t sin_b = S[static_cast<size_t>(st.angle_z & 0x7FF)] >> 4;
+  const std::int32_t cos_b = S[static_cast<size_t>((st.angle_z + 0x200) & 0x7FF)] >> 4;
+  for (int i = 0; i < kFrontendRecordCount; ++i) {
+    const FrontendPoint& p = frontend_active_points_[static_cast<size_t>(i)];
+    ProjectedPoint& out = frontend_projected_[static_cast<size_t>(i)];
+    const std::int32_t rot = Sub32(Mul32(cos_a, p.x), Mul32(sin_a, p.y)) >> 11;
+    std::int32_t num_y = Add32(Mul32(p.x, sin_a), Mul32(p.y, cos_a));
+    std::int32_t num_x = Sub32(Mul32(cos_b, rot), Mul32(sin_b, p.z));
+    std::int32_t den = Add32(Mul32(rot, sin_b), Mul32(p.z, cos_b));
+    num_x = Add32(num_x, st.origin_x);
+    num_y = Add32(num_y, st.origin_y);
+    den = Add32(den, st.origin_z);
+    den = Add32(den, 0x14000000) >> 9;
+    if (den == 0) {
+      out.valid = false;  // the original would fault (#DE) here; never reached in practice
+      continue;
+    }
+    int shade = Sub32(Shl32(den, 9), 0x14000000) >> 23;
+    shade = std::clamp(shade, 0, 15);
+    out.x = TruncDiv(num_x, den) + 0xA0;
+    out.y = TruncDiv(num_y, den) + 0x78;
+    out.color = kFrontendPointColorBase - shade;
+    out.valid = true;
+  }
+
+  st.origin_x = Add32(st.origin_x, Shl32(S[static_cast<size_t>(st.phase_x & 0x7FF)], 3));
+  st.origin_y = Add32(st.origin_y, Shl32(S[static_cast<size_t>(st.phase_y & 0x7FF)], 2));
+  st.origin_z = Add32(st.origin_z, Shl32(S[static_cast<size_t>(st.phase_z & 0x7FF)], 4));
+  const std::int32_t angle_xy_delta = S[static_cast<size_t>(st.angle_xy & 0x7FF)] >> 14;
+  const std::int32_t angle_z_delta = S[static_cast<size_t>(st.angle_z & 0x7FF)] >> 14;
+  st.phase_x = Add32(st.phase_x, angle_xy_delta + 3);
+  st.phase_y = Add32(st.phase_y, angle_xy_delta + 2);
+  st.phase_z = Add32(st.phase_z, angle_z_delta + 4);
+  st.angle_xy = Add32(st.angle_xy, 5);
+  st.angle_z = Add32(st.angle_z, 2);
+  ++frontend_frame_counter_;
+}
+
+// ---------------------------------------------------------------------------
+// Frontend flow.
+
+void MilestoneADemo::TickFrontendOnce(bool frame_start) {
+  switch (flow_phase_) {
+    case FlowPhase::kSplash:
+      TickSplash();
+      break;
+    case FlowPhase::kBootGap:
+      TickBootGap();
+      break;
+    case FlowPhase::kEntryPaletteOut:
+      TickEntryPaletteOut();
+      break;
+    case FlowPhase::kEntryTitleIn:
+      TickEntryTitleIn();
+      break;
+    case FlowPhase::kReveal:
+      TickReveal();
+      break;
+    case FlowPhase::kScreen:
+      if (frame_start && screen_exit_) {
+        // The loop left after the frame in which the gate (or Esc in Credits)
+        // set the exit flag; the 48-step conceal starts with the next frame.
+        screen_exit_ = false;
+        flow_phase_ = FlowPhase::kConceal;
+        flow_step_ = 0;
+        TickConceal();
+      } else {
+        TickScreen();
+      }
+      break;
+    case FlowPhase::kConceal:
+      TickConceal();
+      break;
+    case FlowPhase::kExitTitleOut:
+      TickExitTitleOut();
+      break;
+    case FlowPhase::kExitPaletteIn:
+      TickExitPaletteIn();
+      break;
+    case FlowPhase::kQuitTitleOut:
+      TickQuitTitleOut();
+      break;
+    case FlowPhase::kMusicFreeze:
+      TickMusicFreeze();
+      break;
+    case FlowPhase::kNone:
+      break;
+  }
+  if (frame_start) {
+    ++frontend_view_frame_;
+  }
+}
+
+void MilestoneADemo::BeginStartupSplashes() {
+  scene_ = Scene::kSplash;
+  flow_phase_ = FlowPhase::kSplash;
+  keyboard_capture_row_ = -1;
+  BeginSplashPage(0);
+}
+
+void MilestoneADemo::BeginSplashPage(int page) {
+  // 0x2998: black palette, decode, copy to the shown page, then t0 = tick.
+  splash_page_ = page;
+  splash_stage_ = 0;
+  splash_frame_ = 0;
+  splash_hold_t1_ = 0;
+  splash_level_ = 0;
+  flow_t0_ = Tick32();
+}
+
+void MilestoneADemo::TickSplash() {
+  const int e = static_cast<int>(Tick32() - flow_t0_);
+  splash_frame_ = e;
+  bool cut = false;
+  bool done = false;
+  switch (splash_stage_) {
+    case 0: {
+      // Fade-in: after each tick change e = tick - t0, level 64 - (128 - e) / 2,
+      // for e = 1..127 (first visible at e = 3, full at e = 127).
+      splash_level_ = 64 - ((0x80 - e) / 2);
+      cut = PeekRelease() == 0x01;
+      if (!cut && e >= kSplashFadeInEnd) {
+        splash_stage_ = 1;
+        splash_hold_t1_ = e;
+      }
+      break;
+    }
+    case 1: {
+      // Hold: polls the release history until 120 ticks have passed.
+      cut = PeekRelease() == 0x01;
+      if (!cut && e - splash_hold_t1_ >= kSplashHoldTicks) {
+        splash_stage_ = 2;
+        splash_hold_t1_ = e;  // t2: the fade-out uploads at t2+1 .. t2+128
+      }
+      break;
+    }
+    default: {
+      // Fade-out: the tick is read BEFORE each wait, so the upload at tick
+      // t2+1+k uses k = 0..127: level 64 - k / 2 (two full uploads first).
+      const int k = e - 1 - splash_hold_t1_;
+      splash_level_ = 64 - (std::clamp(k, 0, 0x7F) / 2);
+      cut = PeekRelease() == 0x01;
+      if (!cut && k >= kSplashFadeOutUploads - 1) {
+        done = true;  // last upload (k = 127) then VRAM is cleared
+      }
+      break;
+    }
+  }
+  if (cut) {
+    // Only an Esc release cuts a page: 0x94c, black palette, VRAM cleared; other
+    // releases stay in the history (an Enter starts a New Game at the menu).
+    ClearReleases();
+    splash_level_ = 0;
+    done = true;
+  }
+  if (!done) {
+    return;
+  }
+  splash_level_ = 0;
+  if (splash_page_ == 0) {
+    BeginSplashPage(1);  // the WARNING page starts in the same tick (zero-time load)
+    return;
+  }
+  // After the WARNING: chunk loads and page clears, then 0x6544 with no track
+  // playing yet still runs its 32-tick fade-out wait before starting the music.
+  scene_ = Scene::kFrontend;
+  frontend_view_ = FrontendView::kMainMenu;
+  flow_phase_ = FlowPhase::kBootGap;
+  flow_t0_ = Tick32();
+  flow_step_ = 0;  // 1 once 0x6544 has been called (the boot music request)
+}
+
+void MilestoneADemo::TickBootGap() {
+  const int e = static_cast<int>(Tick32() - flow_t0_);
+  if (e >= kBootLoadAllowanceTicks && flow_step_ == 0) {
+    // main calls 0x6544 after the chunk loads. The request goes out here: the music player runs
+    // 0x6544's 0x20-tick fade-out (nothing plays yet) and then loads and starts the module (audio
+    // MU-09), while this phase keeps the screen black for the same 32 ticks.
+    flow_step_ = 1;
+    StartCurrentMusic("music-start-after-startup");
+  }
+  if (e < kBootLoadAllowanceTicks + kMusicChangeWaitTicks) {
+    return;
+  }
+  // 0x6544 returns with the module started and fading in: 0x3830(1).
+  BeginDispatcherEntry(1, FrozenSource::kBlack);
+}
+
+void MilestoneADemo::BeginDispatcherEntry(int state, FrozenSource source) {
+  // 0x3830 entry: save the work buffer, 0x64f0 over the displayed picture, copy the
+  // title to the work buffer and all three pages, 0x63b8, then dispatch.
+  scene_ = Scene::kFrontend;
+  dispatch_state_ = state;
+  frontend_view_ = state == 5 ? FrontendView::kSoundSetup
+                   : state == 9 ? FrontendView::kHighScoreEntry
+                                : FrontendView::kMainMenu;
+  frozen_source_ = source;
+  frozen_capture_pending_ = true;
+  frozen_texture_level_ = -1;
+  row_amount_.fill(0);
+  menu_pending_ = 0;
+  screen_exit_ = false;
+  flow_t0_ = Tick32();
+  if (!fades_enabled_) {
+    title_level_ = kFrontendRestLevel;
+    StartScreen(state);
+    TickReveal();
+    return;
+  }
+  flow_phase_ = FlowPhase::kEntryPaletteOut;
+}
+
+void MilestoneADemo::TickEntryPaletteOut() {
+  const int e = static_cast<int>(Tick32() - flow_t0_);
+  if (e < kFadeTicks) {
+    return;  // level 64 - e, read by Render; no game logic, no pointfield
+  }
+  // Last upload (e = 63) done: the title copy and 0x63b8 start in this tick.
+  if (dispatch_state_ == 9 && frozen_source_ == FrozenSource::kTopOut) {
+    // effects-alerts FX-VP-02: at black after the GAME OVER fade the lost game is over for good
+    // (0x1FF5 cleared the live flag in the GAME OVER tick); nothing can re-enter it.
+    live_game_active_ = false;
+    live_game_available_ = false;
+  }
+  flow_phase_ = FlowPhase::kEntryTitleIn;
+  flow_t0_ = Tick32();
+  title_level_ = 0;
+  TickEntryTitleIn();
+}
+
+void MilestoneADemo::TickEntryTitleIn() {
+  const int e = static_cast<int>(Tick32() - flow_t0_);
+  if (e >= kFadeTicks) {
+    // 0x63b8 leaves after the frame with e = 62: the title palette stays at 62/64.
+    StartScreen(dispatch_state_);
+    TickReveal();
+    return;
+  }
+  title_level_ = e;
+  // 0x63b8 does not re-base the pacer, whose base predates the 63-tick busy wait, so the fade's
+  // second frame runs the capped 6 catch-up steps (the main loop's pacer): one pointfield step each.
+  StepFrontendPointfield();
+}
+
+void MilestoneADemo::SetAllRowAmounts(int amount) {
+  for (int row = 0; row < kFrontendRowCount; ++row) {
+    row_amount_[static_cast<size_t>(row)] = amount;
+  }
+}
+
+void MilestoneADemo::SetMainMenuRowText(int row) {
+  switch (row) {
+    case 0:
+      row_text_[0] = "New Game";
+      break;
+    case 1:
+      row_text_[1] = "Options";
+      break;
+    case 2:
+      row_text_[2] = std::string("Music:`") + kMusicTracks[static_cast<size_t>(
+                                                   NormalizeModulo(music_track_index_, static_cast<int>(kMusicTracks.size())))] +
+                     "'";
+      break;
+    case 3:
+      row_text_[3] = "Level " + std::to_string(start_level_);
+      break;
+    case 4:
+      row_text_[4] = "High Scores";
+      break;
+    case 5:
+      row_text_[5] = "Credits";
+      break;
+    case 6:
+      row_text_[6] = "Exit Game";
+      break;
+    case 7:
+      row_text_[7] = "Return to Game";
+      break;
+    default:
+      break;
+  }
+}
+
+void MilestoneADemo::BuildOptionsRows() {
+  row_text_[0] = "Music Volume:" + std::to_string(music_volume_);
+  row_text_[1] = "Sound FX Volume:" + std::to_string(sfx_volume_);
+  row_text_[2] = "Keyboard Setup";
+  row_text_[3] = "Back To Main Menu";
+  for (int row = 4; row < kFrontendRowCount; ++row) {
+    row_text_[static_cast<size_t>(row)].clear();
+  }
+}
+
+std::string MilestoneADemo::KeyboardBindingRowText(int row_index) const {
+  if (row_index < 0 || row_index >= static_cast<int>(keyboard_bindings_.size())) {
+    return {};
+  }
+  return std::string(kKeyboardBindingLabels[static_cast<size_t>(row_index)]) + ":" +
+         KeyNameForBinding(keyboard_bindings_[static_cast<size_t>(row_index)]);
+}
+
+void MilestoneADemo::BuildKeyboardSetupRows() {
+  for (int row = 0; row < 5; ++row) {
+    row_text_[static_cast<size_t>(row)] = KeyboardBindingRowText(row);
+  }
+  row_text_[5] = "Back to Options Menu";
+  row_text_[6].clear();
+  row_text_[7].clear();
+}
+
+void MilestoneADemo::BuildSoundSetupRows() {
+  row_text_[0] = kSoundDeviceNames[static_cast<size_t>(
+      std::clamp(sound_device_index_, 0, static_cast<int>(kSoundDeviceNames.size()) - 1))];
+  row_text_[1] = "Mixing Rate:" + std::to_string(mixing_rate_hz_);
+  row_text_[2] = stereo_flag_ != 0 ? "Stereo" : "Mono";
+  row_text_[3] = bit_depth_flag_ != 0 ? "16 Bit" : "8 Bit";
+  row_text_[4] = "Play Game";
+  row_text_[5] = "Exit to Dos";
+  row_text_[6].clear();
+  row_text_[7].clear();
+}
+
+void MilestoneADemo::BuildCreditsRows() {
+  const CreditsPage& page =
+      kCreditsPages[static_cast<size_t>(NormalizeModulo(credits_page_, static_cast<int>(kCreditsPages.size())))];
+  for (int row = 0; row < kFrontendRowCount; ++row) {
+    row_text_[static_cast<size_t>(row)] = page[static_cast<size_t>(row)];
+  }
+}
+
+void MilestoneADemo::BuildHighScoreRows() {
+  for (size_t row = 0; row < high_scores_.size(); ++row) {
+    row_text_[row] = high_scores_[row].name;
+    hs_score_text_[row] = std::to_string(high_scores_[row].score);
+    hs_lines_text_[row] = std::to_string(high_scores_[row].lines);
+  }
+  row_text_[5].clear();
+  row_text_[6] = "Return to Main Menu";
+  row_text_[7].clear();
+}
+
+void MilestoneADemo::StartScreen(int state) {
+  scene_ = Scene::kFrontend;
+  flow_phase_ = FlowPhase::kReveal;
+  flow_step_ = 0;
+  menu_pending_ = 0;
+  screen_exit_ = false;
+  menu_return_state_ = 1;
+  keyboard_capture_row_ = -1;
+  frontend_view_frame_ = 0;
+  dispatch_state_ = state;
+  row_text_.fill(std::string());
+  row_amount_.fill(0);
+  switch (state) {
+    case 5: {
+      // 0x5a94 snaps the stored mixing rate to the first table entry >= it; a rate
+      // above 44100 indexes past the 7-entry copy and reads the index itself (7).
+      frontend_view_ = FrontendView::kSoundSetup;
+      int index = 0;
+      while (index < static_cast<int>(kMixingRates.size()) && mixing_rate_hz_ > kMixingRates[static_cast<size_t>(index)]) {
+        ++index;
+      }
+      sound_rate_index_ = index;
+      mixing_rate_hz_ = index < static_cast<int>(kMixingRates.size()) ? kMixingRates[static_cast<size_t>(index)] : index;
+      frontend_selected_row_ = 0;
+      BuildSoundSetupRows();
+      break;
+    }
+    case 6:
+      frontend_view_ = FrontendView::kOptions;
+      frontend_selected_row_ = 0;  // 0x4584 always starts on row 0
+      BuildOptionsRows();
+      break;
+    case 7:
+      frontend_view_ = FrontendView::kKeyboardSetup;
+      frontend_selected_row_ = 0;
+      BuildKeyboardSetupRows();
+      break;
+    case 8:
+    case 9: {
+      // 0x50b0(mode): mode 1 (a game just ended) qualifies the run first.
+      hs_mode_ = state == 9 ? 1 : 0;
+      hs_slot_ = -1;
+      if (hs_mode_ == 1) {
+        int slot = 0;
+        while (slot < static_cast<int>(high_scores_.size()) &&
+               top_out_score_ <= high_scores_[static_cast<size_t>(slot)].score) {
+          ++slot;
+        }
+        if (slot >= static_cast<int>(high_scores_.size())) {
+          hs_mode_ = 0;
+        } else {
+          for (int index = static_cast<int>(high_scores_.size()) - 1; index > slot; --index) {
+            high_scores_[static_cast<size_t>(index)] = high_scores_[static_cast<size_t>(index - 1)];
+          }
+          high_scores_[static_cast<size_t>(slot)] = HighScoreRecord{"", top_out_score_, top_out_lines_};
+          hs_slot_ = slot;
+          MarkSetupDirty();
+        }
+      }
+      frontend_view_ = hs_mode_ == 1 ? FrontendView::kHighScoreEntry : FrontendView::kHighScores;
+      frontend_selected_row_ = kHiscoreFooterRow;
+      hs_stage_ = hs_mode_ == 1 ? 0 : 1;
+      BuildHighScoreRows();
+      break;
+    }
+    case 10:
+      frontend_view_ = FrontendView::kCredits;
+      credits_page_ = 0;
+      credits_counter_ = 0;
+      credits_esc_latch_ = false;
+      credits_mode_ = 1;
+      BuildCreditsRows();
+      break;
+    case 1:
+    default:
+      frontend_view_ = FrontendView::kMainMenu;
+      for (int row = 0; row < kFrontendRowCount; ++row) {
+        SetMainMenuRowText(row);
+      }
+      frontend_selected_row_ = main_menu_row_;
+      break;
+  }
+}
+
+void MilestoneADemo::TickReveal() {
+  // 0x3df4 (and 0x50b0's reveal): every row at min(step, 0x30) each tick, no
+  // input read; the loop is left after the frame whose step reached 0x30, so the
+  // screen's own loop starts with the next tick.
+  if (flow_step_ >= kRevealSteps) {
+    flow_phase_ = FlowPhase::kScreen;
+    if (frontend_view_ == FrontendView::kCredits) {
+      credits_mode_ = 0;
+      credits_counter_ = 1;  // 0x4fa1: EBX++ after the reveal
+    }
+    if (frontend_view_ == FrontendView::kHighScores || frontend_view_ == FrontendView::kHighScoreEntry) {
+      hs_buffer_.clear();
+      hs_len_ = 0;
+      hs_caps_ = false;
+      hs_commit_ = false;
+      hs_done_ = false;
+      menu_pending_ = 0;
+    }
+    TickScreen();
+    return;
+  }
+  SetAllRowAmounts(std::min(flow_step_, kRevealSteps));
+  StepFrontendPointfield();
+  ++flow_step_;
+}
+
+void MilestoneADemo::TickConceal() {
+  if (flow_step_ >= kRevealSteps) {
+    // 0x3ee4 returned: the screen hands its state to the dispatcher (or Credits
+    // starts its next page).
+    if (frontend_view_ == FrontendView::kCredits && credits_mode_ == 2) {
+      credits_page_ = (credits_page_ + 1) % static_cast<int>(kCreditsPages.size());
+      credits_counter_ = 0;
+      credits_mode_ = 0;
+      flow_phase_ = FlowPhase::kScreen;
+      TickScreen();
+      return;
+    }
+    DispatchState(menu_return_state_);
+    return;
+  }
+  SetAllRowAmounts(std::max(kRevealSteps - 1 - flow_step_, 0));
+  StepFrontendPointfield();
+  ++flow_step_;
+}
+
+void MilestoneADemo::DispatchState(int state) {
+  switch (state) {
+    case 2:
+      // Return to Game (or Play Game / Esc in the start-up Sound Setup): [0x1886f]
+      // = 7 (0x38d0), then the exit tail; main resets the row to 0 after the setup
+      // detour returns (0x181).
+      main_menu_row_ = 7;
+      BeginDispatcherExit(dispatch_state_ == 5 ? FlowExit::kSplashes : FlowExit::kResume);
+      return;
+    case 3:
+      BeginQuitFade();
+      return;
+    case 4:
+      BeginDispatcherExit(FlowExit::kNewGame);
+      return;
+    default:
+      // The dispatcher loop calls the next screen directly: no palette fades.
+      StartScreen(state);
+      TickReveal();
+      return;
+  }
+}
+
+void MilestoneADemo::BeginDispatcherExit(FlowExit exit) {
+  ClearReleases();  // 0x3941
+  flow_exit_ = exit;
+  if (!fades_enabled_) {
+    PersistSetupState();
+    setup_dirty_ = false;
+    FinishDispatcherExit();
+    return;
+  }
+  flow_phase_ = FlowPhase::kExitTitleOut;
+  flow_t0_ = Tick32();
+  row_amount_.fill(0);
+  TickExitTitleOut();
+}
+
+void MilestoneADemo::TickExitTitleOut() {
+  const int e = static_cast<int>(Tick32() - flow_t0_);
+  if (e >= kFadeTicks) {
+    // 0x3604 saves SETUP.DAT, the saved gameplay picture is restored (New Game
+    // also runs its init, 0x2d88 / 0x5e0), then 0x6498 starts in this tick.
+    PersistSetupState();
+    setup_dirty_ = false;
+    frozen_capture_pending_ = true;
+    switch (flow_exit_) {
+      case FlowExit::kNewGame:
+        // effects-alerts AL-VO-01: New Game init (0x05E0 -> 0x206C(1)) resets the face only in the
+        // working screen, so the corner as it was left stays on screen until the first tick.
+        alert_corner_shown_ = alert_corner_;
+        alert_corner_hold_ = true;
+        ResetLiveGameplayState();
+        live_game_active_ = true;
+        live_game_available_ = true;
+        StartCurrentMusic("music-continue-new-game");
+        frozen_source_ = FrozenSource::kGameplay;
+        UseSavedScreenForNewGame();
+        break;
+      case FlowExit::kResume:
+        // The original restores the saved screen; nothing in the frontend changes the
+        // parked game, so rendering the restored game gives the same picture (the game-over
+        // scene's picture after an Esc during the dissolve).
+        RestoreLiveSnapshot();
+        live_game_active_ = true;
+        StartCurrentMusic("music-continue-return-to-game");
+        frozen_source_ = gameplay_phase_ == GameplayPhase::kTopOutDissolve ? FrozenSource::kTopOut
+                                                                          : FrozenSource::kGameplay;
+        break;
+      case FlowExit::kSplashes:
+      case FlowExit::kNone:
+        frozen_source_ = FrozenSource::kBlack;
+        break;
+    }
+    if (flow_exit_ == FlowExit::kNewGame || flow_exit_ == FlowExit::kResume) {
+      // effects-alerts FX-23: the exit tail puts the saved working screen back on the pages before
+      // 0x6498 (0x395a-0x39ae) and that screen holds no particles, so the fade-in shows none; they
+      // show again once the first tick back in the game has stepped them (the flag is cleared in
+      // StepLiveGameplay / StepTopOutScene). Set after New Game's ResetLiveGameplayState.
+      debris_hidden_after_frontend_ = true;
+    }
+    frozen_texture_level_ = -1;
+    flow_phase_ = FlowPhase::kExitPaletteIn;
+    flow_t0_ = Tick32();
+    return;
+  }
+  // 0x62e0: title palette 64 - e (the first frame is at full brightness), the
+  // pointfield keeps moving; the rows were concealed before.
+  title_level_ = 64 - e;
+  StepFrontendPointfield();
+}
+
+void MilestoneADemo::UseSavedScreenForNewGame() {
+  // The exit tail copies the screen saved at the entry ([0x2c69f], 0x395a-0x3995) back
+  // to the work buffer and the pages; 0x6498 then only ramps the palette. For New
+  // Game, 0x05e0 first zeroes the well and the next box (0x6274) and copies the work
+  // buffer to the pages again; the new counters, the first piece, the preview and the
+  // face reset are drawn later and appear with the first gameplay frame (measured on
+  // the oracle: ff-ngfade, ff-ngfade2; AL-VO-01). The old counters, statistics and
+  // face therefore stay visible through the fade-in.
+  if (saved_screen_rgba_.size() != static_cast<size_t>(kScreenWidth) * kScreenHeight * 4) {
+    return;  // no entry picture (fades were off): render the game instead
+  }
+  frozen_rgba_ = saved_screen_rgba_;
+  const SDL_Color black = atet_data_.gameplay_palette()[0];
+  const auto zero_rect = [&](int x0, int y0, int w, int h) {
+    for (int y = y0; y < y0 + h && y < kScreenHeight; ++y) {
+      for (int x = x0; x < x0 + w && x < kScreenWidth; ++x) {
+        const size_t i = (static_cast<size_t>(y) * kScreenWidth + static_cast<size_t>(x)) * 4;
+        frozen_rgba_[i + 0] = black.r;
+        frozen_rgba_[i + 1] = black.g;
+        frozen_rgba_[i + 2] = black.b;
+        frozen_rgba_[i + 3] = SDL_ALPHA_OPAQUE;
+      }
+    }
+  };
+  zero_rect(kGameplayClearX, kGameplayClearY, kGameplayClearWidth, kGameplayClearHeight);
+  zero_rect(kPreviewX, kPreviewY, kPreviewWidth, kPreviewHeight);
+  frozen_capture_pending_ = false;
+}
+
+void MilestoneADemo::TickExitPaletteIn() {
+  const int e = static_cast<int>(Tick32() - flow_t0_);
+  if (e < kFadeTicks) {
+    return;  // level e, read by Render; nothing else runs during the busy wait
+  }
+  // e = 63 uploaded, followed by the full palette in the same tick (0x39b8).
+  FinishDispatcherExit();
+}
+
+void MilestoneADemo::FinishDispatcherExit() {
+  flow_phase_ = FlowPhase::kNone;
+  const FlowExit exit = flow_exit_;
+  flow_exit_ = FlowExit::kNone;
+  switch (exit) {
+    case FlowExit::kNewGame:
+      if (!fades_enabled_) {
+        alert_corner_shown_ = alert_corner_;
+        alert_corner_hold_ = true;
+        ResetLiveGameplayState();
+        live_game_active_ = true;
+        live_game_available_ = true;
+        StartCurrentMusic("music-continue-new-game");
+      }
+      scene_ = Scene::kGameplay;
+      // effects-alerts FX-23: the restored screen holds no particles; they show again after the
+      // first tick back in the game has stepped them.
+      debris_hidden_after_frontend_ = true;
+      // The first game after boot enters the session loop straight from main (0x483 -> 0x488) with
+      // no pacer rebase, so its second frame runs 6 steps; every later New Game comes back through
+      // the session loop's own 0x3830 call and the rebase at 0x4db-0x4ea.
+      pacer_reset_pending_ = frontend_new_games_ > 0;
+      ++frontend_new_games_;
+      break;
+    case FlowExit::kResume:
+      if (!fades_enabled_) {
+        RestoreLiveSnapshot();
+        live_game_active_ = true;
+        StartCurrentMusic("music-continue-return-to-game");
+      }
+      // effects-alerts FX-40: Return to Game after an Esc during the top-out dissolve resumes it.
+      scene_ = gameplay_phase_ == GameplayPhase::kTopOutDissolve ? Scene::kTopOut : Scene::kGameplay;
+      debris_hidden_after_frontend_ = true;
+      pacer_reset_pending_ = true;  // Return to Game: rebase, exactly one step (0x4db-0x4ea)
+      break;
+    case FlowExit::kSplashes:
+    case FlowExit::kNone:
+      // Back in main after the start-up Sound Setup: sound init, then the splashes.
+      main_menu_row_ = 0;
+      BeginStartupSplashes();
+      break;
+  }
+}
+
+void MilestoneADemo::BeginQuitFade() {
+  // State 3: wait for a running music ramp (none can be pending here: the
+  // Music-row change already waited), start the 0x40-tick music fade-out, run the
+  // title fade-out, save SETUP.DAT and exit.
+  ScheduleExitFade();
+  if (!fades_enabled_) {
+    PersistSetupState();
+    setup_dirty_ = false;
+    quit_requested_ = true;
+    return;
+  }
+  flow_phase_ = FlowPhase::kQuitTitleOut;
+  flow_t0_ = Tick32();
+  row_amount_.fill(0);
+  TickQuitTitleOut();
+}
+
+void MilestoneADemo::TickQuitTitleOut() {
+  const int e = static_cast<int>(Tick32() - flow_t0_);
+  title_level_ = 64 - std::min(e, kFadeTicks - 1);
+  if (!quit_requested_) {
+    StepFrontendPointfield();
+  }
+  if (e >= kFadeTicks - 1 && !quit_requested_) {
+    // The frame with e = 62 (level 2) is the last one presented; 0x62e0 then
+    // returns, 0x3604 saves and 0x5cc restores text mode and exits.
+    PersistSetupState();
+    setup_dirty_ = false;
+    quit_requested_ = true;
+  }
+}
+
+void MilestoneADemo::TickMusicFreeze() {
+  if (--music_freeze_left_ > 0) {
+    return;  // inside 0x6544's busy wait: no logic, no presents
+  }
+  // The new module is loaded and fading in; the rest of the Enter tick runs now,
+  // and the pacer then returns min(elapsed, 6) for the next frame.
+  flow_phase_ = FlowPhase::kScreen;
+  TickMainMenu(true);
+}
+
+int MilestoneADemo::PulseRow(int row, int mode) {
+  // 0x3fd8: in gate mode (1) a phase already at 0 or 0x400 ends the gate without
+  // drawing; otherwise draw at trunc(sine[phase] / 2048) + 0x30 and advance 0x20,
+  // twice in gate mode unless the first step landed on 0 or 0x400.
+  if (mode == 1 && (pulse_phase_ == 0 || pulse_phase_ == 0x400)) {
+    return 1;
+  }
+  if (row >= 0 && row < kFrontendRowCount) {
+    row_amount_[static_cast<size_t>(row)] =
+        TruncDiv(original_sine_table_[static_cast<size_t>(pulse_phase_ & kPulsePhaseMask)], 0x800) + 0x30;
+  }
+  pulse_phase_ = (pulse_phase_ + kPulseStep) & kPulsePhaseMask;
+  if (mode == 1 && pulse_phase_ != 0 && pulse_phase_ != 0x400) {
+    pulse_phase_ = (pulse_phase_ + kPulseStep) & kPulsePhaseMask;
+  }
+  return 0;
+}
+
+int MilestoneADemo::PulseEntryRow(int slot, int mode) {
+  // 0x5868: like 0x3fd8 on its own phase [0x19913] for the three columns of the
+  // inserted row, except that a gate ending on 0 / 0x400 still draws (settled 0x30).
+  if (slot < 0 || slot >= 5) {
+    return 1;
+  }
+  const int amount =
+      TruncDiv(original_sine_table_[static_cast<size_t>(entry_pulse_phase_ & kPulsePhaseMask)], 0x800) + 0x30;
+  row_amount_[static_cast<size_t>(slot)] = amount;
+  if (mode == 1 && (entry_pulse_phase_ == 0 || entry_pulse_phase_ == 0x400)) {
+    return 1;
+  }
+  entry_pulse_phase_ = (entry_pulse_phase_ + kPulseStep) & kPulsePhaseMask;
+  if (mode == 1 && entry_pulse_phase_ != 0 && entry_pulse_phase_ != 0x400) {
+    entry_pulse_phase_ = (entry_pulse_phase_ + kPulseStep) & kPulsePhaseMask;
+  }
+  return 0;
+}
+
+void MilestoneADemo::TickScreen() {
+  switch (frontend_view_) {
+    case FrontendView::kMainMenu:
+      TickMainMenu(false);
+      break;
+    case FrontendView::kOptions:
+      TickOptions();
+      break;
+    case FrontendView::kKeyboardSetup:
+      TickKeyboardSetup();
+      break;
+    case FrontendView::kSoundSetup:
+      TickSoundSetup();
+      break;
+    case FrontendView::kCredits:
+      TickCredits();
+      break;
+    case FrontendView::kHighScores:
+    case FrontendView::kHighScoreEntry:
+      TickHighScores();
+      break;
+  }
+}
+
+void MilestoneADemo::TickMainMenu(bool resume_after_music) {
+  // 0x40c0 steady loop, one logic tick.
+  int& row = main_menu_row_;
+  if (!resume_after_music) {
+    // Esc counts only while HELD, only with a game in progress, and only when no
+    // action is pending: Return to Game through the gate (0x4232-0x425b).
+    if (KeyHeld(0x01) && menu_pending_ == 0 && live_game_available_) {
+      menu_pending_ = 1;
+      menu_return_state_ = 2;
+      ClearReleases();
+    }
+    if (PeekRelease() == 0x1C && menu_pending_ == 0) {
+      ClearReleases();
+      switch (row) {
+        case 0:
+          menu_return_state_ = 4;
+          menu_pending_ = 1;
+          break;
+        case 1:
+          menu_return_state_ = 6;
+          menu_pending_ = 1;
+          break;
+        case 2:
+          // 0x61c8 clears the row, the track advances (wrap after 5) and 0x6544
+          // blocks inside this tick: 32-tick fade-out, load, start, fade-in.
+          music_track_index_ = music_track_index_ + 1 > 5 ? 0 : music_track_index_ + 1;
+          MarkSetupDirty();
+          StartCurrentMusic("music-track-change");
+          flow_phase_ = FlowPhase::kMusicFreeze;
+          music_freeze_left_ = kMusicChangeWaitTicks;
+          return;
+        case 3:
+          start_level_ = start_level_ + 1 > 9 ? 0 : start_level_ + 1;
+          SetMainMenuRowText(3);
+          break;
+        case 4:
+          menu_return_state_ = 8;
+          menu_pending_ = 1;
+          break;
+        case 5:
+          menu_return_state_ = 10;
+          menu_pending_ = 1;
+          break;
+        case 6:
+          menu_return_state_ = 3;
+          menu_pending_ = 1;
+          break;
+        case 7:
+          if (live_game_available_) {
+            menu_return_state_ = 2;
+            menu_pending_ = 1;
+          }
+          break;
+        default:
+          break;
+      }
+    }
+  } else {
+    SetMainMenuRowText(2);  // re-printed after 0x6544 returned
+  }
+  const std::uint8_t up = PeekRelease();
+  if ((up == 0xC8 || up == 0x48) && menu_pending_ == 0) {
+    EmitAudioEvent("menu-row-move", 1);
+    menu_pending_ = 2;
+    ClearReleases();
+  }
+  const std::uint8_t down = PeekRelease();
+  if ((down == 0xD0 || down == 0x50) && menu_pending_ == 0) {
+    EmitAudioEvent("menu-row-move", 1);
+    menu_pending_ = 3;
+    ClearReleases();
+  }
+  StepFrontendPointfield();
+  if (menu_pending_ == 0) {
+    PulseRow(row, 0);
+  }
+  if (menu_pending_ == 1 && PulseRow(row, 1) == 1) {
+    screen_exit_ = true;
+  }
+  if (menu_pending_ == 2 && PulseRow(row, 1) == 1) {
+    row = row - 1 < 0 ? 7 : row - 1;
+    menu_pending_ = 0;
+  }
+  if (menu_pending_ == 3 && PulseRow(row, 1) == 1) {
+    row = row + 1 > 7 ? 0 : row + 1;
+    menu_pending_ = 0;
+  }
+  frontend_selected_row_ = row;
+}
+
+void MilestoneADemo::TickOptions() {
+  // 0x4584 steady loop.
+  int& row = frontend_selected_row_;
+  if (KeyHeld(0x01) && menu_pending_ == 0) {
+    ClearReleases();
+    menu_return_state_ = 1;
+    menu_pending_ = 1;
+  }
+  if (PeekRelease() == 0x1C && menu_pending_ == 0) {
+    ClearReleases();  // rows 0 and 1 ignore Enter
+    if (row == 2) {
+      menu_return_state_ = 7;
+      menu_pending_ = 1;
+    } else if (row == 3) {
+      menu_return_state_ = 1;
+      menu_pending_ = 1;
+    }
+  }
+  // Left/Right are read from the held table: one unit per tick, clamped 0..100,
+  // the two directions tested independently; music volume applied each change.
+  if ((KeyHeld(0xCB) || KeyHeld(0x4B)) && menu_pending_ == 0) {
+    if (row == 0) {
+      if (music_volume_ > 0) {
+        --music_volume_;
+        ApplyMusicVolume();
+        MarkSetupDirty();
+      }
+      row_text_[0] = "Music Volume:" + std::to_string(music_volume_);
+    } else if (row == 1) {
+      if (sfx_volume_ > 0) {
+        --sfx_volume_;
+        MarkSetupDirty();
+      }
+      row_text_[1] = "Sound FX Volume:" + std::to_string(sfx_volume_);
+    }
+  }
+  if ((KeyHeld(0xCD) || KeyHeld(0x4D)) && menu_pending_ == 0) {
+    if (row == 0) {
+      if (music_volume_ < 100) {
+        ++music_volume_;
+        ApplyMusicVolume();
+        MarkSetupDirty();
+      }
+      row_text_[0] = "Music Volume:" + std::to_string(music_volume_);
+    } else if (row == 1) {
+      if (sfx_volume_ < 100) {
+        ++sfx_volume_;
+        MarkSetupDirty();
+      }
+      row_text_[1] = "Sound FX Volume:" + std::to_string(sfx_volume_);
+    }
+  }
+  const std::uint8_t up = PeekRelease();
+  if ((up == 0xC8 || up == 0x48) && menu_pending_ == 0) {
+    EmitAudioEvent("menu-row-move", 1);
+    menu_pending_ = 2;
+    ClearReleases();
+  }
+  const std::uint8_t down = PeekRelease();
+  if ((down == 0xD0 || down == 0x50) && menu_pending_ == 0) {
+    EmitAudioEvent("menu-row-move", 1);
+    menu_pending_ = 3;
+    ClearReleases();
+  }
+  StepFrontendPointfield();
+  if (menu_pending_ == 0) {
+    PulseRow(row, 0);
+  }
+  if (menu_pending_ == 1 && PulseRow(row, 1) == 1) {
+    screen_exit_ = true;
+  }
+  if (menu_pending_ == 2 && PulseRow(row, 1) == 1) {
+    row = row - 1 < 0 ? 3 : row - 1;
+    menu_pending_ = 0;
+  }
+  if (menu_pending_ == 3 && PulseRow(row, 1) == 1) {
+    row = row + 1 > 3 ? 0 : row + 1;
+    menu_pending_ = 0;
+  }
+}
+
+void MilestoneADemo::TickKeyboardSetup() {
+  // 0x49bc steady loop; pending 4 = waiting for the key to bind.
+  int& row = frontend_selected_row_;
+  if (KeyHeld(0x01) && menu_pending_ == 0) {
+    ClearReleases();
+    menu_return_state_ = 1;  // Esc goes back to the main menu
+    menu_pending_ = 1;
+  }
+  if (PeekRelease() == 0x1C && menu_pending_ == 0) {
+    ClearReleases();
+    static constexpr std::array<const char*, 5> kPrompts = {
+        "Down:_", "Left:_", "Right:_", "Rotate Left:_", "Rotate Right:_"};
+    if (row >= 0 && row <= 4) {
+      row_text_[static_cast<size_t>(row)] = kPrompts[static_cast<size_t>(row)];
+      menu_pending_ = 4;
+      keyboard_capture_row_ = row;
+    } else if (row == 5) {
+      menu_return_state_ = 6;  // Back to Options Menu (Options starts on row 0)
+      menu_pending_ = 1;
+    }
+  }
+  const std::uint8_t up = PeekRelease();
+  if ((up == 0xC8 || up == 0x48) && menu_pending_ == 0) {
+    EmitAudioEvent("menu-row-move", 1);
+    menu_pending_ = 2;
+    ClearReleases();
+  }
+  const std::uint8_t down = PeekRelease();
+  if ((down == 0xD0 || down == 0x50) && menu_pending_ == 0) {
+    EmitAudioEvent("menu-row-move", 1);
+    menu_pending_ = 3;
+    ClearReleases();
+  }
+  StepFrontendPointfield();
+  if (menu_pending_ == 0) {
+    PulseRow(row, 0);
+  }
+  if (menu_pending_ == 1 && PulseRow(row, 1) == 1) {
+    screen_exit_ = true;
+  }
+  if (menu_pending_ == 2 && PulseRow(row, 1) == 1) {
+    row = row - 1 < 0 ? 5 : row - 1;
+    menu_pending_ = 0;
+  }
+  if (menu_pending_ == 3 && PulseRow(row, 1) == 1) {
+    row = row + 1 > 5 ? 0 : row + 1;
+    menu_pending_ = 0;
+  }
+  if (menu_pending_ == 4) {
+    // The prompt row keeps pulsing; the binding is the newest released key of any
+    // kind except none and Esc (which is left in the history).
+    PulseRow(row, 0);
+    const std::uint8_t code = PeekRelease();
+    if (code != 0 && code != 0x01) {
+      ClearReleases();
+      menu_pending_ = 0;
+      if (row >= 0 && row < static_cast<int>(keyboard_bindings_.size())) {
+        keyboard_bindings_[static_cast<size_t>(row)] = code;
+        MarkSetupDirty();
+        row_text_[static_cast<size_t>(row)] = KeyboardBindingRowText(row);
+        // 0x61c8 clears the row cell again after the capture; the new name is first
+        // drawn by the next tick's pulse, so this frame shows the row blank.
+        row_amount_[static_cast<size_t>(row)] = 0;
+      }
       keyboard_capture_row_ = -1;
     }
   }
 }
 
-void MilestoneADemo::MoveFrontendSelection(int delta) {
-  const int row_count = SelectableFrontendRowCount();
-  if (row_count <= 0) {
+void MilestoneADemo::TickSoundSetup() {
+  // 0x5a94 steady loop (runs before sound init: no SFX here).
+  int& row = frontend_selected_row_;
+  if (KeyHeld(0x01) && menu_pending_ == 0) {
+    menu_return_state_ = 2;
+    menu_pending_ = 1;
+    ClearReleases();
+  }
+  if (PeekRelease() == 0x1C && menu_pending_ == 0) {
+    ClearReleases();
+    switch (row) {
+      case 0:
+        sound_device_index_ = sound_device_index_ + 1 > 5 ? 0 : sound_device_index_ + 1;
+        MarkSetupDirty();
+        BuildSoundSetupRows();
+        break;
+      case 1:
+        sound_rate_index_ = sound_rate_index_ + 1 >= static_cast<int>(kMixingRates.size()) ? 0 : sound_rate_index_ + 1;
+        mixing_rate_hz_ = kMixingRates[static_cast<size_t>(sound_rate_index_)];
+        MarkSetupDirty();
+        BuildSoundSetupRows();
+        break;
+      case 2:
+        stereo_flag_ = stereo_flag_ != 0 ? 0 : 1;
+        MarkSetupDirty();
+        BuildSoundSetupRows();
+        break;
+      case 3:
+        bit_depth_flag_ = bit_depth_flag_ != 0 ? 0 : 1;
+        MarkSetupDirty();
+        BuildSoundSetupRows();
+        break;
+      case 4:
+        menu_return_state_ = 2;
+        menu_pending_ = 1;
+        break;
+      case 5:
+        menu_return_state_ = 3;
+        menu_pending_ = 1;
+        break;
+      default:
+        break;
+    }
+  }
+  const std::uint8_t up = PeekRelease();
+  if ((up == 0xC8 || up == 0x48) && menu_pending_ == 0) {
+    menu_pending_ = 2;
+    ClearReleases();
+  }
+  const std::uint8_t down = PeekRelease();
+  if ((down == 0xD0 || down == 0x50) && menu_pending_ == 0) {
+    menu_pending_ = 3;
+    ClearReleases();
+  }
+  StepFrontendPointfield();
+  if (menu_pending_ == 0) {
+    PulseRow(row, 0);
+  }
+  if (menu_pending_ == 1 && PulseRow(row, 1) == 1) {
+    screen_exit_ = true;
+  }
+  if (menu_pending_ == 2 && PulseRow(row, 1) == 1) {
+    row = row - 1 < 0 ? 5 : row - 1;
+    menu_pending_ = 0;
+  }
+  if (menu_pending_ == 3 && PulseRow(row, 1) == 1) {
+    row = row + 1 > 5 ? 0 : row + 1;
+    menu_pending_ = 0;
+  }
+}
+
+void MilestoneADemo::TickCredits() {
+  // 0x4f38 hold loop. Mode 1 = build the next page and reveal it (one staging
+  // tick first), mode 2 = conceal (staged at counter 300), no pulse, no gate.
+  if (credits_mode_ == 1) {
+    BuildCreditsRows();
+    flow_phase_ = FlowPhase::kReveal;
+    flow_step_ = 0;
+    TickReveal();
+    return;
+  }
+  if (credits_mode_ == 2) {
+    flow_phase_ = FlowPhase::kConceal;
+    flow_step_ = 0;
+    TickConceal();
+    return;
+  }
+  if (credits_counter_ == 0) {
+    credits_mode_ = 1;  // staging tick: no pointfield step
+    return;
+  }
+  if (credits_counter_ == kCreditsHoldEnd) {
+    credits_mode_ = 2;  // staging tick
+    return;
+  }
+  // The only key: Esc held during a hold tick, latched once; the page then
+  // conceals and Credits returns to the main menu.
+  if (KeyHeld(0x01) && !credits_esc_latch_) {
+    menu_return_state_ = 1;
+    credits_esc_latch_ = true;
+    screen_exit_ = true;
+  }
+  StepFrontendPointfield();
+  ++credits_counter_;
+}
+
+void MilestoneADemo::TickHighScores() {
+  // 0x50b0 after its reveal: name entry (state 9 with a qualifying score), then the
+  // footer loop.
+  if (hs_stage_ == 0 && hs_done_) {
+    // The entry loop presented its settled frame last tick and left; the footer loop
+    // starts with this tick.
+    hs_stage_ = 1;
+    frontend_view_ = FrontendView::kHighScores;
+    menu_pending_ = 0;
+  }
+  if (hs_stage_ == 0 && hs_slot_ >= 0) {
+    const size_t slot = static_cast<size_t>(hs_slot_);
+    if (PeekRelease() == 0x1C && !hs_commit_) {
+      ClearReleases();
+      hs_commit_ = true;
+    }
+    // 0x61c8 clears the name cell, the row is printed as "%s_".
+    row_text_[slot] = hs_buffer_ + "_";
+    StepFrontendPointfield();
+    if (!hs_commit_) {
+      PulseEntryRow(hs_slot_, 0);
+    } else {
+      // From the commit on, the name is copied (no cursor) into the row and the
+      // record every tick while the one-shot gate settles the row.
+      row_text_[slot] = hs_buffer_;
+      high_scores_[slot].name = hs_buffer_;
+      MarkSetupDirty();
+      if (PulseEntryRow(hs_slot_, 1) == 1) {
+        hs_done_ = true;
+      }
+    }
+    // Edits come from the release history, one released key per tick; every key
+    // but Enter clears the history (a second Enter is left for the footer).
+    const std::uint8_t code = PeekRelease();
+    if (code != 0) {
+      if (code != 0x1C) {
+        ClearReleases();
+      }
+      if (code == 0x0E && hs_len_ > 0) {
+        --hs_len_;
+        hs_buffer_.resize(static_cast<size_t>(hs_len_));
+      }
+      if (code == 0x3A) {
+        hs_caps_ = !hs_caps_;
+      }
+      char ch = NameEntryChar(0, code);
+      if (ch != 0) {
+        const bool left_shift = KeyHeld(0x2A);
+        const bool right_shift = KeyHeld(0x36);
+        if (!hs_caps_) {
+          if (left_shift || right_shift) {
+            ch = NameEntryChar(1, code);
+          }
+        } else {
+          ch = (left_shift || !right_shift) ? NameEntryChar(2, code) : NameEntryChar(3, code);
+        }
+        if (((left_shift || right_shift) ? 1 : 0) != (hs_caps_ ? 1 : 0)) {
+          ch = NameEntryChar(1, code);
+        }
+        // buffer[len] = ch; the 10th character keeps being overwritten.
+        hs_buffer_.resize(static_cast<size_t>(hs_len_));
+        hs_buffer_.push_back(ch);
+        if (hs_len_ < 9) {
+          ++hs_len_;
+        }
+      }
+    }
     return;
   }
 
-  frontend_selected_row_ = (frontend_selected_row_ + delta + row_count) % row_count;
-  EmitAudioEvent("menu-row-move", 1);
+  // Footer loop: Enter release or a held Esc leave through the 0x3fd8 gate on the
+  // shared menu phase. While Esc is held nothing runs and nothing is presented.
+  if (KeyHeld(0x01)) {
+    ClearReleases();
+    menu_return_state_ = 1;
+    menu_pending_ = 1;
+    ++esc_hold_ticks_;
+    return;
+  }
+  // The hold ends: the footer iteration it froze continues, and the main loop's pacer then returns
+  // min(ticks since its last call, 6) for the next frame (InNestedBlockingPhase).
+  esc_hold_ticks_ = 0;
+  if (PeekRelease() == 0x1C && menu_pending_ == 0) {
+    ClearReleases();
+    menu_return_state_ = 1;
+    menu_pending_ = 1;
+  }
+  StepFrontendPointfield();
+  if (menu_pending_ == 0) {
+    PulseRow(kHiscoreFooterRow, 0);
+  }
+  if (menu_pending_ == 1 && PulseRow(kHiscoreFooterRow, 1) == 1) {
+    screen_exit_ = true;
+  }
 }
 
 void MilestoneADemo::TrackKeyDown(SDL_Keycode key) {
@@ -2136,6 +3783,7 @@ void MilestoneADemo::TrackKeyDown(SDL_Keycode key) {
 
   if (!held_original_scancodes_[original_scancode]) {
     held_original_scancode_frames_[original_scancode] = 0;
+    audit_pressed_[original_scancode] = true;
   }
   held_original_scancodes_[original_scancode] = true;
 }
@@ -2146,171 +3794,60 @@ void MilestoneADemo::TrackKeyUp(SDL_Keycode key) {
     return;
   }
 
+  if (held_original_scancodes_[original_scancode]) {
+    audit_released_[original_scancode] = true;
+  }
   held_original_scancodes_[original_scancode] = false;
   held_original_scancode_frames_[original_scancode] = 0;
 }
 
-void MilestoneADemo::SetFrontendView(FrontendView view, int selected_row) {
-  frontend_view_ = view;
-  const int row_count = SelectableFrontendRowCount();
-  frontend_selected_row_ = row_count <= 0 ? 0 : std::clamp(selected_row, 0, row_count - 1);
-  frontend_view_frame_ = 0;
-  high_score_bootstrap_frames_ = 0;
-  if (view == FrontendView::kCredits) {
-    credits_page_ = 0;
-    credits_page_timer_ = 0;
-  }
-  if (view != FrontendView::kKeyboardSetup) {
-    keyboard_capture_row_ = -1;
-  }
-  if (view != FrontendView::kHighScores && view != FrontendView::kHighScoreEntry) {
-    high_score_conceal_frames_ = 0;
-  }
-  if (view != FrontendView::kHighScoreEntry) {
-    high_score_entry_commit_pending_ = false;
-  }
-}
-
-void MilestoneADemo::BeginSceneFade(PendingScene target) {
-  pending_scene_ = target;
-  if (!fades_enabled_) {
-    CompleteSceneSwitch();  // instant switch for --no-fade / demo shortcuts
-    return;
-  }
-  screen_fade_ = ScreenFade::kOut;
-  screen_fade_frame_ = 0;
-}
-
-void MilestoneADemo::AdvanceScreenFade() {
-  ++screen_fade_frame_;
-  if (screen_fade_frame_ < kScreenFadeTicks) {
-    return;
-  }
-  screen_fade_frame_ = 0;
-  if (screen_fade_ == ScreenFade::kOut) {
-    CompleteSceneSwitch();  // swap content at full black, then fade the new scene in
-    screen_fade_ = ScreenFade::kIn;
-  } else {
-    screen_fade_ = ScreenFade::kNone;
-  }
-}
-
-void MilestoneADemo::CompleteSceneSwitch() {
-  switch (pending_scene_) {
-    case PendingScene::kFrontendFromGameplay:
-      scene_ = Scene::kFrontend;
-      SetFrontendView(FrontendView::kMainMenu, 0);
-      live_game_available_ = true;
-      break;
-    case PendingScene::kGameplayNewGame:
-      ResetLiveGameplayState();
-      live_game_active_ = true;
-      live_game_available_ = true;
-      scene_ = Scene::kGameplay;
-      StartCurrentMusic("music-continue-new-game");
-      break;
-    case PendingScene::kGameplayResume:
-      RestoreLiveSnapshot();
-      live_game_active_ = true;
-      scene_ = Scene::kGameplay;
-      StartCurrentMusic("music-continue-return-to-game");
-      break;
-    case PendingScene::kNone:
-      break;
-  }
-  pending_scene_ = PendingScene::kNone;
-}
-
 int MilestoneADemo::screen_fade_alpha() const {
-  if (screen_fade_ == ScreenFade::kOut) {
-    return std::clamp(screen_fade_frame_ * 255 / kScreenFadeTicks, 0, 255);
-  }
-  if (screen_fade_ == ScreenFade::kIn) {
-    return std::clamp(255 - (screen_fade_frame_ * 255 / kScreenFadeTicks), 0, 255);
-  }
-  // Boot splash pages fade in over the first kSplashFadeTicks frames and out
-  // over the last, holding fully visible between (RE 0x2998).
-  if (fades_enabled_ && scene_ == Scene::kSplash) {
-    if (splash_frame_ < kSplashFadeTicks) {
-      return std::clamp(255 - (splash_frame_ * 255 / kSplashFadeTicks), 0, 255);
-    }
-    const int out_start = kSplashPageFrames - kSplashFadeTicks;
-    if (splash_frame_ >= out_start) {
-      return std::clamp((splash_frame_ - out_start) * 255 / kSplashFadeTicks, 0, 255);
-    }
-  }
   return 0;
 }
 
-void MilestoneADemo::BeginStartupSplashes() {
-  scene_ = Scene::kSplash;
-  splash_page_ = 0;
-  splash_frame_ = 0;
-  keyboard_capture_row_ = -1;
-}
-
-void MilestoneADemo::CompleteStartupSplashes() {
-  scene_ = Scene::kFrontend;
-  splash_page_ = 0;
-  splash_frame_ = 0;
-  SetFrontendView(FrontendView::kMainMenu, 0);
-  StartCurrentMusic("music-start-after-startup");
-}
-
-bool MilestoneADemo::ApplyFrontendHorizontalEdit(int direction, bool allow_toggle_rows) {
-  direction = direction < 0 ? -1 : 1;
-  if (frontend_view_ == FrontendView::kOptions && frontend_selected_row_ == 0) {
-    music_volume_ = std::clamp(music_volume_ + (direction * 10), 0, 100);
-    PersistSetupState();
-    ApplyMusicVolume();
-    return true;
+const char* MilestoneADemo::FlowPhaseName() const {
+  switch (flow_phase_) {
+    case FlowPhase::kNone: return "none";
+    case FlowPhase::kSplash: return "splash";
+    case FlowPhase::kBootGap: return "boot-gap";
+    case FlowPhase::kEntryPaletteOut: return "pal-out";
+    case FlowPhase::kEntryTitleIn: return "title-in";
+    case FlowPhase::kReveal: return "reveal";
+    case FlowPhase::kScreen: return "screen";
+    case FlowPhase::kConceal: return "conceal";
+    case FlowPhase::kExitTitleOut: return "title-out";
+    case FlowPhase::kExitPaletteIn: return "pal-in";
+    case FlowPhase::kQuitTitleOut: return "quit-out";
+    case FlowPhase::kMusicFreeze: return "music-freeze";
   }
-  if (frontend_view_ == FrontendView::kOptions && frontend_selected_row_ == 1) {
-    sfx_volume_ = std::clamp(sfx_volume_ + (direction * 10), 0, 100);
-    PersistSetupState();
-    return true;
-  }
-  if (frontend_view_ == FrontendView::kSoundSetup) {
-    if (frontend_selected_row_ == 0) {
-      sound_device_index_ =
-          NormalizeModulo(sound_device_index_ + direction, static_cast<int>(kSoundDeviceNames.size()));
-      PersistSetupState();
-      return true;
-    }
-    if (frontend_selected_row_ == 1) {
-      const int rate_index =
-          NormalizeModulo(MixingRateIndex(mixing_rate_hz_) + direction, static_cast<int>(kMixingRates.size()));
-      mixing_rate_hz_ = kMixingRates[rate_index];
-      PersistSetupState();
-      return true;
-    }
-    if (allow_toggle_rows && frontend_selected_row_ == 2) {
-      stereo_flag_ = stereo_flag_ == 0 ? 1 : 0;
-      PersistSetupState();
-      return true;
-    }
-    if (allow_toggle_rows && frontend_selected_row_ == 3) {
-      bit_depth_flag_ = bit_depth_flag_ == 0 ? 1 : 0;
-      PersistSetupState();
-      return true;
-    }
-  }
-
-  return false;
+  return "?";
 }
 
 void MilestoneADemo::PersistSetupState() const {
   if (!SaveSetupDat()) {
     SDL_LogWarn(
         SDL_LOG_CATEGORY_APPLICATION,
-        "Failed to save SETUP.DAT state: %s",
-        ATET_PORT_SETUP_DAT_PATH);
+        "Failed to save SETUP.DAT state: %s (%s)",
+        setup_dat_path_.c_str(),
+        SDL_GetError());
+    return;
+  }
+  // The original writes SETUP.DAT only at the frontend exits (0x3604 from the
+  // dispatcher's state 3 and exit tail) and when it creates the defaults; the log
+  // line lets the suites check that an edit alone does not save (IN-14, HS-26).
+  if (debug_state_logging_) {
+    SDL_Log("Setup: SETUP.DAT saved at tick %u", static_cast<unsigned>(Tick32()));
   }
 }
 
 void MilestoneADemo::EmitAudioEvent(const char* event_name, int slot, int pan, int voice_class, int sfx_volume_override) {
   if (event_name == nullptr) {
     return;
+  }
+  if (voice_class < 0) {
+    // 0x6817 plays on voice (module channels + EDX); EDX is 0 at the lock (0x0D4E) and the menu
+    // blips (0x4445, 0x447C, 0x487F, 0x48BA, 0x4C9E, 0x4CD7) and 1 at every other call site.
+    voice_class = (slot == 0 || slot == 1) ? 0 : 1;
   }
   audio_events_.push_back(AudioEvent{
       event_name,
@@ -2321,13 +3858,50 @@ void MilestoneADemo::EmitAudioEvent(const char* event_name, int slot, int pan, i
       sfx_volume_override >= 0 ? sfx_volume_override : sfx_volume_,
       pan,
       voice_class});
+  audit_emitted_.push_back(AuditEmitted{audit_stage_, event_name, true, slot, music_track_index_, music_volume_,
+                                        sfx_volume_override >= 0 ? sfx_volume_override : sfx_volume_, pan,
+                                        voice_class});
 }
 
 int MilestoneADemo::PanForPieceColumn(int piece_x) const {
-  // Exact slot-0 pan curve recovered from the piece-lock caller at 0x0d4e:
-  //   ecx = (pieceX - 5) * 21 + 0x80
-  // (centered at column 5, ~21 units of pan bias per column). Clamped to 0..255.
-  return std::clamp((piece_x - 5) * 21 + 0x80, 0, 255);
+  // Lock-sound pan, 0x0D23-0x0D4E: ecx = (x - 5) * 21 + 0x80 with x the piece's reference x
+  // (the origin of its 4x4 box in the authored table 0x184E3, [0x2C737]); the mixer keeps the low
+  // 8 bits (0xB276), so x = -2 (an O or vertical I/S/Z at the left wall) pans hard right (237).
+  // The reference x is the piece's leftmost board column minus the authored left margin of its
+  // shape; the margin depends only on the shape (derived from 0x184E3: 0 for a horizontal I, 1 for
+  // three-wide states and the J/L/T states that point left, 2 for the rest).
+  struct ShapeMargin {
+    std::uint16_t mask;  // bit (dy * 4 + dx) of the cells shifted to their top-left
+    int margin;
+  };
+  static constexpr std::array<ShapeMargin, 19> kAuthoredLeftMargins = {{
+      {0x000F, 0}, {0x0017, 1}, {0x0027, 1}, {0x0033, 2}, {0x0036, 1}, {0x0047, 1}, {0x0063, 1},
+      {0x0071, 1}, {0x0072, 1}, {0x0074, 1}, {0x0113, 2}, {0x0131, 2}, {0x0132, 2}, {0x0223, 1},
+      {0x0231, 2}, {0x0232, 1}, {0x0311, 2}, {0x0322, 1}, {0x1111, 2},
+  }};
+  const std::array<CellOffset, 4> cells = RotatedCells(live_piece_.type, live_piece_.rotation);
+  int min_x = cells[0].x;
+  int min_y = cells[0].y;
+  for (const CellOffset& cell : cells) {
+    min_x = std::min(min_x, cell.x);
+    min_y = std::min(min_y, cell.y);
+  }
+  std::uint16_t mask = 0;
+  for (const CellOffset& cell : cells) {
+    const int bit = (cell.y - min_y) * 4 + (cell.x - min_x);
+    if (bit >= 0 && bit < 16) {
+      mask = static_cast<std::uint16_t>(mask | (1u << bit));
+    }
+  }
+  int margin = 0;
+  for (const ShapeMargin& entry : kAuthoredLeftMargins) {
+    if (entry.mask == mask) {
+      margin = entry.margin;
+      break;
+    }
+  }
+  const int reference_x = piece_x + min_x - margin;
+  return ((reference_x - 5) * 21 + 0x80) & 0xFF;
 }
 
 void MilestoneADemo::EmitMusicEvent(const char* event_name) {
@@ -2341,6 +3915,8 @@ void MilestoneADemo::EmitMusicEvent(const char* event_name) {
       music_track_index_,
       music_volume_,
       sfx_volume_});
+  audit_emitted_.push_back(
+      AuditEmitted{audit_stage_, event_name, false, 0, music_track_index_, music_volume_, sfx_volume_, 0x80, 0});
 }
 
 void MilestoneADemo::FlushAudioEvents() {
@@ -2383,158 +3959,60 @@ void MilestoneADemo::ApplyMusicVolume() {
   EmitMusicEvent("music-volume-apply");
 }
 
-void MilestoneADemo::BeginHighScoreConcealToMain() {
-  if (high_score_conceal_frames_ <= 0) {
-    high_score_conceal_frames_ = kHighScoreConcealFrames;
-    EmitMusicEvent("high-score-conceal-to-main");
-  }
-}
-
-bool MilestoneADemo::HandleHighScoreNameEntry(SDL_Keycode key) {
-  if (high_score_entry_row_ < 0 || high_score_entry_row_ >= static_cast<int>(high_scores_.size())) {
-    SetFrontendView(FrontendView::kHighScores, 0);
-    return true;
-  }
-
-  if (key == SDLK_ESCAPE) {
-    SetFrontendView(FrontendView::kHighScores, 0);
-    high_score_entry_row_ = -1;
-    high_score_entry_name_.clear();
-    high_score_entry_lowercase_ = false;
-    high_score_entry_commit_pending_ = false;
-    return true;
-  }
-
-  if (!HighScoreEntryInputReady()) {
-    return true;
-  }
-
-  if (key == SDLK_RETURN) {
-    high_score_entry_commit_pending_ = true;
-    return true;
-  }
-
-  if (key == SDLK_BACKSPACE) {
-    if (!high_score_entry_name_.empty()) {
-      high_score_entry_name_.pop_back();
-    }
-    return true;
-  }
-
-  if (key == SDLK_LSHIFT || key == SDLK_RSHIFT) {
-    high_score_entry_lowercase_ = !high_score_entry_lowercase_;
-    return true;
-  }
-
-  if (high_score_entry_name_.size() >= 10) {
-    return true;
-  }
-
-  if (key >= SDLK_A && key <= SDLK_Z) {
-    const char base = high_score_entry_lowercase_ ? 'a' : 'A';
-    high_score_entry_name_.push_back(static_cast<char>(base + (key - SDLK_A)));
-    return true;
-  }
-
-  if (key >= SDLK_0 && key <= SDLK_9) {
-    high_score_entry_name_.push_back(static_cast<char>('0' + (key - SDLK_0)));
-    return true;
-  }
-
-  if (key == SDLK_SPACE && !high_score_entry_name_.empty()) {
-    high_score_entry_name_.push_back(' ');
-    return true;
-  }
-  if (key == SDLK_SPACE) {
-    return true;
-  }
-
-  return false;
-}
-
-void MilestoneADemo::CommitHighScoreNameEntry() {
-  if (high_score_entry_row_ < 0 || high_score_entry_row_ >= static_cast<int>(high_scores_.size())) {
-    high_score_entry_commit_pending_ = false;
-    return;
-  }
-
-  high_scores_[high_score_entry_row_].name = high_score_entry_name_.empty() ? "Player" : high_score_entry_name_;
-  PersistSetupState();
-  SetFrontendView(FrontendView::kHighScores, 0);
-  high_score_entry_row_ = -1;
-  high_score_entry_name_.clear();
-  high_score_entry_lowercase_ = false;
-  high_score_entry_commit_pending_ = false;
-}
-
-void MilestoneADemo::CaptureKeyboardBinding(std::uint8_t original_scancode) {
-  if (keyboard_capture_row_ < 0 || keyboard_capture_row_ >= static_cast<int>(keyboard_bindings_.size())) {
-    keyboard_capture_row_ = -1;
-    return;
-  }
-
-  keyboard_bindings_[keyboard_capture_row_] = original_scancode;
-  keyboard_capture_row_ = -1;
-  PersistSetupState();
-}
-
 void MilestoneADemo::BeginHighScoreNameEntry(int score, int lines) {
-  top_out_handoff_pending_ = false;
-  const bool use_state9_bootstrap =
-      scene_ == Scene::kTopOut || gameplay_phase_ == GameplayPhase::kTopOutDissolve;
-  if (use_state9_bootstrap) {
+  // Game over -> 0x3830(9): the session loop clears the release history (0x4ba),
+  // restores the area under GAME OVER only in the saved work buffer (0x23ac), and
+  // the dispatcher entry fades the displayed picture out, fades the title in and
+  // runs 0x50b0(1), which qualifies the run and starts the name entry.
+  const bool from_top_out = scene_ == Scene::kTopOut || gameplay_phase_ == GameplayPhase::kTopOutDissolve;
+  if (from_top_out) {
     StartCurrentMusic("music-continue-topout-highscore");
   }
-  int insert_index = -1;
-  for (size_t index = 0; index < high_scores_.size(); ++index) {
-    if (score > high_scores_[index].score) {
-      insert_index = static_cast<int>(index);
-      break;
-    }
-  }
-
-  if (insert_index < 0) {
-    scene_ = Scene::kFrontend;
-    SetFrontendView(FrontendView::kHighScores, 0);
-    high_score_entry_row_ = -1;
-    high_score_entry_name_.clear();
-    high_score_entry_lowercase_ = false;
-    high_score_entry_commit_pending_ = false;
-    high_score_bootstrap_frames_ = use_state9_bootstrap ? kState9BootstrapFrames : 0;
-    return;
-  }
-
-  for (int index = static_cast<int>(high_scores_.size()) - 1; index > insert_index; --index) {
-    high_scores_[index] = high_scores_[index - 1];
-  }
-
-  high_scores_[insert_index] = HighScoreRecord{"", score, lines};
-  high_score_entry_row_ = insert_index;
-  high_score_entry_name_.clear();
-  high_score_entry_lowercase_ = false;
-  high_score_entry_commit_pending_ = false;
-  scene_ = Scene::kFrontend;
-  SetFrontendView(FrontendView::kHighScoreEntry, 0);
-  high_score_bootstrap_frames_ = use_state9_bootstrap ? kState9BootstrapFrames : 0;
+  top_out_score_ = score;
+  top_out_lines_ = lines;
+  ClearReleases();
+  // Callers run from key events and Render (outside Tick); the original's session loop
+  // reacts inside the tick that reads the release, so the entry starts with the next
+  // Tick (its 63-tick fade then counts from that tick).
+  state9_pending_ = true;
+  state9_source_ = scene_ == Scene::kTopOut ? FrozenSource::kTopOut : FrozenSource::kGameplay;
 }
 
 void MilestoneADemo::BeginTopOutDemo(int score, int lines) {
+  ArmTopOut(score, lines, /*piece_drawn=*/false, /*announce=*/true);
+}
+
+void MilestoneADemo::ArmTopOut(int score, int lines, bool piece_drawn, bool announce) {
+  // Failed spawn (0x102D..0x1065): face 6 for ever through the shared trigger 0x2008,
+  // 0x1F8C(2) (scanline counter 0, logical board cleared), SFX 5 (centre, class 1). The
+  // dissolve samples the working screen, so its source is the board plus the colliding
+  // piece when that was drawn (0x10A1 runs only when no collapse is pending). A spawn that
+  // failed in a clearing lock step played the face and the sound there (announce = false)
+  // and arms the scene only when gameplay-core's collapse of the frozen stack has run.
   top_out_frame_ = 0;
-  gameplay_top_out_frame_ = 0;
   top_out_dissolved_rows_ = 0;
-  // Clear the gameplay warning band + alert so the backdrop's RenderGameplay
-  // stops drawing a mood face; the top-out (shocked, tile06) face takes over.
-  warning_band_ = 0;
-  alert_effect_id_ = -1;
-  alert_lifetime_ = 0;
-  alert_reveal_frame_ = 0;
-  top_out_saved_under_valid_ = false;
   top_out_score_ = score;
   top_out_lines_ = lines;
-  top_out_handoff_pending_ = false;
+  top_out_source_cells_ = live_board_cells_;
+  if (piece_drawn) {
+    for (const CellOffset& cell : RotatedCells(live_piece_.type, live_piece_.rotation)) {
+      const int board_x = live_piece_.x + cell.x;
+      const int board_y = live_piece_.y + cell.y;
+      if (board_x >= 0 && board_x < kBoardWidth && board_y >= 0 && board_y < kBoardHeight) {
+        top_out_source_cells_[static_cast<size_t>(board_y * kBoardWidth + board_x)] =
+            NormalizeModulo(live_piece_.type, kPieceCount) + 1;
+      }
+    }
+  }
+  if (announce) {
+    TriggerAlert(6, kAlertInfiniteLifetime);
+  }
+  live_board_cells_.fill(0);
   gameplay_phase_ = GameplayPhase::kTopOutDissolve;
-  live_game_available_ = false;
-  EmitAudioEvent("top-out", 5);
+  if (announce) {
+    EmitAudioEvent("top-out", 5, 0x80, 1);
+  }
+  flow_phase_ = FlowPhase::kNone;  // --topout-demo starts here from the splash state
   scene_ = Scene::kTopOut;
 }
 
@@ -2543,43 +4021,13 @@ void MilestoneADemo::BeginLiveGameplayDemo(int simulated_clear_count) {
   if (simulated_clear_count > 0) {
     InjectFilledRowsForSmoke(std::clamp(simulated_clear_count, 1, 4));
   }
+  flow_phase_ = FlowPhase::kNone;  // --live-demo starts here from the splash state
   scene_ = Scene::kGameplay;
 }
 
-bool MilestoneADemo::TryMoveLivePiece(int delta_x, int delta_y) {
-  if (gameplay_phase_ != GameplayPhase::kFalling) {
-    return false;
-  }
-  LivePiece moved = live_piece_;
-  moved.x += delta_x;
-  moved.y += delta_y;
-  if (!CanPlaceLivePiece(moved)) {
-    return false;
-  }
-
-  live_piece_ = moved;
-  if (delta_x != 0 || delta_y < 0) {
-    lock_frames_ = 0;
-  }
-  return true;
-}
-
-bool MilestoneADemo::TryRotateLivePiece(int delta_rotation) {
-  if (gameplay_phase_ != GameplayPhase::kFalling) {
-    return false;
-  }
-  LivePiece rotated = live_piece_;
-  rotated.rotation = NormalizeModulo(rotated.rotation + delta_rotation, 4);
-  if (!CanPlaceLivePiece(rotated)) {
-    return false;
-  }
-
-  live_piece_ = rotated;
-  lock_frames_ = 0;
-  return true;
-}
-
 bool MilestoneADemo::CanPlaceLivePiece(const LivePiece& piece) const {
+  // 0x12AC(x, y, rot, id): a cell blocks when its column is outside 0..9, when its row is >= 20, or
+  // when its row is >= 0 and the board cell is set. Cells above the well (row < 0) are legal.
   const std::array<CellOffset, 4> cells = RotatedCells(piece.type, piece.rotation);
   for (const CellOffset& cell : cells) {
     const int board_x = piece.x + cell.x;
@@ -2602,59 +4050,77 @@ void MilestoneADemo::ResetLiveGameplayState() {
   live_piece_stats_.fill(0);
   live_score_ = 0;
   live_lines_ = 0;
+  // 0x5E0 (0x5FC): the running level starts at the menu's start level; after that only a ten-line
+  // crossing changes it (0xEA7).
   live_level_ = start_level_;
-  gameplay_random_state_ = piece_seed_;
-  gameplay_random_table_.fill(0);
-  gameplay_random_index_ = 0;
   gameplay_phase_ = GameplayPhase::kFalling;
   gravity_accumulator_ = 0;
-  lock_frames_ = 0;
+  // 0x9C8(1) called at 0x707: the four repeat timers and the Down lockout start at 0.
+  repeat_timers_.fill(0);
   down_lockout_frames_ = 0;
   pending_clear_rows_.clear();
   collapse_frame_ = 0;
-  gameplay_top_out_frame_ = 0;
+  collapse_step_ = 0;
+  collapse_batch_ = 0;
+  live_piece_hidden_ = false;
+  top_out_after_collapse_ = false;
+  top_out_frame_ = 0;
+  top_out_dissolved_rows_ = 0;
+  top_out_source_cells_.fill(0);
   warning_band_ = 0;
-  warning_cooldowns_.fill(0);
-  debris_particles_.clear();
+  // The particle pool is NOT reset: 0x2DA0 runs once at startup, so debris alive when the
+  // player left for the menu keeps flying in the new game (it froze while the menu ran).
   live_snapshot_ = LiveSnapshot{};
-  last_clear_was_four_ = false;
-  sleepy_ = false;
-  frames_since_clear_ = 0;
-  alert_effect_id_ = -1;
-  alert_lifetime_ = 0;
-  alert_reveal_frame_ = 0;
-  live_piece_ = LivePiece{0, 0, 4, 0};
+  ResetAlertState();  // 0x206C(1) from New Game init (0x0757): face, last-clear tick, b2b, cooldowns
+  // 0x5E0 -> 0x32B0 at 0x6F8: srand([0x2D2A3]), the tick counter, then refill the 8192-entry table,
+  // so every New Game deals a new sequence. --piece-seed pins the seed for tests and comparisons.
+  piece_seed_ = has_piece_seed_override_ ? piece_seed_override_ : static_cast<std::uint32_t>(tick_count_);
   RefillGameplayRandomTable();
-  live_piece_ = LivePiece{RollNextPieceType(), 0, 4, 0};
+  // 0x70C: next = draw % 7; then 0x1348 promotes it (current = next, next = draw % 7, counted).
   live_next_piece_type_ = RollNextPieceType();
+  live_piece_ = LivePiece{0, 0, kSpawnX, 0};
   line_clear_demo_count_ = 0;
-  ++live_piece_stats_[static_cast<size_t>(live_piece_.type)];
+  SpawnNextLivePiece();
 }
 
 bool MilestoneADemo::SpawnNextLivePiece() {
-  live_piece_ = LivePiece{live_next_piece_type_, 0, 4, 0};
+  // 0x1348: current = next, next = rng % 7, statistics[current] += 1, x=4 y=0 rotation 0,
+  // accumulator 0. It never writes the Down lockout 0x2C783.
+  live_piece_ = LivePiece{live_next_piece_type_, 0, kSpawnX, 0};
   live_next_piece_type_ = RollNextPieceType();
   gravity_accumulator_ = 0;
-  lock_frames_ = 0;
-  down_lockout_frames_ = kGameplayDownLockoutFrames;
   ++live_piece_stats_[static_cast<size_t>(live_piece_.type)];
+  // 0x102D: the spawn is tested in the same step on the board as it is now; after a clearing lock
+  // that board has its full rows emptied but not yet compacted.
   if (!CanPlaceLivePiece(live_piece_)) {
-    BeginTopOutDemo(live_score_, live_lines_);
+    if (gameplay_phase_ == GameplayPhase::kCollapse) {
+      // 0x9C8 runs a pending collapse (0xA20) before it looks at the top-out (0xA3A), so the frozen
+      // stack is collapsed for 8 steps per row first and the dissolve starts after it. The rest of
+      // the top-out (0x1037..0x1065) happens now: the top-out face (alert 6, lifetime -1) replaces
+      // the clear's reward face and the top-out sound (slot 5, centre, class 1) plays in this step.
+      top_out_after_collapse_ = true;
+      TriggerAlert(6, kAlertInfiniteLifetime);
+      EmitAudioEvent("top-out", 5, 0x80, 1);
+    } else {
+      // The colliding piece is drawn (0x10A1 runs when no collapse is pending) and the dissolve
+      // samples it (effects-alerts FX-20).
+      ArmTopOut(live_score_, live_lines_, /*piece_drawn=*/true, /*announce=*/true);
+    }
     return false;
   }
   return true;
 }
 
-void MilestoneADemo::CommitLivePieceToBoard() {
-  const std::array<CellOffset, 4> cells = RotatedCells(live_piece_.type, live_piece_.rotation);
-  for (const CellOffset& cell : cells) {
+void MilestoneADemo::CommitLivePieceToBoard(int lock_y) {
+  // 0x9C8 0xD53..0xD8E: the cells go to row lock_y + dy; rows < 0 are dropped. (The original's logical
+  // board stores 1 and keeps the colours in the screen image; the port stores id + 1 so it can redraw.)
+  for (const CellOffset& cell : RotatedCells(live_piece_.type, live_piece_.rotation)) {
     const int board_x = live_piece_.x + cell.x;
-    const int board_y = live_piece_.y + cell.y;
+    const int board_y = lock_y + cell.y;
     if (board_x < 0 || board_x >= kBoardWidth || board_y < 0 || board_y >= kBoardHeight) {
       continue;
     }
-    live_board_cells_[static_cast<size_t>(board_y * kBoardWidth + board_x)] =
-        NormalizeModulo(live_piece_.type, static_cast<int>(kTetrominoShapes.size())) + 1;
+    live_board_cells_[static_cast<size_t>(board_y * kBoardWidth + board_x)] = NormalizeModulo(live_piece_.type, kPieceCount) + 1;
   }
 }
 
@@ -2663,19 +4129,12 @@ void MilestoneADemo::StepLiveGameplay() {
     return;
   }
 
+  // One session-loop tick: particles 0x2E18, gameplay 0x9C8, alert face 0x206C.
   StepDebrisParticles();
-  ++frames_since_clear_;
-  if (!sleepy_ && frames_since_clear_ >= kSleepyNoClearFrames) {
-    sleepy_ = true;
-    EmitAudioEvent("sleepy-no-clear-timeout", 6);
-  }
-  if (down_lockout_frames_ > 0) {
-    --down_lockout_frames_;
-  }
-  for (int& cooldown : warning_cooldowns_) {
-    if (gameplay_phase_ != GameplayPhase::kCollapse && cooldown > 0) {
-      --cooldown;
-    }
+  debris_hidden_after_frontend_ = false;
+  if (alert_corner_hold_) {
+    alert_corner_hold_ = false;  // the first tick's flush shows the working-screen corner
+    alert_corner_dirty_ = true;
   }
 
   switch (gameplay_phase_) {
@@ -2686,124 +4145,245 @@ void MilestoneADemo::StepLiveGameplay() {
       StepCollapseGameplay();
       break;
     case GameplayPhase::kTopOutDissolve:
-      StepTopOutGameplay();
-      break;
+      break;  // the game-over scene steps itself (StepTopOutScene)
   }
 
   UpdateAlert();
 }
 
+bool MilestoneADemo::GameplayKeyHeld(int binding) const {
+  // The ISR-maintained held table, indexed by the SETUP.DAT binding (0 Down, 1 Left, 2 Right,
+  // 3 A = rotation +1, 4 S = rotation -1).
+  const std::uint8_t scan_code = keyboard_bindings_[static_cast<size_t>(binding)];
+  return scan_code != 0 && held_original_scancodes_[scan_code];
+}
+
+void MilestoneADemo::StepGameplayInput() {
+  // 0x9C8 0xA97..0xAF3: on every live step decrement the four repeat timers and the Down lockout.
+  for (int& timer : repeat_timers_) {
+    if (timer > 0) {
+      --timer;
+    }
+  }
+  if (down_lockout_frames_ > 0) {
+    --down_lockout_frames_;
+  }
+  // 0xAF9..0xC94, in this order: Left (x-1), Right (x+1), A (rotation+1), S (rotation-1). A key acts
+  // when held with its timer at 0 and then reloads 8 whether or not the target fitted; a released
+  // key's timer is 0, so presses act at once and a held key repeats every 8 steps. Only the target
+  // is tested (no kicks) and the gravity accumulator is never touched.
+  static constexpr int kDeltaX[4] = {-1, 1, 0, 0};
+  static constexpr int kDeltaRotation[4] = {0, 0, 1, -1};
+  for (int action = 0; action < 4; ++action) {
+    const bool held = GameplayKeyHeld(action + 1);
+    int& timer = repeat_timers_[static_cast<size_t>(action)];
+    if (held && timer == 0) {
+      LivePiece moved = live_piece_;
+      moved.x += kDeltaX[action];
+      moved.rotation = (moved.rotation + kDeltaRotation[action]) & 3;
+      if (CanPlaceLivePiece(moved)) {
+        live_piece_ = moved;
+      }
+      timer = kGameplayBindingRepeatFrames;
+    }
+    if (!held) {
+      timer = 0;
+    }
+  }
+}
+
 void MilestoneADemo::StepFallingGameplay() {
-  gravity_accumulator_ += CurrentDropIncrement();
-  bool moved_down = false;
-  while (gravity_accumulator_ >= kGameplayGravityThreshold) {
-    gravity_accumulator_ -= kGameplayGravityThreshold;
-    if (TryMoveLivePiece(0, 1)) {
-      moved_down = true;
-    } else {
-      break;
-    }
+  StackWarningStep();  // 0x21C4 at 0x0A5E: start of every normal step, before the input block
+  // A piece promoted by a clearing lock stayed hidden through the collapse; from its first live step
+  // on 0x9C8 erases, moves and redraws it.
+  live_piece_hidden_ = false;
+  StepGameplayInput();
+
+  // 0xC94..0xD03: Down held with the lockout at 0 replaces the increment by 0x8000, Down up clears the
+  // lockout, the increment is clamped to 0x10000, and on reaching 0x10000 the accumulator is SET TO 0
+  // (no remainder is kept) and the piece is tried one row down.
+  const int increment = CurrentDropIncrement();
+  if (!GameplayKeyHeld(0)) {
+    down_lockout_frames_ = 0;
+  }
+  audit_gravity_active_ = true;
+  audit_gravity_rate_ = increment;
+  audit_gravity_acc_before_ = gravity_accumulator_;
+  gravity_accumulator_ += increment;
+  LivePiece target = live_piece_;
+  if (gravity_accumulator_ >= kGameplayGravityThreshold) {
+    gravity_accumulator_ = 0;
+    ++target.y;
+    ++audit_descent_attempts_;
   }
 
-  LivePiece below = live_piece_;
-  ++below.y;
-  if (CanPlaceLivePiece(below)) {
-    if (moved_down) {
-      lock_frames_ = 0;
+  // 0xD09..0xD1D: the collision test runs at that position on every live step, not only when a row is
+  // due, and there is no grounded timer: a resting piece locks on its next gravity row (one period
+  // after landing, 2 steps under soft drop) whatever the player does meanwhile.
+  if (CanPlaceLivePiece(target)) {
+    if (target.y != live_piece_.y) {
+      ++audit_descent_successes_;
     }
-    UpdateStackWarning(true);
+    live_piece_ = target;
+    CheckSleepyTimeout();
     return;
   }
+  LockLivePiece(target.y - 1);
+  CheckSleepyTimeout();  // also on lock steps, the clearing and the top-out ones (0x1065 -> 0x10A6)
+}
 
-  ++lock_frames_;
-  if (lock_frames_ < kGameplayLockFrames) {
-    UpdateStackWarning(true);
-    return;
-  }
-
-  // Piece lock / board impact -> slot 0, spatialized by board column, and played
-  // at half the SFX volume (0x6817 caller at 0x0d4e: pan = (col-5)*21+0x80,
-  // volume arg = [0x2c6e7] / 2, class 0).
+void MilestoneADemo::LockLivePiece(int lock_y) {
+  // Piece lock / board impact -> slot 0, panned by the reference column and played at half the SFX
+  // volume (0x6817 caller at 0x0D4E: pan = (x-5)*21+0x80 with the reference x, volume [0x2C6E7]/2).
   EmitAudioEvent("piece-lock", 0, PanForPieceColumn(live_piece_.x), 0, sfx_volume_ / 2);
-  CommitLivePieceToBoard();
-  const std::vector<int> full_rows = DetectFullRows();
+  // 0xD60 dec ebp: the cells are written one row above the position that collided.
+  CommitLivePieceToBoard(lock_y);
+  const std::vector<int> full_rows = FullRowsAroundLock(lock_y);
   if (!full_rows.empty()) {
+    // 0xE4E..0x100C, all in this step: collapse init, Down lockout, level, reward, lines, score.
     BeginLineCollapse(full_rows);
-    return;
+    down_lockout_frames_ = kDownLockoutAfterClear;
+    ApplyLineClearScore(static_cast<int>(full_rows.size()));
   }
-
-  UpdateStackWarning(true);
-  last_clear_was_four_ = false;
+  // A non-clearing lock leaves the back-to-back memory alone: 0x2C763 is written only by a clear
+  // (0x0FB9) and by New Game (0x20AF) (effects-alerts AL-09 = gameplay-core LC-06).
+  // 0x1011: the next piece is promoted, counted and tested in the lock step (0x107C keeps it undrawn
+  // while rows are pending).
   SpawnNextLivePiece();
 }
 
 void MilestoneADemo::StepCollapseGameplay() {
+  // 0x9C8 0xA20..0xA39: while rows are pending a step only calls 0x1D04(0): no input, gravity, repeat
+  // timers or Down lockout. Each call slides the stack above the current row down one pixel
+  // (RenderGameplay draws that from collapse_step_); the 8th call compacts the row in the board, adds
+  // one to the rows still queued (all above it) and starts the next. The promoted piece's first live
+  // step is the one after the last call: lock step + 8 * rows + 1.
   ++collapse_frame_;
-  if (collapse_frame_ < static_cast<int>(pending_clear_rows_.size()) * kGameplayCollapseFramesPerRow) {
-    UpdateStackWarning(false);
-    return;
+  ++collapse_step_;
+  if (collapse_step_ == kCollapseStepsPerRow) {
+    collapse_step_ = 0;
+    if (!top_out_after_collapse_) {
+      CompactClearedRow(pending_clear_rows_[static_cast<size_t>(collapse_batch_)]);
+      for (size_t later = static_cast<size_t>(collapse_batch_) + 1; later < pending_clear_rows_.size(); ++later) {
+        ++pending_clear_rows_[later];
+      }
+    }
+    ++collapse_batch_;
+  }
+  if (collapse_batch_ < static_cast<int>(pending_clear_rows_.size())) {
+    return;  // collapse steps return before the warning (0x21C4) and sleepy (0x10A6) code
   }
 
-  CollapseMarkedRows();
-  ApplyLineClearScore(static_cast<int>(pending_clear_rows_.size()));
   pending_clear_rows_.clear();
+  collapse_batch_ = 0;
   collapse_frame_ = 0;
   gameplay_phase_ = GameplayPhase::kFalling;
-  UpdateStackWarning(true);
-  SpawnNextLivePiece();
+  if (top_out_after_collapse_) {
+    // The spawn failed in the clearing step: the original wiped its board there (0x1F8C(2)), so its
+    // collapse anchor sat on the empty-board line 152 and each call blanked one scanline of the bottom
+    // row (0x1E34 skips the copy) while the stack image stayed put. Now the dissolve starts.
+    top_out_after_collapse_ = false;
+    std::fill_n(live_board_cells_.begin() + (kBoardHeight - 1) * kBoardWidth, kBoardWidth, 0);
+    // Face and sound came in the lock step; the dissolve samples the frozen stack as drawn now.
+    ArmTopOut(live_score_, live_lines_, /*piece_drawn=*/false, /*announce=*/false);
+    return;
+  }
 }
 
-void MilestoneADemo::StepTopOutGameplay() {
-  ++gameplay_top_out_frame_;
-  if (gameplay_top_out_frame_ >= kTopOutHandoffFrame) {
-    BeginHighScoreNameEntry(live_score_, live_lines_);
+// End of every normal step (0x10A6): the sleepy face when exactly 1800 ticks have passed
+// since the last clear (or New Game). A pause straddling that tick skips it for good.
+void MilestoneADemo::CheckSleepyTimeout() {
+  if (Tick32() - last_clear_tick_ == kSleepyTicksSinceClear) {
+    TriggerAlert(11, kAlertSleepyLifetime);
+    EmitAudioEvent("sleepy-no-clear-timeout", 6, 0x80, 1);
   }
 }
 
 int MilestoneADemo::CurrentDropIncrement() const {
-  // RE gameplay-input-timing-pass: natural gravity is (level<<9)+0x200 per frame, but
-  // while Down is held -- and the post-line-clear/spawn Down-lockout (0x2c783) has
-  // expired -- the per-frame increment is OVERRIDDEN to 0x8000, then clamped to the
-  // 0x10000 descent threshold. 0x8000 is half the threshold, so soft-drop descends one
-  // row every two frames (~35 rows/s at 70Hz). The prior port moved a whole row every
-  // frame (~70/s) ON TOP OF gravity, i.e. ~2x too fast -- the "way too fast" report.
-  const std::uint8_t down_scan_code = keyboard_bindings_[0];
-  const bool down_held =
-      down_scan_code != 0 && held_original_scancodes_[down_scan_code] && down_lockout_frames_ == 0;
-  const int increment = down_held ? kSoftDropIncrement : CurrentGravityRate();
+  // 0xCAB..0xCE5: the level's increment [0x2C717] = (level<<9)+0x200, replaced by 0x8000 while Down is
+  // held and the Down lockout is 0, clamped to the 0x10000 threshold.
+  const bool soft_drop = GameplayKeyHeld(0) && down_lockout_frames_ == 0;
+  const int increment = soft_drop ? kSoftDropIncrement : CurrentGravityRate();
   return std::min(increment, kGameplayGravityThreshold);
 }
 
 void MilestoneADemo::BeginLineCollapse(const std::vector<int>& rows) {
-  pending_clear_rows_ = rows;
-  collapse_frame_ = 0;
-  gameplay_phase_ = GameplayPhase::kCollapse;
+  // 0xE08..0xE32, per full row bottom-up: 0x1414 turns the row's pixels into particles (level%10
+  // helper, pre-clear level), then the row is zeroed in the board (not compacted) and appended to the
+  // clear list. The particle seeding reads the cells, so it runs before they are zeroed.
   SeedLineClearDebris(rows);
-  const int clear_count = static_cast<int>(rows.size());
-  // Capture the pre-clear state that selects the reward/wake mood face.
-  const bool was_sleepy = sleepy_;
-  const bool was_four = last_clear_was_four_;
-  if (sleepy_ && clear_count == 1) {
-    EmitAudioEvent("sleepy-wake-1-line", 8);
+  for (const int row : rows) {
+    std::fill_n(live_board_cells_.begin() + row * kBoardWidth, kBoardWidth, 0);
   }
-  sleepy_ = false;
-  frames_since_clear_ = 0;
-  if (clear_count == 1) {
-    EmitAudioEvent("line-clear-1", 9);
-  } else if (clear_count == 4) {
-    EmitAudioEvent(last_clear_was_four_ ? "line-clear-4-back-to-back" : "line-clear-4", last_clear_was_four_ ? 11 : 10);
-  } else {
-    EmitAudioEvent("line-clear-2-or-3", 7);
+  pending_clear_rows_ = rows;
+  // 0x1D04(1): collapse step and batch start at 0.
+  collapse_frame_ = 0;
+  collapse_step_ = 0;
+  collapse_batch_ = 0;
+  gameplay_phase_ = GameplayPhase::kCollapse;
+  // 0x107C: no live piece is drawn while rows are pending.
+  live_piece_hidden_ = true;
+  const int clear_count = std::clamp(static_cast<int>(rows.size()), 1, 4);
+  // Clear block of the lock step (0x0EB2..0x0FA9): one reward face and ONE sound (centre,
+  // class 1). Wake needs the sleepy face to be the current face; back-to-back needs the
+  // previous clear to have been a tetris; otherwise tables 0x980 / 0x990.
+  static constexpr std::array<int, 4> kClearFace = {2, 0, 9, 7};
+  static constexpr std::array<int, 4> kClearSlot = {9, 7, 7, 10};
+  static constexpr std::array<const char*, 4> kClearName = {"line-clear-1", "line-clear-2-or-3", "line-clear-2-or-3",
+                                                            "line-clear-4"};
+  int face = kClearFace[static_cast<size_t>(clear_count - 1)];
+  int slot = kClearSlot[static_cast<size_t>(clear_count - 1)];
+  const char* name = kClearName[static_cast<size_t>(clear_count - 1)];
+  if (clear_count == 1 && alert_effect_id_ == 11) {
+    face = 12;
+    slot = 8;
+    name = "sleepy-wake-1-line";
+  } else if (clear_count == 4 && last_clear_was_four_) {
+    face = 8;
+    slot = 11;
+    name = "line-clear-4-back-to-back";
   }
+  TriggerAlert(face, kAlertClearLifetime);
+  EmitAudioEvent(name, slot, 0x80, 1);
+  // Then, silently, the fast-follow face when the previous clear (or New Game) came less
+  // than 160 ticks ago (0x0F54..0x0F9F): 1 for a single, 10 for a double or triple.
+  if (Tick32() - last_clear_tick_ < kFastFollowTicks) {
+    if (clear_count == 1) {
+      TriggerAlert(1, kAlertClearLifetime);
+    } else if (clear_count < 4) {
+      TriggerAlert(10, kAlertClearLifetime);
+    }
+  }
+  last_clear_tick_ = Tick32();
   last_clear_was_four_ = clear_count == 4;
-  // Reward/wake mood face (chunk-6 alert tile), overriding the ambient warning
-  // for its lifetime (RE alert-id-correlation table).
-  TriggerAlert(AlertIdForClear(clear_count, was_four, was_sleepy), kAlertEventLifetime);
+}
+
+std::vector<int> MilestoneADemo::FullRowsAroundLock(int lock_y) const {
+  // 0xDB8..0xE3F: rows lock_y+1 down to lock_y-2 (every row the piece can occupy), bottom-up; the clear
+  // list keeps that order, which is also the collapse order.
+  std::vector<int> rows;
+  for (int row = lock_y + 1; row >= lock_y - 2; --row) {
+    if (row < 0 || row >= kBoardHeight) {
+      continue;
+    }
+    bool full = true;
+    for (int x = 0; x < kBoardWidth; ++x) {
+      if (live_board_cells_[static_cast<size_t>(row * kBoardWidth + x)] == 0) {
+        full = false;
+        break;
+      }
+    }
+    if (full) {
+      rows.push_back(row);
+    }
+  }
+  return rows;
 }
 
 std::vector<int> MilestoneADemo::DetectFullRows() const {
+  // Row-injection helper only (the lock scans four rows, FullRowsAroundLock); bottom-up like the lock.
   std::vector<int> rows;
-  for (int y = 0; y < kBoardHeight; ++y) {
+  for (int y = kBoardHeight - 1; y >= 0; --y) {
     bool full = true;
     for (int x = 0; x < kBoardWidth; ++x) {
       if (live_board_cells_[static_cast<size_t>(y * kBoardWidth + x)] == 0) {
@@ -2819,42 +4399,31 @@ std::vector<int> MilestoneADemo::DetectFullRows() const {
 }
 
 void MilestoneADemo::ApplyLineClearScore(int clear_count) {
+  // 0xE58..0xEA7 then 0xFAE..0xFEC: the level goes up by one when lines%10 + n >= 10 (gravity follows,
+  // +0x200 per level via CurrentGravityRate), then lines += n, then the score adds (level+1) *
+  // {100,300,600,1200}[n-1] with the level already raised. The start level is never re-read here.
   static constexpr std::array<int, 5> kBaseClearScores = {0, 100, 300, 600, 1200};
   clear_count = std::clamp(clear_count, 1, 4);
-  live_score_ += (live_level_ + 1) * kBaseClearScores[clear_count];
+  if (live_lines_ % 10 + clear_count >= 10) {
+    ++live_level_;
+  }
   live_lines_ += clear_count;
-  live_level_ = start_level_ + (live_lines_ / 10);
+  live_score_ += (live_level_ + 1) * kBaseClearScores[static_cast<size_t>(clear_count)];
 }
 
-void MilestoneADemo::CollapseMarkedRows() {
-  std::array<bool, kBoardHeight> clear_mask{};
-  for (const int row : pending_clear_rows_) {
-    if (row >= 0 && row < kBoardHeight) {
-      clear_mask[static_cast<size_t>(row)] = true;
-    }
+void MilestoneADemo::CompactClearedRow(int row) {
+  // 0x1D6D..0x1DBA, the 8th collapse call of a row: rows 0..row-1 move down one row, row 0 is zeroed.
+  for (int y = row; y > 0; --y) {
+    std::copy_n(live_board_cells_.begin() + (y - 1) * kBoardWidth, kBoardWidth, live_board_cells_.begin() + y * kBoardWidth);
   }
-
-  int write_y = kBoardHeight - 1;
-  for (int read_y = kBoardHeight - 1; read_y >= 0; --read_y) {
-    if (clear_mask[static_cast<size_t>(read_y)]) {
-      continue;
-    }
-    for (int x = 0; x < kBoardWidth; ++x) {
-      live_board_cells_[static_cast<size_t>(write_y * kBoardWidth + x)] =
-          live_board_cells_[static_cast<size_t>(read_y * kBoardWidth + x)];
-    }
-    --write_y;
-  }
-  while (write_y >= 0) {
-    for (int x = 0; x < kBoardWidth; ++x) {
-      live_board_cells_[static_cast<size_t>(write_y * kBoardWidth + x)] = 0;
-    }
-    --write_y;
-  }
+  std::fill_n(live_board_cells_.begin(), kBoardWidth, 0);
 }
 
 void MilestoneADemo::SeedLineClearDebris(const std::vector<int>& rows) {
+  AuditScopedTicks audit_ticks(&g_audit.line_clear_seed_ticks);
   const int style = NormalizeModulo(live_level_, 10);
+  // Rows arrive bottom-up (the lock scans y+1 down to y-2, 0xDB8..0xE3F), so the lowest cleared
+  // row draws the RNG first, as 0x1414 is called in that order.
   for (const int row : rows) {
     if (row < 0 || row >= kBoardHeight) {
       continue;
@@ -2889,75 +4458,76 @@ void MilestoneADemo::SeedLineClearDebris(const std::vector<int>& rows) {
 }
 
 void MilestoneADemo::EmitLineClearParticle(int style, int col, int row8, int screen_x, int screen_y, int color) {
-  // Draw the family's RNG for every swept column (matching the original per-pixel
-  // consumption), then spawn only for a visible sampled pixel. The RNG-burst
-  // families (0/1/2) draw from the certified shared gameplay RNG.
-  const bool visible =
-      color != 0 && particle_ramps_[static_cast<size_t>(std::clamp(color, 0, 255)) * 4] != 0;
-
+  // Every helper spawns one particle per band pixel with no zero test (0x14B4..0x1C40);
+  // the burst families (0/1/2) draw from the shared gameplay RNG first.
   switch (style) {
     case 0: {  // 0x14b4: random polar burst (3 draws: life, angle, speed)
       const int life = static_cast<int>(NextGameplayRandomU32() & 0x3f) + 0x10;
       const int angle = static_cast<int>(NextGameplayRandomU32() & 0x7ff);
       const int speed = static_cast<int>(NextGameplayRandomU32() & 0x1ff) + 0x80;
-      if (visible) SpawnDebrisPolar(screen_x, screen_y, speed, angle, life, color);
+      SpawnDebrisPolar(screen_x, screen_y, speed, angle, life, color);
       break;
     }
     case 1: {  // 0x158c: horizontal spray, direction by band-row parity (2 draws: life, speed)
       const int life = static_cast<int>(NextGameplayRandomU32() & 0x3f) + 0x10;
       const int speed = static_cast<int>(NextGameplayRandomU32() & 0x1ff) + 0x80;
-      if (visible) SpawnDebrisPolar(screen_x, screen_y, speed, (row8 & 1) ? 0x400 : 0, life, color);
+      SpawnDebrisPolar(screen_x, screen_y, speed, (row8 & 1) ? 0x400 : 0, life, color);
       break;
     }
     case 2: {  // 0x1694: column-swept fan (2 draws: life, speed)
       const int life = static_cast<int>(NextGameplayRandomU32() & 0x3f) + 0x10;
       const int speed = static_cast<int>(NextGameplayRandomU32() & 0x1ff) + 0x80;
-      if (visible) SpawnDebrisPolar(screen_x, screen_y, speed, 0x188 + col * 3, life, color);
+      SpawnDebrisPolar(screen_x, screen_y, speed, 0x188 + col * 3, life, color);
       break;
     }
     case 3:  // 0x1770: deterministic fan
-      if (visible) SpawnDebrisPolar(screen_x, screen_y, 0x100, 0xc0 + col * 8, 0x40, color);
+      SpawnDebrisPolar(screen_x, screen_y, 0x100, 0xc0 + col * 8, 0x40, color);
       break;
-    case 4:  // 0x1830: target sweep (targetY = 8*row+0xf; screen_y = 21 + 8*row + row8)
-      if (visible) SpawnDebrisTarget(screen_x, screen_y, 0x1f + col * 3, screen_y - 6 - row8, 0x40, color);
+    case 4:  // 0x1830: target sweep; target Y starts at 8*row+0xf and gains 3 per band pixel
+             // row (0x18F8 add ecx,3). screen_y = 21 + 8*row + row8.
+      SpawnDebrisTarget(screen_x, screen_y, 0x1f + col * 3, screen_y - 6 + 2 * row8, 0x40, color);
       break;
     case 5:  // 0x192c: converge to a fixed point
-      if (visible) SpawnDebrisTarget(screen_x, screen_y, 0x95, 0xd5, 0x30, color);
+      SpawnDebrisTarget(screen_x, screen_y, 0x95, 0xd5, 0x30, color);
       break;
     case 6:  // 0x19dc: fixed direction, column-ramped speed
-      if (visible) SpawnDebrisPolar(screen_x, screen_y, 0x214 + col * 4, 0x600, 0x30, color);
+      SpawnDebrisPolar(screen_x, screen_y, 0x214 + col * 4, 0x600, 0x30, color);
       break;
     case 7:  // 0x1a9c: converge to a vertical line (targetY = 8*row+0x18)
-      if (visible) SpawnDebrisTarget(screen_x, screen_y, 0x94, screen_y + 3 - row8, 0x30, color);
+      SpawnDebrisTarget(screen_x, screen_y, 0x94, screen_y + 3 - row8, 0x30, color);
       break;
-    case 8:  // 0x1b54: horizontal split at column 0x28
-      if (visible) SpawnDebrisPolar(screen_x, screen_y, 0x80, col < 0x28 ? 0 : 0x400, 0x30, color);
+    case 8:  // 0x1b54: horizontal split at column 0x28; speed 0x80 gains 0x10 per band
+             // pixel row (0x1C06 add esi,0x10)
+      SpawnDebrisPolar(screen_x, screen_y, 0x80 + 0x10 * row8, col < 0x28 ? 0 : 0x400, 0x30, color);
       break;
     default:  // 9, 0x1c40: two-band split at column 0x28
-      if (visible) SpawnDebrisPolar(screen_x, screen_y, 0xa0, col < 0x28 ? 0x100 : 0x500, 0x30, color);
+      SpawnDebrisPolar(screen_x, screen_y, 0xa0, col < 0x28 ? 0x100 : 0x500, 0x30, color);
       break;
   }
 }
 
 void MilestoneADemo::SpawnDebrisPolar(int screen_x, int screen_y, int speed, int angle, int lifetime, int color) {
   if (debris_particles_.size() >= kGameplayMaxDebrisParticles) {
+    ++audit_particles_dropped_;
     return;
   }
-  // Polar velocity (0x2f78): v = -(sine[idx] * speed) >> 7 with the original's
-  // 0x8001 sine amplitude. sine_table_ here has amplitude 0x10000 (2x), so shift
-  // by 8 to reproduce the same velocity scale. Position/velocity are 16.16.
+  ++audit_particles_spawned_;
+  // Polar velocity (0x2f78): v = -((t[idx] * speed) >> 7) on the 0x27B8 table (peak
+  // 32768). Position/velocity are 16.16.
   const int cos_index = (angle + 0x200) & 0x7FF;
   const int sin_index = angle & 0x7FF;
-  const int vx = -static_cast<int>((static_cast<std::int64_t>(sine_table_[cos_index]) * speed) >> 8);
-  const int vy = -static_cast<int>((static_cast<std::int64_t>(sine_table_[sin_index]) * speed) >> 8);
+  const int vx = -static_cast<int>((static_cast<std::int64_t>(particle_sine_table_[cos_index]) * speed) >> 7);
+  const int vy = -static_cast<int>((static_cast<std::int64_t>(particle_sine_table_[sin_index]) * speed) >> 7);
   const int decay = kDebrisAgeFull / std::max(1, lifetime);
   debris_particles_.push_back(DebrisParticle{screen_x << 16, screen_y << 16, vx, vy, 0, decay, color});
 }
 
 void MilestoneADemo::SpawnDebrisTarget(int screen_x, int screen_y, int target_x, int target_y, int lifetime, int color) {
   if (debris_particles_.size() >= kGameplayMaxDebrisParticles) {
+    ++audit_particles_dropped_;
     return;
   }
+  ++audit_particles_spawned_;
   // Target velocity (0x3034): v = (target - start) * 65536 / lifetime.
   const int life = std::max(1, lifetime);
   const int vx = ((target_x - screen_x) << 16) / life;
@@ -2967,10 +4537,24 @@ void MilestoneADemo::SpawnDebrisTarget(int screen_x, int screen_y, int target_x,
 }
 
 void MilestoneADemo::StepDebrisParticles() {
+  AuditScopedTicks audit_ticks(&g_audit.debris_step_ticks);
+  const size_t audit_before = debris_particles_.size();
+  // 0x2E18: age += decay and retire at 0x400 before moving; otherwise move, and retire a
+  // particle whose new position is off screen (x < 0, y < 0, x > 320.0, y > 240.0; exactly
+  // 320.0 or 240.0 survive; the new position is not stored). The survivors keep their order.
   for (DebrisParticle& particle : debris_particles_) {
-    particle.x += particle.vx;
-    particle.y += particle.vy;
     particle.age += particle.decay;
+    if (particle.age >= kDebrisAgeFull) {
+      continue;
+    }
+    const int next_x = particle.x + particle.vx;
+    const int next_y = particle.y + particle.vy;
+    if (next_x < 0 || next_y < 0 || next_x > (kScreenWidth << 16) || next_y > (kScreenHeight << 16)) {
+      particle.age = kDebrisAgeFull;  // culled
+      continue;
+    }
+    particle.x = next_x;
+    particle.y = next_y;
   }
   debris_particles_.erase(
       std::remove_if(
@@ -2978,16 +4562,21 @@ void MilestoneADemo::StepDebrisParticles() {
           debris_particles_.end(),
           [](const DebrisParticle& particle) { return particle.age >= kDebrisAgeFull; }),
       debris_particles_.end());
+  audit_particles_retired_ += static_cast<std::uint32_t>(audit_before - debris_particles_.size());
+  g_audit.debris_active = static_cast<std::uint32_t>(debris_particles_.size());
 }
 
 void MilestoneADemo::RenderDebrisParticles(SDL_Renderer* renderer) const {
-  for (const DebrisParticle& particle : debris_particles_) {
+  AuditScopedTicks audit_ticks(&g_audit.debris_render_ticks);
+  g_audit.debris_active = static_cast<std::uint32_t>(debris_particles_.size());
+  // 0x2F24 walks the list from its head, newest first (the spawners insert at the head),
+  // and 0x17821 stores every colour, 0 (black) included; so the OLDEST particle on a pixel
+  // is the one left visible. The container is in spawn order: draw it back to front.
+  for (auto it = debris_particles_.rbegin(); it != debris_particles_.rend(); ++it) {
+    const DebrisParticle& particle = *it;
     const int stage = std::clamp(particle.age >> 8, 0, 3);  // 4 stages of 0x100
     const Uint8 ramp_index = particle_ramps_[static_cast<size_t>(std::clamp(particle.color, 0, 255)) * 4 +
                                               static_cast<size_t>(stage)];
-    if (ramp_index == 0) {
-      continue;
-    }
     const SDL_Color color = gameplay_palette_[ramp_index];
     SDL_SetRenderDrawColor(renderer, color.r, color.g, color.b, SDL_ALPHA_OPAQUE);
     const SDL_FRect debris_rect = {
@@ -2997,29 +4586,27 @@ void MilestoneADemo::RenderDebrisParticles(SDL_Renderer* renderer) const {
         1.0f,
     };
     SDL_RenderFillRect(renderer, &debris_rect);
+    ++g_audit.debris_drawn;
   }
 }
 
-// GAP A: the original's top-out dissolve is not a silent black-out. As the well
-// is cleared top-down, each row erupts into an upward particle fountain of its
-// own cell colors (the line-clear/alert helper family), then the well empties.
-// Drive that off the same dissolve front the black-out uses: for each row that
-// newly crosses into the dissolved region, spray the certified debris pool
-// upward from that row's filled cells.
-void MilestoneADemo::UpdateTopOutDissolve() {
-  // RE 0x1fc6: the dissolve front advances ONE pixel-row per frame down the whole
-  // gameplay area (kBoardHeight*8 pixel rows), spraying that row's debris as it passes.
-  // A pixel-row cascade (not board-row bursts) is what makes the next row start
-  // exploding while the previous is still mid-air -- the continuous teardown the
-  // original shows, instead of "one chunk at a time".
-  const int total_pixel_rows = kBoardHeight * kPieceTileSize;  // 160
-  const int dissolved =
-      std::clamp((top_out_frame_ * total_pixel_rows) / kTopOutDissolveFrames, 0, total_pixel_rows);
-  for (int pixel_row = top_out_dissolved_rows_; pixel_row < dissolved; ++pixel_row) {
-    SpawnTopOutPixelRow(pixel_row);
-  }
-  top_out_dissolved_rows_ = dissolved;
+// One tick of the game-over scene (session loop 0x58E/0x595/0x59D): particles 0x2E18,
+// then 0x9C8 -> 0x1F8C(0), which sprays and erases one scanline per tick until the 160th
+// and then draws GAME OVER in that same tick (afterwards 0x9C8 returns at once), then the
+// alert update 0x206C. Nothing here times out: only an Esc release leaves (HandleKeyUp).
+void MilestoneADemo::StepTopOutScene() {
+  AuditScopedTicks audit_ticks(&g_audit.topout_update_ticks);
   StepDebrisParticles();
+  debris_hidden_after_frontend_ = false;
+  if (top_out_dissolved_rows_ < kTopOutDissolveFrames) {
+    SpawnTopOutPixelRow(top_out_dissolved_rows_);
+    ++top_out_dissolved_rows_;
+    if (top_out_dissolved_rows_ == kTopOutDissolveFrames) {
+      live_game_available_ = false;  // 0x1FF5: the lost game can no longer be resumed
+    }
+  }
+  ++top_out_frame_;
+  UpdateAlert();
 }
 
 void MilestoneADemo::SpawnTopOutPixelRow(int pixel_row) {
@@ -3039,7 +4626,8 @@ void MilestoneADemo::SpawnTopOutPixelRow(int pixel_row) {
     for (int col = 0; col < kGameplayClearWidth; col += 2) {  // every other pixel (40/row)
       const int board_col = col / kPieceTileSize;
       const int pixel_x = col % kPieceTileSize;
-      const int cell = live_board_cells_[static_cast<size_t>(board_row * kBoardWidth + board_col)];
+      // 0x1EDC samples the working screen: the drawn well (board + colliding piece).
+      const int cell = top_out_source_cells_[static_cast<size_t>(board_row * kBoardWidth + board_col)];
       if (cell == 0) {
         continue;
       }
@@ -3068,108 +4656,160 @@ void MilestoneADemo::TriggerAlert(int effect_id, int lifetime) {
   if (effect_id < 0 || effect_id >= static_cast<int>(alert_tiles_.size())) {
     return;
   }
-  if (effect_id != alert_effect_id_) {
-    alert_reveal_frame_ = 0;
+  if (effect_id == alert_effect_id_ || alert_lifetime_ != 0) {
+    // A face is up (or the same one again): the new face is drawn whole at once and gets
+    // the new lifetime; a reveal still running keeps its counter.
+    alert_effect_id_ = effect_id;
+    AlertCornerDrawFull(effect_id);
+    alert_lifetime_ = lifetime;
+    return;
   }
+  // Idle start: nothing drawn yet; the update reveals it over the next six steps.
   alert_effect_id_ = effect_id;
-  alert_lifetime_ = std::max(1, lifetime);
+  alert_lifetime_ = lifetime;
+  alert_reveal_counter_ = 6;
 }
 
 void MilestoneADemo::UpdateAlert() {
-  if (alert_lifetime_ > 0) {
+  if (alert_lifetime_ == 0) {
+    return;
+  }
+  if (alert_lifetime_ != kAlertInfiniteLifetime) {
     --alert_lifetime_;
-    ++alert_reveal_frame_;
-    if (alert_lifetime_ == 0) {
-      alert_effect_id_ = -1;
-    }
-    return;  // a timed event holds over the ambient state until it expires
   }
-  int ambient = -1;
-  if (warning_band_ > 0) {
-    ambient = 2 + warning_band_;  // bands 1/2/3 -> alert tiles 3/4/5
-  } else if (sleepy_) {
-    ambient = 11;
+  if (alert_reveal_counter_ > 0) {
+    AlertCornerDrawStretch(alert_effect_id_,
+                           kAlertRevealRows[static_cast<size_t>(alert_reveal_counter_ - 1)]);
+    --alert_reveal_counter_;
   }
-  if (ambient != alert_effect_id_) {
-    alert_reveal_frame_ = 0;
-  } else {
-    ++alert_reveal_frame_;
+  if (alert_lifetime_ == 0) {
+    AlertCornerRestore();
+    alert_effect_id_ = -1;
   }
-  alert_effect_id_ = ambient;
 }
 
-int MilestoneADemo::AlertIdForClear(int cleared_rows, bool was_four, bool was_sleepy) const {
-  // Matches the recovered 0x09c8 line-clear alert table 0x980 = [2,0,9,7] plus its
-  // two overrides: a single-line clear out of the sleepy state wakes to tile 12,
-  // and a four-line clear following another four-line is the back-to-back tile 8.
-  // (There is no fast-follow-up path in the shipped code; tiles 1/10 are unused.)
-  if (was_sleepy && cleared_rows == 1) {
-    return 12;
+// 0x206C(1), called only by New Game init (0x0757): everything idle, the background back,
+// the last-clear tick restarted and the previous clear size and warning cooldowns cleared.
+void MilestoneADemo::ResetAlertState() {
+  alert_reveal_counter_ = 0;
+  alert_lifetime_ = 0;
+  AlertCornerRestore();
+  alert_effect_id_ = -1;
+  last_clear_tick_ = Tick32();
+  last_clear_was_four_ = false;
+  warning_cooldowns_.fill(0);
+}
+
+void MilestoneADemo::AlertCornerRestore() {
+  alert_corner_ = alert_corner_background_;
+  alert_corner_dirty_ = true;
+}
+
+void MilestoneADemo::AlertCornerDrawFull(int effect_id) {
+  const std::vector<Uint8>& tile = atet_data_.alert_tile(effect_id).indices;
+  for (size_t index = 0; index < alert_corner_.size(); ++index) {
+    if (tile[index] != kAlertTransparentIndex) {
+      alert_corner_[index] = tile[index];
+    }
   }
-  if (cleared_rows == 4 && was_four) {
-    return 8;
+  alert_corner_dirty_ = true;
+}
+
+void MilestoneADemo::AlertCornerDrawStretch(int effect_id, int rows) {
+  if (rows <= 0) {
+    return;
   }
-  switch (cleared_rows) {
-    case 1:
-      return 2;
-    case 2:
-      return 0;
-    case 3:
-      return 9;
-    case 4:
-      return 7;
-    default:
-      return 2;
+  const std::vector<Uint8>& tile = atet_data_.alert_tile(effect_id).indices;
+  const int step = 0x320000 / rows;             // 50 rows in 16.16, idiv
+  const int first_row = 25 - (rows >> 1);       // centred on corner row 25 (y 165)
+  for (int band_row = 0; band_row < rows; ++band_row) {
+    const int source_row = (step * band_row) >> 16;
+    const int corner_row = first_row + band_row;
+    for (int col = 0; col < kAlertFaceSize; ++col) {
+      const size_t dst = static_cast<size_t>(corner_row * kAlertFaceSize + col);
+      const Uint8 value = tile[static_cast<size_t>(source_row * kAlertFaceSize + col)];
+      alert_corner_[dst] = value == kAlertTransparentIndex ? alert_corner_background_[dst] : value;
+    }
   }
+  alert_corner_dirty_ = true;
 }
 
 void MilestoneADemo::RenderAlertTile(SDL_Renderer* renderer) const {
-  if (scene_ != Scene::kGameplay || alert_effect_id_ < 0 ||
-      alert_effect_id_ >= static_cast<int>(alert_tiles_.size())) {
+  if (renderer == nullptr) {
     return;
   }
-  const TextureAsset& tile = alert_tiles_[static_cast<size_t>(alert_effect_id_)];
-  if (tile.texture == nullptr) {
-    return;
+  if (alert_corner_texture_ == nullptr) {
+    alert_corner_texture_ = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STREAMING,
+                                              kAlertFaceSize, kAlertFaceSize);
+    if (alert_corner_texture_ == nullptr) {
+      return;
+    }
+    SDL_SetTextureScaleMode(alert_corner_texture_, SDL_SCALEMODE_NEAREST);
+    SDL_SetTextureBlendMode(alert_corner_texture_, SDL_BLENDMODE_NONE);
+    alert_corner_dirty_ = true;
   }
-  // Staged vertical reveal-in: RE board-alert-pass 0x206c feeds the row table
-  // {50,40,30,20,10,1} to 0x17983 as the six-step reveal counter counts down,
-  // i.e. rows-from-frame grow 1,10,20,30,40,50 -> full. Top-anchored wipe.
-  static constexpr int kRevealRows[6] = {1, 10, 20, 30, 40, 50};
-  const int step = std::clamp(alert_reveal_frame_, 0, 6);
-  const int revealed = step >= 6 ? tile.height : std::min(kRevealRows[step], tile.height);
-  if (revealed <= 0) {
-    return;
+  if (alert_corner_dirty_) {
+    const std::array<Uint8, 2500>& corner = alert_corner_hold_ ? alert_corner_shown_ : alert_corner_;
+    std::array<Uint8, kAlertFaceSize * kAlertFaceSize * 4> rgba{};
+    for (size_t index = 0; index < corner.size(); ++index) {
+      const SDL_Color& color = gameplay_palette_[corner[index]];
+      rgba[index * 4 + 0] = color.r;
+      rgba[index * 4 + 1] = color.g;
+      rgba[index * 4 + 2] = color.b;
+      rgba[index * 4 + 3] = SDL_ALPHA_OPAQUE;
+    }
+    SDL_UpdateTexture(alert_corner_texture_, nullptr, rgba.data(), kAlertFaceSize * 4);
+    alert_corner_dirty_ = false;
   }
-  const SDL_FRect src = {0.0f, 0.0f, static_cast<float>(tile.width), static_cast<float>(revealed)};
-  const SDL_FRect dst = {24.0f, 132.0f, static_cast<float>(tile.width), static_cast<float>(revealed)};
-  SDL_RenderTexture(renderer, tile.texture, &src, &dst);
+  const SDL_FRect dst = {static_cast<float>(kAlertFaceX), static_cast<float>(kAlertFaceY),
+                         static_cast<float>(kAlertFaceSize), static_cast<float>(kAlertFaceSize)};
+  SDL_RenderTexture(renderer, alert_corner_texture_, nullptr, &dst);
 }
 
-void MilestoneADemo::UpdateStackWarning(bool allow_sound) {
-  const int highest_row = HighestOccupiedRow();
-  int new_band = 0;
-  if (highest_row >= 0 && highest_row <= kWarningHighRow) {
-    new_band = 3;
-  } else if (highest_row >= 0 && highest_row <= kWarningMediumRow) {
-    new_band = 2;
-  } else if (highest_row >= 0 && highest_row <= kWarningLowRow) {
-    new_band = 1;
+// 0x21C4, at the start of every normal step (never on collapse, dissolve or game-over
+// steps): count the three cooldowns down, then look at the first occupied row of the
+// locked board (20 when empty). A warning face is a one-shot 160-step face through the
+// shared trigger; its sound needs the band's cooldown at 0 too, and the high band's sound
+// also needs the mid cooldown at 0, so climbing from the mid band into the high band is
+// silent. Every in-band step reloads the cooldowns, so nothing repeats while the stack
+// stays in a band.
+void MilestoneADemo::StackWarningStep() {
+  for (int& cooldown : warning_cooldowns_) {
+    if (cooldown > 0) {
+      --cooldown;
+    }
   }
-
-  warning_band_ = new_band;
-  if (!allow_sound || new_band == 0) {
-    return;
+  int& low = warning_cooldowns_[0];
+  int& mid = warning_cooldowns_[1];
+  int& high = warning_cooldowns_[2];
+  const int highest = HighestOccupiedRow();
+  const int r = (highest < 0 ? kBoardHeight : highest) - 1;
+  if (r < kWarningHighLimit) {
+    warning_band_ = 3;
+    if (high == 0) {
+      TriggerAlert(5, kAlertClearLifetime);
+      if (mid == 0) {
+        EmitAudioEvent("stack-warning-medium-high", 4, 0x80, 1);
+      }
+    }
+    low = mid = high = kWarningCooldownTicks;
+  } else if (r < kWarningMidLimit) {
+    warning_band_ = 2;
+    if (mid == 0) {
+      TriggerAlert(4, kAlertClearLifetime);
+      EmitAudioEvent("stack-warning-medium-high", 4, 0x80, 1);
+    }
+    mid = low = kWarningCooldownTicks;
+  } else if (r < kWarningLowLimit) {
+    warning_band_ = 1;
+    if (low == 0) {
+      TriggerAlert(3, kAlertClearLifetime);
+      EmitAudioEvent("stack-warning-low", 3, 0x80, 1);
+    }
+    low = kWarningCooldownTicks;
+  } else {
+    warning_band_ = 0;
   }
-
-  const size_t cooldown_index = static_cast<size_t>(new_band - 1);
-  if (warning_cooldowns_[cooldown_index] > 0) {
-    return;
-  }
-
-  // Warnings are centered and routed through the class-1 playback offset (0x6817 EDX=1).
-  EmitAudioEvent(new_band == 1 ? "stack-warning-low" : "stack-warning-medium-high", new_band == 1 ? 3 : 4, 0x80, 1);
-  warning_cooldowns_[cooldown_index] = kWarningCooldownFrames;
 }
 
 int MilestoneADemo::HighestOccupiedRow() const {
@@ -3191,9 +4831,9 @@ int MilestoneADemo::CurrentGravityRate() const {
 // decompilation (RE: sfx/rng findings). The table fill mirrors `0x32b0`:
 // srand(seed) via `0xed0f`, then fill an 8192-dword table (allocated 0x8000
 // bytes at `0x32f0`) with `(rand()<<16)|rand()` using the Watcom C `rand`
-// `0xeceb` (LCG 0x41C64E6D/0x3039, returning bits 16..30). The seed source is
-// the shared entropy global `0x2d2a3` (no recovered deterministic write, so
-// effectively timer-like); the port models it with a settable/default seed.
+// `0xeceb` (LCG 0x41C64E6D/0x3039, returning bits 16..30). The seed is the 60 Hz
+// tick counter `0x2d2a3` (written only at 0x65B3/0x6683): 0 for the startup fill at
+// 0x150, the current tick at every New Game; piece_seed_ holds the seed in use.
 void MilestoneADemo::RefillGameplayRandomTable() {
   gameplay_random_state_ = piece_seed_;
   gameplay_random_index_ = 0;
@@ -3218,7 +4858,13 @@ std::uint32_t MilestoneADemo::NextGameplayRandomU32() {
     gameplay_random_index_ = 0;
   }
 
-  return gameplay_random_table_[static_cast<size_t>(gameplay_random_index_)];
+  const std::uint32_t audit_value = gameplay_random_table_[static_cast<size_t>(gameplay_random_index_)];
+  ++audit_rng_draws_;
+  audit_rng_hash_ = Fnv1a64Update(audit_rng_hash_, &audit_value, sizeof(audit_value));
+  if (audit_rng_values_.size() < 16384) {
+    audit_rng_values_.push_back(audit_value);
+  }
+  return audit_value;
 }
 
 void MilestoneADemo::SaveLiveSnapshot() {
@@ -3232,15 +4878,16 @@ void MilestoneADemo::SaveLiveSnapshot() {
   live_snapshot_.lines = live_lines_;
   live_snapshot_.level = live_level_;
   live_snapshot_.gravity_accumulator = gravity_accumulator_;
-  live_snapshot_.lock_frames = lock_frames_;
+  live_snapshot_.repeat_timers = repeat_timers_;
   live_snapshot_.down_lockout_frames = down_lockout_frames_;
   live_snapshot_.collapse_frame = collapse_frame_;
-  live_snapshot_.top_out_frame = gameplay_top_out_frame_;
+  live_snapshot_.collapse_step = collapse_step_;
+  live_snapshot_.collapse_batch = collapse_batch_;
+  live_snapshot_.live_piece_hidden = live_piece_hidden_;
+  live_snapshot_.top_out_after_collapse = top_out_after_collapse_;
   live_snapshot_.warning_band = warning_band_;
   live_snapshot_.warning_cooldowns = warning_cooldowns_;
   live_snapshot_.last_clear_was_four = last_clear_was_four_;
-  live_snapshot_.sleepy = sleepy_;
-  live_snapshot_.frames_since_clear = frames_since_clear_;
 }
 
 void MilestoneADemo::RestoreLiveSnapshot() {
@@ -3256,19 +4903,22 @@ void MilestoneADemo::RestoreLiveSnapshot() {
   live_lines_ = live_snapshot_.lines;
   live_level_ = live_snapshot_.level;
   gravity_accumulator_ = live_snapshot_.gravity_accumulator;
-  lock_frames_ = live_snapshot_.lock_frames;
+  repeat_timers_ = live_snapshot_.repeat_timers;
   down_lockout_frames_ = live_snapshot_.down_lockout_frames;
   collapse_frame_ = live_snapshot_.collapse_frame;
-  gameplay_top_out_frame_ = live_snapshot_.top_out_frame;
+  collapse_step_ = live_snapshot_.collapse_step;
+  collapse_batch_ = live_snapshot_.collapse_batch;
+  live_piece_hidden_ = live_snapshot_.live_piece_hidden;
+  top_out_after_collapse_ = live_snapshot_.top_out_after_collapse;
   warning_band_ = live_snapshot_.warning_band;
   warning_cooldowns_ = live_snapshot_.warning_cooldowns;
   last_clear_was_four_ = live_snapshot_.last_clear_was_four;
-  sleepy_ = live_snapshot_.sleepy;
-  frames_since_clear_ = live_snapshot_.frames_since_clear;
 }
 
 int MilestoneADemo::RollNextPieceType() {
-  return static_cast<int>(NextGameplayRandomU32() % kTetrominoShapes.size());
+  // 0x1368..0x1380 (and 0x70C): the next piece id is the drawn value % 7 (signed idiv; values are
+  // below 2^31).
+  return static_cast<int>(NextGameplayRandomU32() % kPieceCount);
 }
 
 void MilestoneADemo::SimulateLiveLineClear(int clear_count) {
@@ -3276,7 +4926,10 @@ void MilestoneADemo::SimulateLiveLineClear(int clear_count) {
 }
 
 void MilestoneADemo::InjectFilledRowsForSmoke(int row_count) {
-  if (!live_game_active_) {
+  // Smoke/debug helper (--live-demo, keys C and B): fill the bottom rows and clear them through the
+  // same bookkeeping as a clearing lock (particles, collapse, Down lockout, level, reward, lines,
+  // score) but without a lock or a promotion. Ignored while a collapse or top-out is running.
+  if (!live_game_active_ || gameplay_phase_ != GameplayPhase::kFalling) {
     return;
   }
   row_count = std::clamp(row_count, 1, 4);
@@ -3286,7 +4939,10 @@ void MilestoneADemo::InjectFilledRowsForSmoke(int row_count) {
       live_board_cells_[static_cast<size_t>(board_y * kBoardWidth + x)] = ((x + row) % 7) + 1;
     }
   }
-  BeginLineCollapse(DetectFullRows());
+  const std::vector<int> rows = DetectFullRows();
+  BeginLineCollapse(rows);
+  down_lockout_frames_ = kDownLockoutAfterClear;
+  ApplyLineClearScore(static_cast<int>(rows.size()));
 }
 
 int MilestoneADemo::CurrentRunScore() const {
@@ -3316,25 +4972,12 @@ bool MilestoneADemo::ApplyGameplayBinding(std::uint8_t original_scancode, bool a
   }
 
   if (live_game_active_) {
-    if (allow_down && original_scancode == keyboard_bindings_[0]) {
-      // Down is consumed here but does not move a row on press; the soft-drop is
-      // driven per frame by the gravity accumulator (CurrentDropIncrement) off the
-      // held-key state, matching the original's polled 0x8000-per-frame model.
-      return true;
-    }
-    if (original_scancode == keyboard_bindings_[1]) {
-      return TryMoveLivePiece(-1, 0);
-    }
-    if (original_scancode == keyboard_bindings_[2]) {
-      return TryMoveLivePiece(1, 0);
-    }
-    if (original_scancode == keyboard_bindings_[3]) {
-      return TryRotateLivePiece(-1);
-    }
-    if (original_scancode == keyboard_bindings_[4]) {
-      return TryRotateLivePiece(1);
-    }
-    return false;
+    // In a live game the five bound keys act only through the held-key table that the gameplay step
+    // reads (0x9C8 samples it once per step: a press and release between two steps is never seen,
+    // and a press is acted on by the next step). The press is consumed here so it reaches no other
+    // handler.
+    return std::find(keyboard_bindings_.begin(), keyboard_bindings_.end(), original_scancode) !=
+           keyboard_bindings_.end();
   }
 
   if (original_scancode == keyboard_bindings_[1] || original_scancode == keyboard_bindings_[3]) {
@@ -3373,130 +5016,6 @@ void MilestoneADemo::ResetSetupStateToDefaults() {
   }
 }
 
-std::vector<std::string> MilestoneADemo::CurrentFrontendRows() const {
-  if (frontend_view_ == FrontendView::kMainMenu) {
-    return {
-        "New Game",
-        "Options",
-        std::string("Music:`") + kMusicTracks[music_track_index_] + "'",
-        "Level " + std::to_string(start_level_),
-        "High Scores",
-        "Credits",
-        "Exit Game",
-        "Return to Game",
-    };
-  }
-
-  if (frontend_view_ == FrontendView::kOptions) {
-    return {
-        FormatPercentRow("Music Volume:", music_volume_),
-        FormatPercentRow("Sound FX Volume:", sfx_volume_),
-        "Keyboard Setup",
-        "Back To Main Menu",
-        "",
-        "",
-        "",
-        "",
-    };
-  }
-
-  if (frontend_view_ == FrontendView::kKeyboardSetup) {
-    return {
-        KeyboardBindingRowText(0),
-        KeyboardBindingRowText(1),
-        KeyboardBindingRowText(2),
-        KeyboardBindingRowText(3),
-        KeyboardBindingRowText(4),
-        "Back to Options Menu",
-        "",
-        "",
-    };
-  }
-
-  if (frontend_view_ == FrontendView::kSoundSetup) {
-    return {
-        SoundSetupRowText(0),
-        SoundSetupRowText(1),
-        SoundSetupRowText(2),
-        SoundSetupRowText(3),
-        "Play Game",
-        "Exit to Dos",
-        "",
-        "",
-    };
-  }
-
-  if (frontend_view_ == FrontendView::kHighScores || frontend_view_ == FrontendView::kHighScoreEntry) {
-    // The original's high-score screen has no "High Scores" heading -- the five
-    // score rows sit directly under the shared logo (verified against the running
-    // original), starting at the same row Y as the menu's first row.
-    return {
-        HighScoreRowText(0),
-        HighScoreRowText(1),
-        HighScoreRowText(2),
-        HighScoreRowText(3),
-        HighScoreRowText(4),
-        "Return to Main Menu",
-    };
-  }
-
-  std::vector<std::string> rows;
-  std::string page = kCreditsPages[credits_page_];
-  size_t start = 0;
-  while (start <= page.size()) {
-    const size_t newline = page.find('\n', start);
-    rows.push_back(page.substr(start, newline == std::string::npos ? std::string::npos : newline - start));
-    if (newline == std::string::npos) {
-      break;
-    }
-    start = newline + 1;
-  }
-  return rows;
-}
-
-std::string MilestoneADemo::KeyboardBindingRowText(int row_index) const {
-  if (row_index < 0 || row_index >= static_cast<int>(keyboard_bindings_.size())) {
-    return {};
-  }
-
-  std::string row = std::string(kKeyboardBindingLabels[row_index]) + ":";
-  if (keyboard_capture_row_ == row_index) {
-    row += "_";
-  } else {
-    row += KeyNameForBinding(keyboard_bindings_[row_index]);
-  }
-  return row;
-}
-
-std::string MilestoneADemo::HighScoreRowText(int row_index) const {
-  if (row_index < 0 || row_index >= static_cast<int>(high_scores_.size())) {
-    return {};
-  }
-
-  const HighScoreRecord& record = high_scores_[row_index];
-  std::string name = record.name.empty() ? "Nobody" : record.name;
-  if (frontend_view_ == FrontendView::kHighScoreEntry && row_index == high_score_entry_row_ &&
-      HighScoreEntryInputReady()) {
-    name = high_score_entry_name_.empty() ? "_" : high_score_entry_name_ + "_";
-  }
-  return name + " " + std::to_string(record.score) + " " + std::to_string(record.lines);
-}
-
-std::string MilestoneADemo::SoundSetupRowText(int row_index) const {
-  switch (row_index) {
-    case 0:
-      return std::string("Sound Device:") + kSoundDeviceNames[std::clamp(sound_device_index_, 0, static_cast<int>(kSoundDeviceNames.size()) - 1)];
-    case 1:
-      return "Mixing Rate:" + std::to_string(mixing_rate_hz_);
-    case 2:
-      return std::string("Output:") + (stereo_flag_ == 0 ? "Mono" : "Stereo");
-    case 3:
-      return std::string("Sample Size:") + (bit_depth_flag_ == 0 ? "8 Bit" : "16 Bit");
-    default:
-      return {};
-  }
-}
-
 int MilestoneADemo::MeasureFrontendText(const std::string& text) const {
   int width = 0;
   for (const unsigned char raw_byte : text) {
@@ -3511,84 +5030,72 @@ int MilestoneADemo::MeasureFrontendText(const std::string& text) const {
 }
 
 int MilestoneADemo::PulseRevealAmount() const {
-  // Generic menu-row pulse, decoded exactly from RE 0x3fd8: reveal = sine[phase]/0x800
-  // + 0x30, phase advancing 0x20 per frame (period 0x800/0x20 = 64 frames, ~0.91s at
-  // 70Hz). The original sine table amplitude is 0x8001, so sine/0x800 spans +/-0x10 =>
-  // reveal 0x20..0x40, symmetric around the settled 0x30. Peak 0x40 renders a 16px row
-  // (0x40/4) that exactly fills 0x60cc's 16-row window, so it never clips and never
-  // exceeds the 17px row pitch -> NO neighbour overlap. IMPORTANT: this port's
-  // sine_table_ has amplitude 0x10000 (2x the original's 0x8001), so divide by 0x1000
-  // (not 0x800) to reproduce the same +/-0x10 swing. (Earlier passes used 0x40/frame
-  // with /0x800 -> a 32-frame 0x10..0x50 swing, 2x too fast AND 2x too tall = clipped
-  // + overlapping; then over-corrected to a grow-up-only 0x30..0x48 that still
-  // overshot the pitch on middle rows -- the "overlapping everywhere" report.)
-  return TruncDiv(sine_table_[(frontend_frame_counter_ * 0x20) & 0x7FF], 0x1000) + 0x30;
+  // The amount the selected (pulsing) row was last drawn with: 0x3fd8 computes
+  // trunc(sine[phase] / 2048) + 0x30 on the original's peak-32768 table.
+  int row = frontend_selected_row_;
+  if (frontend_view_ == FrontendView::kMainMenu) {
+    row = main_menu_row_;
+  } else if (frontend_view_ == FrontendView::kHighScoreEntry && hs_slot_ >= 0) {
+    row = hs_slot_;
+  } else if (frontend_view_ == FrontendView::kHighScores) {
+    row = kHiscoreFooterRow;
+  }
+  if (row < 0 || row >= kFrontendRowCount) {
+    return 0;
+  }
+  return row_amount_[static_cast<size_t>(row)];
 }
 
-int MilestoneADemo::FrontendRowRevealDelayFrames() const {
-  const bool high_score_view =
+int MilestoneADemo::VisibleRowCount() const {
+  const bool high_score_table =
       frontend_view_ == FrontendView::kHighScores || frontend_view_ == FrontendView::kHighScoreEntry;
-  return kFrontendObjectWarmupFrames + (high_score_view ? high_score_bootstrap_frames_ : 0);
+  int visible = 0;
+  for (int row = 0; row < kFrontendRowCount; ++row) {
+    const bool has_text = !row_text_[static_cast<size_t>(row)].empty() || (high_score_table && row < 5);
+    if (row_amount_[static_cast<size_t>(row)] > 0 && has_text) {
+      ++visible;
+    }
+  }
+  return visible;
 }
 
-int MilestoneADemo::HighScoreBootstrapRemainingFrames() const {
-  const bool high_score_view =
-      frontend_view_ == FrontendView::kHighScores || frontend_view_ == FrontendView::kHighScoreEntry;
-  if (!high_score_view || high_score_bootstrap_frames_ <= 0) {
-    return 0;
+void MilestoneADemo::RenderLiveHud(SDL_Renderer* renderer) const {
+  const int high_score_value = high_scores_.empty() ? 0 : high_scores_[0].score;
+  DrawCounter(renderer, digit_atlas_.texture, {36, 89, 7, high_score_value});
+  DrawCounter(renderer, digit_atlas_.texture, {36, 101, 7, live_score_});
+  DrawCounter(renderer, digit_atlas_.texture, {60, 112, 3, live_level_});
+  DrawCounter(renderer, digit_atlas_.texture, {144, 195, 4, live_lines_});
+
+  for (size_t i = 0; i < live_piece_stats_.size(); ++i) {
+    DrawCounter(renderer, digit_atlas_.texture, {kPieceStatX, kPieceStatRows[i], 4, live_piece_stats_[i]});
   }
 
-  return std::max(0, high_score_bootstrap_frames_ - frontend_view_frame_);
+  DrawPreviewPiece(renderer, piece_atlas_.texture, live_next_piece_type_);
 }
 
-int MilestoneADemo::RevealedFrontendRowCount(size_t row_count) const {
-  if (row_count == 0) {
-    return 0;
+void MilestoneADemo::DrawBoardCells(SDL_Renderer* renderer, const std::array<int, 200>& cells,
+                                    bool hide_clearing_rows) const {
+  for (int y = 0; y < kBoardHeight; ++y) {
+    // Each line-clear helper erases its 80x8 band right after spawning the band's
+    // particles (memset at e.g. 0x155F), in the clear tick itself: a cleared row is never
+    // drawn again; its debris (stage-0 colour = tile colour) shows it for that one frame.
+    if (hide_clearing_rows && gameplay_phase_ == GameplayPhase::kCollapse &&
+        std::find(pending_clear_rows_.begin(), pending_clear_rows_.end(), y) != pending_clear_rows_.end()) {
+      continue;
+    }
+    for (int x = 0; x < kBoardWidth; ++x) {
+      const int cell = cells[static_cast<size_t>(y * kBoardWidth + x)];
+      if (cell <= 0) {
+        continue;
+      }
+      DrawPieceTile(
+          renderer,
+          piece_atlas_.texture,
+          cell - 1,
+          kGameplayClearX + (x * kPieceTileSize),
+          kGameplayClearY + (y * kPieceTileSize));
+    }
   }
-
-  const int active_frame = frontend_view_frame_ - FrontendRowRevealDelayFrames();
-  if (active_frame < 0) {
-    return 0;
-  }
-
-  return std::clamp((active_frame / kFrontendRowRevealIntervalFrames) + 1, 0, static_cast<int>(row_count));
-}
-
-int MilestoneADemo::VisibleFrontendRowCount(size_t row_count) const {
-  const int revealed_rows = RevealedFrontendRowCount(row_count);
-  if (high_score_conceal_frames_ <= 0 ||
-      (frontend_view_ != FrontendView::kHighScores && frontend_view_ != FrontendView::kHighScoreEntry)) {
-    return revealed_rows;
-  }
-
-  const int conceal_elapsed = kHighScoreConcealFrames - high_score_conceal_frames_;
-  const int concealed_rows =
-      std::clamp(conceal_elapsed / kFrontendRowRevealIntervalFrames, 0, static_cast<int>(row_count));
-  return std::max(0, revealed_rows - concealed_rows);
-}
-
-bool MilestoneADemo::HighScoreEntryInputReady() const {
-  return frontend_view_ == FrontendView::kHighScoreEntry &&
-         RevealedFrontendRowCount(kHighScoreTableRevealRows) >= kHighScoreTableRevealRows;
-}
-
-int MilestoneADemo::SelectableFrontendRowCount() const {
-  switch (frontend_view_) {
-    case FrontendView::kMainMenu:
-      return 8;
-    case FrontendView::kOptions:
-      return 4;
-    case FrontendView::kKeyboardSetup:
-      return 6;
-    case FrontendView::kSoundSetup:
-      return 6;
-    case FrontendView::kHighScores:
-    case FrontendView::kHighScoreEntry:
-    case FrontendView::kCredits:
-      return 0;
-  }
-
-  return 0;
 }
 
 void MilestoneADemo::RenderGameplay(SDL_Renderer* renderer) const {
@@ -3612,39 +5119,38 @@ void MilestoneADemo::RenderGameplay(SDL_Renderer* renderer) const {
   SDL_RenderFillRect(renderer, &well_clear);
 
   if (live_game_active_) {
-    const int high_score_value = high_scores_.empty() ? 0 : high_scores_[0].score;
-    DrawCounter(renderer, digit_atlas_.texture, {36, 89, 7, high_score_value});
-    DrawCounter(renderer, digit_atlas_.texture, {36, 101, 7, live_score_});
-    DrawCounter(renderer, digit_atlas_.texture, {60, 112, 3, live_level_});
-    DrawCounter(renderer, digit_atlas_.texture, {144, 195, 4, live_lines_});
+    RenderLiveHud(renderer);
 
-    for (size_t i = 0; i < live_piece_stats_.size(); ++i) {
-      DrawCounter(renderer, digit_atlas_.texture, {kPieceStatX, kPieceStatRows[i], 4, live_piece_stats_[i]});
-    }
-
-    DrawTetromino(
-        renderer,
-        piece_atlas_.texture,
-        live_next_piece_type_,
-        live_next_piece_type_,
-        kPreviewX,
-        kPreviewY);
-
+    // Collapse look (0x1D04 / 0x1E34): the cleared rows were zeroed in the lock step (their pixels left
+    // as particles), and each collapse call moves the band between the stack top and the current
+    // cleared row down one scanline. Everything above that row is empty but the stack, so drawing
+    // the rows above it collapse_step_ pixels lower reproduces the memmove pixel for pixel; the 8th
+    // call compacts the board instead. If the spawn failed in the clearing step the stack stays put
+    // and each call blanks one scanline of the bottom row instead (empty-board anchor 152).
+    const bool collapsing = gameplay_phase_ == GameplayPhase::kCollapse &&
+                            collapse_batch_ < static_cast<int>(pending_clear_rows_.size());
+    const int slide_row = collapsing && !top_out_after_collapse_
+                              ? pending_clear_rows_[static_cast<size_t>(collapse_batch_)]
+                              : -1;
+    const int blanked_bottom_lines =
+        collapsing && top_out_after_collapse_ ? std::min(collapse_frame_, kPieceTileSize) : 0;
     for (int y = 0; y < kBoardHeight; ++y) {
-      bool collapse_row_hidden = false;
-      for (size_t clear_index = 0; clear_index < pending_clear_rows_.size(); ++clear_index) {
-        if (pending_clear_rows_[clear_index] == y &&
-            collapse_frame_ >= static_cast<int>(clear_index + 1) * kGameplayCollapseFramesPerRow) {
-          collapse_row_hidden = true;
-          break;
-        }
-      }
-      if (collapse_row_hidden) {
-        continue;
-      }
+      const int slide = y < slide_row ? collapse_step_ : 0;
+      const int skip_lines = y == kBoardHeight - 1 ? blanked_bottom_lines : 0;
       for (int x = 0; x < kBoardWidth; ++x) {
         const int cell = live_board_cells_[static_cast<size_t>(y * kBoardWidth + x)];
         if (cell <= 0) {
+          continue;
+        }
+        if (skip_lines > 0) {
+          if (skip_lines < kPieceTileSize && piece_atlas_.texture != nullptr) {
+            const SDL_FRect source = {static_cast<float>((cell - 1) * kPieceTileSize), static_cast<float>(skip_lines),
+                                      static_cast<float>(kPieceTileSize), static_cast<float>(kPieceTileSize - skip_lines)};
+            const SDL_FRect destination = {static_cast<float>(kGameplayClearX + (x * kPieceTileSize)),
+                                           static_cast<float>(kGameplayClearY + (y * kPieceTileSize) + skip_lines),
+                                           static_cast<float>(kPieceTileSize), static_cast<float>(kPieceTileSize - skip_lines)};
+            SDL_RenderTexture(renderer, piece_atlas_.texture, &source, &destination);
+          }
           continue;
         }
         DrawPieceTile(
@@ -3652,20 +5158,30 @@ void MilestoneADemo::RenderGameplay(SDL_Renderer* renderer) const {
             piece_atlas_.texture,
             cell - 1,
             kGameplayClearX + (x * kPieceTileSize),
-            kGameplayClearY + (y * kPieceTileSize));
+            kGameplayClearY + (y * kPieceTileSize) + slide);
       }
     }
 
-    DrawLiveTetromino(
-        renderer,
-        piece_atlas_.texture,
-        live_piece_.type,
-        live_piece_.rotation,
-        live_piece_.x,
-        live_piece_.y);
+    // 0x107C/0x10A1: the live piece is drawn at the end of every live step (also the one that starts
+    // a top-out, where the colliding new piece is drawn over the stack), never while rows are pending,
+    // and a piece promoted during a clear only from its first live step.
+    if (!live_piece_hidden_ && gameplay_phase_ != GameplayPhase::kCollapse) {
+      DrawLiveTetromino(
+          renderer,
+          piece_atlas_.texture,
+          live_piece_.type,
+          live_piece_.rotation,
+          live_piece_.x,
+          live_piece_.y);
+    }
 
-    RenderDebrisParticles(renderer);
+    // The face is part of the working screen; the debris is plotted after every tick
+    // (0x5AE -> 0x2F24), over the face. A screen restored by the frontend holds no
+    // particles, so none are drawn until the first tick back in the game steps them.
     RenderAlertTile(renderer);
+    if (!debris_hidden_after_frontend_) {
+      RenderDebrisParticles(renderer);
+    }
     return;
   }
 
@@ -3700,6 +5216,396 @@ void MilestoneADemo::RenderGameplay(SDL_Renderer* renderer) const {
         kGameplayClearX + (piece.x * kPieceTileSize),
         kGameplayClearY + (piece.y * kPieceTileSize));
   }
+}
+
+// ============================================================================
+// Audit instrumentation (audit/instrument worktree only). Read-only views of the
+// demo state plus per-step accumulators reset by AuditBeginStep.
+// ============================================================================
+namespace {
+
+const char* AuditActionName(size_t index) {
+  static constexpr const char* kNames[8] = {"up",          "down",         "left",    "right",
+                                            "rotate_left", "rotate_right", "confirm", "escape"};
+  return index < 8 ? kNames[index] : "?";
+}
+
+}  // namespace
+
+void MilestoneADemo::AuditBeginStep(std::uint64_t step) {
+  audit_step_ = step;
+  audit_stage_ = "input";
+  audit_emitted_.clear();
+  audit_rng_index_before_ = gameplay_random_index_;
+  audit_rng_draws_ = 0;
+  audit_rng_hash_ = kFnvOffsetBasis;
+  audit_rng_values_.clear();
+  audit_gravity_active_ = false;
+  audit_gravity_rate_ = 0;
+  audit_gravity_acc_before_ = gravity_accumulator_;
+  audit_descent_attempts_ = 0;
+  audit_descent_successes_ = 0;
+  audit_score_before_ = live_score_;
+  audit_particles_spawned_ = 0;
+  audit_particles_dropped_ = 0;
+  audit_particles_retired_ = 0;
+  audit_pressed_.fill(false);
+  audit_released_.fill(false);
+  audit_held_at_step_start_ = held_original_scancodes_;
+}
+
+void MilestoneADemo::AuditWritePresentation(JsonOut& json) const {
+  json.BeginObject()
+      .Key("splash_frame").Int(splash_frame_)
+      .Key("frontend_frame_counter").Int(frontend_frame_counter_)
+      .Key("frontend_view_frame").Int(frontend_view_frame_)
+      .Key("pulse").Int(PulseRevealAmount())
+      .Key("top_out_frame").Int(top_out_frame_)
+      .Key("top_out_dissolved_pixel_rows").Int(top_out_dissolved_rows_)
+      .Key("debris").UInt(debris_particles_.size())
+      .Key("fade_alpha").Int(screen_fade_alpha())
+      .Key("tick").UInt(Tick32())
+      .Key("flow").Str(FlowPhaseName())
+      .EndObject();
+}
+
+void MilestoneADemo::AuditWriteEmittedEvents(JsonOut& json) const {
+  json.BeginArray();
+  for (const AuditEmitted& event : audit_emitted_) {
+    json.BeginObject().Key("stage").Str(event.stage).Key("kind").Str(event.is_sfx ? "sfx" : "music").Key("name").Str(
+        event.name);
+    if (event.is_sfx) {
+      json.Key("slot").Int(event.slot).Key("sfx_volume").Int(event.sfx_volume).Key("pan").Int(event.pan).Key(
+          "voice_class").Int(event.voice_class);
+    } else {
+      json.Key("track").Int(event.track).Key("music_volume").Int(event.music_volume);
+    }
+    json.EndObject();
+  }
+  json.EndArray();
+}
+
+void MilestoneADemo::AuditWriteState(JsonOut& json, bool include_rng_values) const {
+  const char* scene = "frontend";
+  switch (scene_) {
+    case Scene::kSplash: scene = "splash"; break;
+    case Scene::kFrontend: scene = "frontend"; break;
+    case Scene::kGameplay: scene = "gameplay"; break;
+    case Scene::kTopOut: scene = "topout"; break;
+  }
+  const char* view = "main_menu";
+  switch (frontend_view_) {
+    case FrontendView::kMainMenu: view = "main_menu"; break;
+    case FrontendView::kOptions: view = "options"; break;
+    case FrontendView::kKeyboardSetup: view = "keyboard_setup"; break;
+    case FrontendView::kHighScores: view = "high_scores"; break;
+    case FrontendView::kHighScoreEntry: view = "high_score_entry"; break;
+    case FrontendView::kCredits: view = "credits"; break;
+    case FrontendView::kSoundSetup: view = "sound_setup"; break;
+  }
+  const char* phase = "falling";
+  if (gameplay_phase_ == GameplayPhase::kCollapse) {
+    phase = "collapse";
+  } else if (gameplay_phase_ == GameplayPhase::kTopOutDissolve) {
+    phase = "topout_dissolve";
+  }
+  // Fade fields keep their old names: state = the dispatcher fade running
+  // ("pal-out" 0x64f0, "title-in" 0x63b8, "title-out" 0x62e0, "pal-in" 0x6498,
+  // "quit-out" state 3), frame = e (ticks since that fade started).
+  const char* fade = "none";
+  switch (flow_phase_) {
+    case FlowPhase::kEntryPaletteOut: fade = "pal-out"; break;
+    case FlowPhase::kEntryTitleIn: fade = "title-in"; break;
+    case FlowPhase::kExitTitleOut: fade = "title-out"; break;
+    case FlowPhase::kExitPaletteIn: fade = "pal-in"; break;
+    case FlowPhase::kQuitTitleOut: fade = "quit-out"; break;
+    default: break;
+  }
+  const char* pending = "none";
+  switch (flow_exit_) {
+    case FlowExit::kNone: pending = dispatch_state_ == 1 && flow_phase_ == FlowPhase::kEntryPaletteOut ? "frontend_from_gameplay" : "none"; break;
+    case FlowExit::kNewGame: pending = "gameplay_new_game"; break;
+    case FlowExit::kResume: pending = "gameplay_resume"; break;
+    case FlowExit::kSplashes: pending = "splashes"; break;
+  }
+
+  json.Key("scene").Str(scene).Key("scene_name").Str(scene_name());
+  json.Key("splash").BeginObject().Key("page").Int(splash_page_).Key("frame").Int(splash_frame_).EndObject();
+  json.Key("session")
+      .BeginObject()
+      .Key("live_game_active").Bool(live_game_active_)
+      .Key("live_game_available").Bool(live_game_available_)
+      .Key("quit_requested").Bool(quit_requested_)
+      .Key("gameplay_preset").Int(gameplay_preset_index_)
+      .EndObject();
+  json.Key("phase").Str(phase);
+
+  // Piece (port numbering; geometry from RotatedCells, i.e. what draw/collision use).
+  json.Key("piece").BeginObject().Key("id").Int(live_piece_.type).Key("rotation").Int(live_piece_.rotation).Key("x").Int(
+      live_piece_.x).Key("y").Int(live_piece_.y).Key("next").Int(live_next_piece_type_);
+  json.Key("cells").BeginArray();
+  for (const CellOffset& cell : RotatedCells(live_piece_.type, live_piece_.rotation)) {
+    json.BeginArray().Int(live_piece_.x + cell.x).Int(live_piece_.y + cell.y).EndArray();
+  }
+  json.EndArray();
+  json.Key("stats").BeginArray();
+  for (const int count : live_piece_stats_) {
+    json.Int(count);
+  }
+  json.EndArray().EndObject();
+
+  // Gravity bracket for this step (StepFallingGameplay); rate includes the 0x8000 soft-drop override.
+  json.Key("gravity").BeginObject().Key("stepped").Bool(audit_gravity_active_);
+  if (audit_gravity_active_) {
+    json.Key("rate").Int(audit_gravity_rate_).Key("acc_before").Int(audit_gravity_acc_before_);
+  } else {
+    json.Key("rate").Null().Key("acc_before").Null();
+  }
+  json.Key("acc_after").Int(gravity_accumulator_)
+      .Key("natural_rate").Int(CurrentGravityRate())
+      .Key("soft_drop_override").Bool(audit_gravity_active_ && audit_gravity_rate_ == kSoftDropIncrement &&
+                                      CurrentGravityRate() != kSoftDropIncrement)
+      .Key("descent_attempts").Int(audit_descent_attempts_)
+      .Key("descent_successes").Int(audit_descent_successes_)
+      .Key("lock_frames").Int(0)  // no grounded lock timer any more (GR-01); field kept for the trace schema
+      .Key("down_lockout").Int(down_lockout_frames_)
+      .EndObject();
+
+  // Input: the eight semantic actions (v1 trace order) mapped through the bindings.
+  const std::array<std::uint8_t, 8> action_scancodes = {
+      0xC8, keyboard_bindings_[0], keyboard_bindings_[1], keyboard_bindings_[2],
+      keyboard_bindings_[3], keyboard_bindings_[4], 0x1C, 0x01};
+  auto write_set = [&](const std::array<bool, 256>& states) {
+    json.BeginArray();
+    for (size_t i = 0; i < action_scancodes.size(); ++i) {
+      const std::uint8_t sc = action_scancodes[i];
+      if (sc != 0 && states[sc]) {
+        json.Str(AuditActionName(i));
+      }
+    }
+    json.EndArray();
+  };
+  json.Key("input").BeginObject();
+  json.Key("held_at_step_start");
+  write_set(audit_held_at_step_start_);
+  json.Key("held");
+  write_set(held_original_scancodes_);
+  json.Key("pressed");
+  write_set(audit_pressed_);
+  json.Key("released");
+  write_set(audit_released_);
+  json.Key("held_frames").BeginObject();
+  for (size_t i = 0; i < action_scancodes.size(); ++i) {
+    const std::uint8_t sc = action_scancodes[i];
+    json.Key(AuditActionName(i)).Int(sc != 0 && held_original_scancodes_[sc] ? held_original_scancode_frames_[sc] : 0);
+  }
+  json.EndObject();
+  // Gameplay repeats use 0x9C8's four timers (repeat_timers_: act at 0, reload 8 =
+  // kGameplayBindingRepeatFrames); held_frames above are the frontend counters (Left/Right edit
+  // repeats at 12 then every 4).
+  json.Key("das_period").Int(kGameplayBindingRepeatFrames);
+  json.Key("held_raw").BeginArray();
+  for (size_t sc = 0; sc < held_original_scancodes_.size(); ++sc) {
+    if (held_original_scancodes_[sc]) {
+      json.Int(static_cast<int>(sc));
+    }
+  }
+  json.EndArray().EndObject();
+
+  // RNG (consumption 0x3280 model): draws this step, FNV-1a64 over the raw LE u32 values.
+  json.Key("rng")
+      .BeginObject()
+      .Key("seed").UInt(piece_seed_)
+      .Key("state").UInt(gameplay_random_state_)
+      .Key("index_before").Int(audit_rng_index_before_)
+      .Key("index_after").Int(gameplay_random_index_)
+      .Key("draws").UInt(audit_rng_draws_)
+      .Key("values_fnv1a64").Str(Hex64(audit_rng_hash_));
+  json.Key("values");
+  if (include_rng_values || audit_rng_draws_ <= 8) {
+    json.BeginArray();
+    for (const std::uint32_t value : audit_rng_values_) {
+      json.UInt(value);
+    }
+    json.EndArray();
+  } else {
+    json.Null();
+  }
+  json.EndObject();
+
+  // Board: 20 rows top->bottom, 10 cells left->right, value = cell byte (0 empty,
+  // 1..7 = port piece type + 1). Hash = FNV-1a64 over the 200 bytes (v1 board domain).
+  std::uint64_t board_hash = kFnvOffsetBasis;
+  for (const int cell : live_board_cells_) {
+    const std::uint8_t byte = static_cast<std::uint8_t>(cell);
+    board_hash = Fnv1a64Update(board_hash, &byte, 1);
+  }
+  json.Key("board").BeginObject().Key("fnv1a64").Str(Hex64(board_hash)).Key("rows").BeginArray();
+  for (int y = 0; y < kBoardHeight; ++y) {
+    std::string row;
+    for (int x = 0; x < kBoardWidth; ++x) {
+      row += static_cast<char>('0' + std::clamp(live_board_cells_[static_cast<size_t>(y * kBoardWidth + x)], 0, 9));
+    }
+    json.Str(row);
+  }
+  json.EndArray().EndObject();
+
+  json.Key("score")
+      .BeginObject()
+      .Key("value").Int(live_score_)
+      .Key("lines").Int(live_lines_)
+      .Key("level").Int(live_level_)
+      .Key("start_level").Int(start_level_)
+      .Key("delta").Int(live_score_ - audit_score_before_)
+      .EndObject();
+
+  json.Key("clear").BeginObject().Key("rows").BeginArray();
+  for (const int row : pending_clear_rows_) {
+    json.Int(row);
+  }
+  json.EndArray().Key("collapse_frame").Int(collapse_frame_).EndObject();
+
+  json.Key("particles")
+      .BeginObject()
+      .Key("active").UInt(debris_particles_.size())
+      .Key("spawned").UInt(audit_particles_spawned_)
+      .Key("dropped_at_cap").UInt(audit_particles_dropped_)
+      .Key("retired").UInt(audit_particles_retired_)
+      .EndObject();
+
+  // Test hook (effects-alerts prototype): the whole particle pool for the steps in
+  // ATET_AUDIT_PARTICLES=A:B, in container order (index 0 = first spawned), each as
+  // [x, y, vx, vy, age, decay, color] (16.16 fixed point, as the original's nodes).
+  {
+    static const std::pair<std::uint64_t, std::uint64_t> particle_range = [] {
+      std::pair<std::uint64_t, std::uint64_t> range{1, 0};  // empty unless the variable is set
+      const char* spec = SDL_getenv("ATET_AUDIT_PARTICLES");
+      unsigned long long from = 0;
+      unsigned long long to = 0;
+      if (spec != nullptr && SDL_sscanf(spec, "%llu:%llu", &from, &to) == 2 && from <= to) {
+        range = {from, to};
+      }
+      return range;
+    }();
+    if (audit_step_ >= particle_range.first && audit_step_ <= particle_range.second) {
+      json.Key("particle_list").BeginArray();
+      for (const DebrisParticle& particle : debris_particles_) {
+        json.BeginArray()
+            .Int(particle.x)
+            .Int(particle.y)
+            .Int(particle.vx)
+            .Int(particle.vy)
+            .Int(particle.age)
+            .Int(particle.decay)
+            .Int(particle.color)
+            .EndArray();
+      }
+      json.EndArray();
+    }
+  }
+
+  json.Key("warning")
+      .BeginObject()
+      .Key("band").Int(warning_band_)
+      .Key("cooldowns").BeginArray().Int(warning_cooldowns_[0]).Int(warning_cooldowns_[1]).Int(warning_cooldowns_[2]).EndArray()
+      .Key("sleepy").Bool(alert_effect_id_ == 11)
+      .Key("frames_since_clear").Int(static_cast<long long>(Tick32() - last_clear_tick_))
+      .EndObject();
+
+  json.Key("alert").BeginObject().Key("id");
+  if (alert_effect_id_ >= 0) {
+    json.Int(alert_effect_id_);
+  } else {
+    json.Null();
+  }
+  json.Key("lifetime").Int(alert_lifetime_)
+      .Key("reveal_frame").Int(6 - alert_reveal_counter_)
+      .Key("reveal_counter").Int(alert_reveal_counter_)
+      .Key("tick").UInt(Tick32())
+      .Key("last_clear_tick").UInt(last_clear_tick_)
+      .EndObject();
+
+  json.Key("topout")
+      .BeginObject()
+      .Key("frame").Int(top_out_frame_)
+      .Key("gameplay_frame").Int(top_out_frame_)
+      .Key("dissolved_pixel_rows").Int(top_out_dissolved_rows_)
+      .Key("overlay_visible").Bool(scene_ == Scene::kTopOut && top_out_dissolved_rows_ >= kTopOutDissolveFrames)
+      .Key("saved_under_valid").Bool(false)
+      .Key("handoff_pending").Bool(false)
+      .EndObject();
+
+  json.Key("frontend")
+      .BeginObject()
+      .Key("view").Str(view)
+      .Key("selected_row").Int(frontend_view_ == FrontendView::kMainMenu ? main_menu_row_ : frontend_selected_row_)
+      .Key("view_frame").Int(frontend_view_frame_)
+      .Key("frame_counter").Int(frontend_frame_counter_)
+      .Key("cycle_counter").Int(frontend_cycle_counter_)
+      .Key("bank").Int(frontend_current_bank_)
+      .Key("next_bank").Int(frontend_next_bank_)
+      .Key("pulse").Int(PulseRevealAmount())
+      .Key("visible_rows").Int(scene_ == Scene::kFrontend ? VisibleRowCount() : 0)
+      .Key("conceal_frames").Int(flow_phase_ == FlowPhase::kConceal ? kRevealSteps - flow_step_ : 0)
+      .Key("hs_bootstrap_remaining").Int(0)
+      .Key("credits_page").Int(credits_page_)
+      .Key("credits_timer").Int(credits_counter_)
+      .Key("keyboard_capture_row").Int(keyboard_capture_row_)
+      .Key("entry_row").Int(frontend_view_ == FrontendView::kHighScoreEntry ? hs_slot_ : -1)
+      .Key("entry_name").Str(hs_buffer_)
+      .Key("commit_pending").Bool(hs_commit_);
+  // Dispatcher-model state (fix-frontend-flow prototype).
+  json.Key("flow").Str(FlowPhaseName())
+      .Key("flow_step").Int(flow_step_)
+      .Key("dispatch_state").Int(dispatch_state_)
+      .Key("pending").Int(menu_pending_)
+      .Key("return_state").Int(menu_return_state_)
+      .Key("main_menu_row").Int(main_menu_row_)
+      .Key("pulse_phase").Int(pulse_phase_)
+      .Key("entry_pulse_phase").Int(entry_pulse_phase_)
+      .Key("title_level").Int(CurrentTitleLevel())
+      .Key("splash_level").Int(CurrentSplashLevel())
+      .Key("frozen_level").Int(CurrentFrozenLevel())
+      .Key("release_newest").Int(PeekRelease())
+      .Key("credits_mode").Int(credits_mode_);
+  json.Key("pf")
+      .BeginObject()
+      .Key("ang_xy").Int(frontend_pointfield_state_.angle_xy)
+      .Key("ang_z").Int(frontend_pointfield_state_.angle_z)
+      .Key("ph_x").Int(frontend_pointfield_state_.phase_x)
+      .Key("ph_y").Int(frontend_pointfield_state_.phase_y)
+      .Key("ph_z").Int(frontend_pointfield_state_.phase_z)
+      .Key("org_x").Int(frontend_pointfield_state_.origin_x)
+      .Key("org_y").Int(frontend_pointfield_state_.origin_y)
+      .Key("org_z").Int(frontend_pointfield_state_.origin_z)
+      .EndObject();
+  json.Key("row_amounts").BeginArray();
+  for (const int amount : row_amount_) {
+    json.Int(amount);
+  }
+  json.EndArray();
+  json.Key("row_texts").BeginArray();
+  for (const std::string& text : row_text_) {
+    json.Str(text);
+  }
+  json.EndArray();
+  json.EndObject();
+
+  json.Key("fade")
+      .BeginObject()
+      .Key("state").Str(fade)
+      .Key("frame").Int(FlowFadeE())
+      .Key("alpha").Int(screen_fade_alpha())
+      .Key("pending_scene").Str(pending)
+      .Key("enabled").Bool(fades_enabled_)
+      .EndObject();
+
+  json.Key("settings")
+      .BeginObject()
+      .Key("music_volume").Int(music_volume_)
+      .Key("sfx_volume").Int(sfx_volume_)
+      .Key("music_track_index").Int(music_track_index_)
+      .EndObject();
 }
 
 }  // namespace atet
