@@ -46,15 +46,23 @@ echo "[1] scenarios exit 0"
 declare -A rc
 rc[basic3]=$(run basic3 --smoke-frames=3)
 rc[lineclear]=$(run lineclear --live-demo --scripted-input=@"$ss/live-line-clear.txt" --smoke-frames=90)
-rc[pauseresume]=$(run pauseresume --live-demo --scripted-input=@"$ss/pause-resume.txt" --smoke-frames=100)
-rc[hiscore]=$(run hiscore --reset-setup --topout-demo --scripted-input=@"$ss/high-score-exit.txt" --smoke-frames=240 --debug-state)
+rc[pauseresume]=$(run pauseresume --live-demo --scripted-input=@"$ss/pause-resume.txt" --smoke-frames=220 --debug-state)
+rc[hiscore]=$(run hiscore --reset-setup --topout-demo --scripted-input=@"$ss/high-score-exit.txt" --smoke-frames=300 --debug-state)
 rc[topout1400]=$(run topout1400 --reset-setup --topout-demo --smoke-frames=1400)
 for n in basic3 lineclear pauseresume hiscore topout1400; do
   [ "${rc[$n]}" = "0" ] && pass "$n EXIT=0" || fail "$n EXIT=${rc[$n]}"
 done
+# Pause on the Esc RELEASE, Return to Game through the gate and the 48-step
+# conceal (the script used to press Esc without a release, which the original
+# never acts on, and Esc on the main menu used to quit the port).
+{ grep -q 'scene=Main Menu' "$tmp/pauseresume.txt" && tail -n 3 "$tmp/pauseresume.txt" | grep -q 'scene=Gameplay'; } \
+  && pass "pause-resume: menu opened and the game resumed" || fail "pause-resume did not pause and resume"
 
 echo "[2] top-out fingerprint"
-for pat in "topout=160" "topout=760" "hsboot=72"; do
+# hsboot=72 was the port's invented 72-frame state-9 hold; the original runs the
+# dispatcher entry (palette fades, off in --topout-demo) and the 48-step table
+# reveal, so the check is now the name-entry screen after a reveal.
+for pat in "topout=160" "topout=760" "scene=High Score Entry" "flow=reveal"; do
   grep -q "$pat" "$tmp/hiscore.txt" && pass "$pat present" || fail "$pat missing"
 done
 
@@ -77,14 +85,20 @@ grep -q "SFX mix: slot=10 vol%=90 engine=57/64" "$tmp/sfx.txt" \
 echo "[5] startup music loads"
 grep -q "Music: playing track 0" "$tmp/topout1400.txt" && pass "track 0 'Continuum' loads" || fail "startup music missing"
 
-echo "[6] gameplay<->frontend screen fade"
-# Real New Game (no shortcut, fades on): Enter on the default menu row after the
-# boot splashes (~720+ frames now). The menu should fade out ~120 ticks, switch at
-# black, fade in ~120 (screen fades are ~2.0s = 120 frames at 60Hz).
-"$exe" --reset-setup --debug-state --scripted-input=820:enter,822:enter:up --smoke-frames=1120 > "$tmp/fade.txt" 2>&1
-fo=$(grep -c 'fade=out:' "$tmp/fade.txt"); fi=$(grep -c 'fade=in:' "$tmp/fade.txt")
-{ [ "$fo" -ge 112 ] && [ "$fo" -le 126 ] && [ "$fi" -ge 112 ] && [ "$fi" -le 126 ]; } \
-  && pass "New Game fade out=$fo in=$fi (~120t each)" || fail "fade timing off (out=$fo in=$fi)"
+echo "[6] gameplay<->frontend transitions (dispatcher 0x3830)"
+# The old check expected ~120-frame overlay fades fitted to a capture. The original
+# runs four 63-tick palette fades: at boot 0x64f0 (invisible, over black) and the
+# title fade-in 0x63b8; on New Game the title fade-out 0x62e0 and the gameplay
+# fade-in 0x6498. The menu is interactive from tick 957 (step 956); an Enter
+# released at step 960 starts New Game through the gate and the 48-step conceal.
+"$exe" --reset-setup --debug-state --scripted-input=958:enter,960:enter:up --smoke-frames=1250 > "$tmp/fade.txt" 2>&1
+po=$(grep -c 'fade=pal-out:' "$tmp/fade.txt"); ti=$(grep -c 'fade=title-in:' "$tmp/fade.txt")
+to=$(grep -c 'fade=title-out:' "$tmp/fade.txt"); pi=$(grep -c 'fade=pal-in:' "$tmp/fade.txt")
+co=$(grep -c 'flow=conceal' "$tmp/fade.txt")
+{ [ "$po" -eq 63 ] && [ "$ti" -eq 63 ] && [ "$to" -eq 63 ] && [ "$pi" -eq 63 ] && [ "$co" -eq 48 ]; } \
+  && pass "boot pal-out=$po title-in=$ti, New Game conceal=$co title-out=$to pal-in=$pi (63-tick fades)" \
+  || fail "transition timing off (pal-out=$po title-in=$ti conceal=$co title-out=$to pal-in=$pi)"
+grep -q 'scene=Gameplay' "$tmp/fade.txt" && pass "New Game reaches gameplay" || fail "New Game never reached gameplay"
 # Shortcuts stay fade-free for determinism.
 "$exe" --live-demo --debug-state --smoke-frames=5 2>&1 | grep -q 'fade=none' \
   && pass "shortcut (--live-demo) is fade-free" || fail "shortcut should not fade"

@@ -14,8 +14,26 @@
 #include <vector>
 
 #include "indexed_asset_loader.h"
+#include "audit_instrument.h"
+
+// Audit instrumentation: count the SDL draw API calls the demo issues per frame.
+// A function-like macro does not re-expand inside its own replacement, so the
+// inner call reaches the real SDL function.
+#define SDL_RenderTexture(...) (++::atet::g_audit.render_texture_calls, SDL_RenderTexture(__VA_ARGS__))
+#define SDL_RenderFillRect(...) (++::atet::g_audit.fill_rect_calls, SDL_RenderFillRect(__VA_ARGS__))
+#define SDL_SetRenderDrawColor(...) (++::atet::g_audit.draw_color_calls, SDL_SetRenderDrawColor(__VA_ARGS__))
 
 namespace atet {
+
+namespace {
+// Scoped perf-counter accumulator for the audit sub-phase timers.
+struct AuditScopedTicks {
+  explicit AuditScopedTicks(std::uint64_t* sink) : sink_(sink), start_(SDL_GetPerformanceCounter()) {}
+  ~AuditScopedTicks() { *sink_ += SDL_GetPerformanceCounter() - start_; }
+  std::uint64_t* sink_;
+  std::uint64_t start_;
+};
+}  // namespace
 
 namespace {
 
@@ -44,18 +62,35 @@ constexpr int kFrontendRenderHeight = 16;
 constexpr int kFrontendRowY = 0x64;
 constexpr int kFrontendRowStep = 0x11;
 constexpr int kFrontendTextCenterX = 0xA0;
-// High-score table columns (logical 320-space), measured from the running
-// original: names left-aligned, score and lines right-aligned into columns.
-constexpr int kHiscoreNameLeftX = 94;
-constexpr int kHiscoreScoreRightX = 230;
-constexpr int kHiscoreLinesRightX = 266;
-constexpr int kFrontendSteadyFrames = 0x258;
-constexpr int kFrontendMorphFrames = 0x80;
-constexpr int kFrontendObjectWarmupFrames = 12;
-constexpr int kFrontendRowRevealIntervalFrames = 4;
-constexpr int kCreditsPageFrames = 360;
-constexpr int kFrontendHoldStartFrames = 12;
-constexpr int kFrontendHoldRepeatFrames = 4;
+// High-score table (0x50b0): name, score and lines are each CENTRED (0x60cc with
+// ECX = 1) at x 0x69, 0xdc and 0x118; row 5 is empty and the footer is row 6 at
+// y 0xca (the generic row y for index 6).
+constexpr int kHiscoreNameCenterX = 0x69;
+constexpr int kHiscoreScoreCenterX = 0xDC;
+constexpr int kHiscoreLinesCenterX = 0x118;
+constexpr int kHiscoreFooterRow = 6;
+constexpr int kFrontendSteadyFrames = 0x258;   // 0x39c4: next bank picked at counter 600
+constexpr int kFrontendMorphFrames = 0x80;     // ... morph 128 steps, switch at 728
+constexpr int kFrontendRowCount = 8;
+// Frontend timing, all in logic ticks of the PIT clock (STATIC-EXACT, see
+// audit-2026-10 frontend-flow / timing-reconciled):
+constexpr int kRevealSteps = 0x30;             // 0x3df4 / 0x3ee4: 48 steps
+constexpr int kFadeTicks = 0x3F;               // 0x64f0 / 0x63b8 / 0x62e0 / 0x6498 exit at e >= 63
+constexpr int kFrontendRestLevel = kFadeTicks - 1;  // 0x63b8's last upload is level 62
+constexpr int kPulseStep = 0x20;               // 0x3fd8: +0x20 per steady tick
+constexpr int kPulsePhaseMask = 0x7FF;
+constexpr int kStalePacerBurst = 6;            // 0x24d0 caps the catch-up at 6 ticks
+constexpr int kMusicChangeWaitTicks = 0x20;    // 0x6544: 0x699e(2, 0x20) and its busy wait
+constexpr int kExitMusicRampTicks = 0x40;      // state 3: 0x699e(2, 0x40)
+// Ticks between the WARNING's last upload and the 0x6544 call (chunk decode and
+// page clears at main 0x2eb-0x3cb). The Unicorn oracle (device None, zero-time
+// disk) measures 1; DOSBox-X at Pentium-133 speed takes about 5 more. Disk and
+// CPU time are not part of the code, so the zero-disk oracle value is used.
+constexpr int kBootLoadAllowanceTicks = 1;
+constexpr int kSplashFadeInEnd = 0x7F;         // 0x2998: fade-in e = 1..127
+constexpr int kSplashHoldTicks = 0x78;         // hold 120 ticks
+constexpr int kSplashFadeOutUploads = 0x80;    // fade-out e = 0..127 (128 uploads)
+constexpr int kCreditsHoldEnd = 0x12C;         // 0x4f38: conceal staged when the counter reaches 300
 constexpr int kGameplayBindingRepeatFrames = 8;
 constexpr int kGameplayGravityThreshold = 0x10000;
 // RE gameplay-input-timing-pass: while Down is held the per-frame gravity increment
@@ -72,18 +107,8 @@ constexpr int kWarningHighRow = 2;
 constexpr int kWarningCooldownFrames = 120;
 constexpr int kSleepyNoClearFrames = 60 * 45;
 constexpr int kAlertEventLifetime = 96;  // frames a one-shot mood face (clear/wake) stays up (~1.4s @70fps)
-constexpr int kHighScoreConcealFrames = 36;
-constexpr int kHighScoreTableRevealRows = 6;
-// Boot-splash + fade durations measured from the running original (kryptos boot
-// capture at 60 Hz): each splash page fades in ~2.0s, holds ~2.0s, fades out ~2.0s
-// (~6.0s/page), and screen fades run ~2.0s. The port had ~0.4s splash fades and ~1.07s
-// screen fades -- "WAY too fast" -- because the fade tick-counts were guessed small to
-// fit a too-short 120-frame page. (RE 0x6498/0x64f0 = 0x40 palette STEPS, but the
-// running fade advances slower than one step/frame, so the wall-clock duration is ~2s;
-// the port models each fade as a linear ramp over the measured frame duration.)
-constexpr int kSplashPageFrames = 360;   // ~6.0s at 60 Hz: 2s fade-in + 2s hold + 2s fade-out
-constexpr int kScreenFadeTicks = 120;    // ~2.0s screen fade (title/menu + gameplay<->frontend)
-constexpr int kSplashFadeTicks = 120;    // ~2.0s splash fade-in/out within a page
+// (The old 120-frame splash/screen fade constants were fitted to a capture; every
+// frontend fade is now the original's tick-exact palette level, see kFadeTicks.)
 constexpr int kTopOutTimingFps = 60;
 // RE 0x1f8c/0x1fc6: the top-out dissolve sweeps exactly ONE pixel-row per frame down
 // the whole gameplay area (kBoardHeight*8 = 160 pixel rows), so the spray completes in
@@ -93,7 +118,6 @@ constexpr int kTopOutDissolveFrames = kBoardHeight * kPieceTileSize;  // 160
 constexpr int kTopOutOverlayStartFrame = kTopOutDissolveFrames;       // GAME OVER right after
 constexpr int kTopOutOverlayEndFrame = kTopOutOverlayStartFrame + 10 * kTopOutTimingFps;  // ~hold
 constexpr int kTopOutHandoffFrame = kTopOutOverlayEndFrame + 20;
-constexpr int kState9BootstrapFrames = 72;
 constexpr int kFrontendRecordSize = 0x1C;
 constexpr int kFrontendRecordCount = 0x400;
 constexpr int kFrontendBankCount = 8;
@@ -222,9 +246,11 @@ const std::array<GameplayPreset, 3> kGameplayPresets = {{
     },
 }};
 
+// Track names exactly as the original's Music row strings (0x17b2b..0x17bab);
+// track 1 is "Tearing up Spacetime" there (FE-18).
 const std::array<const char*, 6> kMusicTracks = {
     "Continuum",
-    "Tearing Up SpaceTime",
+    "Tearing up Spacetime",
     "Inner Walls Released",
     "Costumed",
     "I See It Now",
@@ -250,14 +276,154 @@ const std::array<int, 7> kMixingRates = {
     44100,
 };
 
-const std::array<const char*, 6> kCreditsPages = {
-    "Acid Tetris\nCopyright 1997\nDungeon Dwellers Design",
-    "Programming:\nJason Pimble\nGraphics:\nScott Emerle",
-    "Music System:\nJean Paul Mikkers\nOrignal Concept\nDesign and Program By:\nAlexey Pazhitnov",
-    "Protected Mode Extender By:\nCharles Scheffold\nThomas Pytel",
-    "Music:\nChris Emerle\nScott Emerle\nLiam Hesse\nJon Dal Kristbjornsson\nBobby Tamburrino",
-    "Special Thanks To:\nPaul Mason\nCathleen Crandall\nJohn Hood",
-};
+// Credits: six pages of eight fixed row slots (0x4f38 copies 8 x 40 bytes per
+// page), blank slots included, and the copyright line keeps its trailing space.
+using CreditsPage = std::array<const char*, 8>;
+const std::array<CreditsPage, 6> kCreditsPages = {{
+    {"", "Acid Tetris", "", "Copyright 1997 ", "", "Dungeon Dwellers Design", "", ""},
+    {"", "Programming:", "Jason Pimble", "", "Graphics:", "Scott Emerle", "", ""},
+    {"", "Music System:", "Jean Paul Mikkers", "", "Orignal Concept", "Design and Program By:", "Alexey Pazhitnov", ""},
+    {"", "", "Protected Mode Extender By:", "", "Charles Scheffold", "Thomas Pytel", "", ""},
+    {"", "Music:", "Chris Emerle", "Scott Emerle", "Liam Hesse", "Jon Dal Kristbjornsson", "Bobby Tamburrino", ""},
+    {"", "Special Thanks To:", "", "Paul Mason", "Cathleen Crandall", "John Hood", "", ""},
+}};
+
+// Keyboard Setup key names: the original prints a 4-character name per scancode
+// (spaces included), indexed by the ISR code (E0 keys +0x80). Codes not listed
+// print four spaces.
+const char* KeyNameForCode(std::uint8_t code) {
+  switch (code) {
+    case 0x01: return "Esc ";
+    case 0x02: return " 1  ";
+    case 0x03: return " 2  ";
+    case 0x04: return " 3  ";
+    case 0x05: return " 4  ";
+    case 0x06: return " 5  ";
+    case 0x07: return " 6  ";
+    case 0x08: return " 7  ";
+    case 0x09: return " 8  ";
+    case 0x0A: return " 9  ";
+    case 0x0B: return " 0  ";
+    case 0x0C: return " -  ";
+    case 0x0D: return " =  ";
+    case 0x0E: return "BkSp";
+    case 0x0F: return "Tab ";
+    case 0x10: return " Q  ";
+    case 0x11: return " W  ";
+    case 0x12: return " E  ";
+    case 0x13: return " R  ";
+    case 0x14: return " T  ";
+    case 0x15: return " Y  ";
+    case 0x16: return " U  ";
+    case 0x17: return " I  ";
+    case 0x18: return " O  ";
+    case 0x19: return " P  ";
+    case 0x1A: return " [  ";
+    case 0x1B: return " ]  ";
+    case 0x1C: return "Entr";
+    case 0x1D: return "CtLt";
+    case 0x1E: return " A  ";
+    case 0x1F: return " S  ";
+    case 0x20: return " D  ";
+    case 0x21: return " F  ";
+    case 0x22: return " G  ";
+    case 0x23: return " H  ";
+    case 0x24: return " J  ";
+    case 0x25: return " K  ";
+    case 0x26: return " L  ";
+    case 0x27: return " ;  ";
+    case 0x28: return " '  ";
+    case 0x29: return " `  ";
+    case 0x2A: return "ShLt";
+    case 0x2B: return "   ";
+    case 0x2C: return " Z  ";
+    case 0x2D: return " X  ";
+    case 0x2E: return " C  ";
+    case 0x2F: return " V  ";
+    case 0x30: return " B  ";
+    case 0x31: return " N  ";
+    case 0x32: return " M  ";
+    case 0x33: return " ,  ";
+    case 0x34: return " .  ";
+    case 0x35: return " /  ";
+    case 0x36: return "ShRt";
+    case 0x37: return "* KP";
+    case 0x38: return "AtLt";
+    case 0x39: return "Spce";
+    case 0x3A: return "CapL";
+    case 0x3B: return " F1 ";
+    case 0x3C: return " F2 ";
+    case 0x3D: return " F3 ";
+    case 0x3E: return " F4 ";
+    case 0x3F: return " F5 ";
+    case 0x40: return " F6 ";
+    case 0x41: return " F7 ";
+    case 0x42: return " F8 ";
+    case 0x43: return " F9 ";
+    case 0x44: return "F10 ";
+    case 0x45: return "NmLk";
+    case 0x46: return "ScLk";
+    case 0x47: return "HmKP";
+    case 0x48: return "UpKP";
+    case 0x49: return "PUKP";
+    case 0x4A: return "- KP";
+    case 0x4B: return "LtKP";
+    case 0x4C: return "CnKP";
+    case 0x4D: return "RtKP";
+    case 0x4E: return "+ KP";
+    case 0x4F: return "EdKP";
+    case 0x50: return "DnKP";
+    case 0x51: return "PDKP";
+    case 0x52: return "InKP";
+    case 0x53: return "DlKP";
+    case 0x57: return "F11 ";
+    case 0x58: return "F12 ";
+    case 0xAA: return "PrSr";
+    case 0xB5: return "/ KP";
+    case 0xB8: return "AtRt";
+    case 0xC7: return "Home";
+    case 0xC8: return " Up ";
+    case 0xC9: return "PgUp";
+    case 0xCB: return "Left";
+    case 0xCD: return "Rght";
+    case 0xCF: return "End ";
+    case 0xD0: return "Down";
+    case 0xD1: return "PgDn";
+    case 0xD2: return "Inst";
+    case 0xD3: return "Del ";
+    case 0xDC: return "EnKP";
+    case 0xDD: return "CtRt";
+    default: return "    ";
+  }
+}
+
+// High-score name entry character tables (0x50b0 at 0x5502-0x55a1): T0 gates
+// which released keys type anything (lowercase), T1/T2 uppercase, T3 lowercase.
+// T1-T3 also map '.', which T0 never lets through.
+char NameEntryChar(int table, std::uint8_t code) {
+  static constexpr char kRow1[] = "1234567890";   // 0x02..0x0b
+  static constexpr char kRow2[] = "qwertyuiop";   // 0x10..0x19
+  static constexpr char kRow3[] = "asdfghjkl";    // 0x1e..0x26
+  static constexpr char kRow4[] = "zxcvbnm";      // 0x2c..0x32
+  char ch = 0;
+  if (code >= 0x02 && code <= 0x0B) {
+    ch = kRow1[code - 0x02];
+  } else if (code >= 0x10 && code <= 0x19) {
+    ch = kRow2[code - 0x10];
+  } else if (code >= 0x1E && code <= 0x26) {
+    ch = kRow3[code - 0x1E];
+  } else if (code >= 0x2C && code <= 0x32) {
+    ch = kRow4[code - 0x2C];
+  } else if (code == 0x39) {
+    ch = ' ';
+  } else if (code == 0x34 && table != 0) {
+    ch = '.';
+  }
+  if ((table == 1 || table == 2) && ch >= 'a' && ch <= 'z') {
+    ch = static_cast<char>(ch - 'a' + 'A');
+  }
+  return ch;
+}
 
 const std::array<const char*, 5> kKeyboardBindingLabels = {
     "Down",
@@ -496,6 +662,51 @@ std::array<int, 2048> BuildSineTable() {
   return table;
 }
 
+// The original's table, built at startup by 0x27b8: chop(sin(i * 0.0030679616) *
+// 32769.0) for i < 0x200 (the two doubles at 0x17ae8 / 0x17af0, truncated toward
+// zero by __CHP + FISTP), mirrored into 2048 entries; peak 32768. The pointfield
+// 0x39c4 and the row pulses 0x3fd8 / 0x5868 read this amplitude.
+std::array<int, 2048> BuildOriginalSineTable() {
+  std::array<int, 2048> table{};
+  constexpr double kStep = 0.0030679616;
+  constexpr double kAmplitude = 32769.0;
+  for (int index = 0; index < 0x200; ++index) {
+    const int value = static_cast<int>(std::trunc(std::sin(static_cast<double>(index) * kStep) * kAmplitude));
+    table[index] = value;
+    table[0x3FF - index] = value;
+    table[0x400 + index] = -value;
+    table[0x7FF - index] = -value;
+  }
+  return table;
+}
+
+// 32-bit helpers matching the original's IMUL / SAR / IDIV.
+inline std::int32_t Wrap32(std::int64_t value) {
+  return static_cast<std::int32_t>(static_cast<std::uint32_t>(static_cast<std::uint64_t>(value)));
+}
+inline std::int32_t Mul32(std::int32_t a, std::int32_t b) {
+  return Wrap32(static_cast<std::int64_t>(a) * static_cast<std::int64_t>(b));
+}
+inline std::int32_t Add32(std::int32_t a, std::int32_t b) {
+  return Wrap32(static_cast<std::int64_t>(a) + static_cast<std::int64_t>(b));
+}
+inline std::int32_t Sub32(std::int32_t a, std::int32_t b) {
+  return Wrap32(static_cast<std::int64_t>(a) - static_cast<std::int64_t>(b));
+}
+inline std::int32_t Shl32(std::int32_t a, int bits) {
+  return static_cast<std::int32_t>(static_cast<std::uint32_t>(a) << bits);
+}
+
+// VGA 6-bit DAC value to the port's 8-bit colour; must stay identical to
+// ScaleVga6 in atet_data.cpp (the palettes the textures were built with).
+inline Uint8 Expand6To8(int component6) {
+  return static_cast<Uint8>(std::lround((static_cast<double>(std::clamp(component6, 0, 63)) / 63.0) * 255.0));
+}
+// 0x284c: every 6-bit palette byte becomes (c * level) >> 6 (level = 64 - d).
+inline int ScaleDac6(int component6, int level) {
+  return (component6 * std::clamp(level, 0, 64)) >> 6;
+}
+
 std::uint8_t OriginalScancodeForKey(SDL_Keycode key) {
   switch (key) {
     case SDLK_ESCAPE:
@@ -568,8 +779,11 @@ std::uint8_t OriginalScancodeForKey(SDL_Keycode key) {
     case SDLK_L:
       return 0x26;
     case SDLK_LSHIFT:
-    case SDLK_RSHIFT:
       return 0x2A;
+    case SDLK_RSHIFT:
+      return 0x36;  // the ISR keeps right Shift as its own code (name entry case rule)
+    case SDLK_CAPSLOCK:
+      return 0x3A;  // released Caps Lock toggles the name-entry case flag
     case SDLK_Z:
       return 0x2C;
     case SDLK_X:
@@ -597,54 +811,23 @@ std::uint8_t OriginalScancodeForKey(SDL_Keycode key) {
       return 0xCD;
     case SDLK_DOWN:
       return 0xD0;
+    // Keypad arrows are distinct codes (no E0 prefix); the menus accept 0x48/0x50
+    // and Options 0x4B/0x4D besides the grey arrows.
+    case SDLK_KP_8:
+      return 0x48;
+    case SDLK_KP_2:
+      return 0x50;
+    case SDLK_KP_4:
+      return 0x4B;
+    case SDLK_KP_6:
+      return 0x4D;
     default:
       return 0;
   }
 }
 
 std::string KeyNameForBinding(std::uint8_t scan_code) {
-  switch (scan_code) {
-    case 0xCB:
-      return "Left";
-    case 0xCD:
-      return "Right";
-    case 0xC8:
-      return "Up";
-    case 0xD0:
-      return "Down";
-    case 0x39:
-      return "Space";
-    case 0x1C:
-      return "Enter";
-    case 0x0F:
-      return "Tab";
-    case 0x0E:
-      return "Backspace";
-    case 0x2A:
-      return "Shift";
-    case 0x1D:
-      return "Ctrl";
-    case 0x38:
-      return "Alt";
-    default:
-      if (scan_code >= 0x02 && scan_code <= 0x0B) {
-        constexpr std::array<char, 10> digits = {'1', '2', '3', '4', '5', '6', '7', '8', '9', '0'};
-        return std::string(1, digits[scan_code - 0x02]);
-      }
-      if (scan_code >= 0x10 && scan_code <= 0x19) {
-        constexpr std::array<char, 10> row = {'Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P'};
-        return std::string(1, row[scan_code - 0x10]);
-      }
-      if (scan_code >= 0x1E && scan_code <= 0x26) {
-        constexpr std::array<char, 9> row = {'A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L'};
-        return std::string(1, row[scan_code - 0x1E]);
-      }
-      if (scan_code >= 0x2C && scan_code <= 0x32) {
-        constexpr std::array<char, 7> row = {'Z', 'X', 'C', 'V', 'B', 'N', 'M'};
-        return std::string(1, row[scan_code - 0x2C]);
-      }
-      return "Key";
-  }
+  return KeyNameForCode(scan_code);
 }
 
 int GlyphCodeForCharacter(unsigned char ch) {
@@ -704,20 +887,6 @@ std::string FormatCounterValue(int value, int digits) {
   }
 
   return text;
-}
-
-std::string FormatPercentRow(const char* label, int value) {
-  return std::string(label) + std::to_string(std::clamp(value, 0, 100));
-}
-
-int MixingRateIndex(int rate_hz) {
-  for (size_t index = 0; index < kMixingRates.size(); ++index) {
-    if (kMixingRates[index] == rate_hz) {
-      return static_cast<int>(index);
-    }
-  }
-
-  return static_cast<int>(kMixingRates.size()) - 1;
 }
 
 void DrawTexture(SDL_Renderer* renderer, SDL_Texture* texture, int width, int height) {
@@ -872,6 +1041,7 @@ bool MilestoneADemo::Initialize(SDL_Renderer* renderer, std::string* error_out, 
   // ATETRIS.ZIP, ATET.DAT extracted via miniz), first next to the executable
   // (portable / release layout, robust to the build machine's drive letter), then
   // the working directory, then the build-tree ATET.DAT as a dev fallback.
+  const Uint64 audit_t_data = SDL_GetPerformanceCounter();
   std::string dat_error = "not found";
   bool loaded = false;
   std::vector<std::string> search_dirs;
@@ -892,6 +1062,7 @@ bool MilestoneADemo::Initialize(SDL_Renderer* renderer, std::string* error_out, 
           atet_data_.LoadFromDat(bytes, &dat_error)) {
         loaded = true;
         found = true;
+        g_audit_startup.data_source = dir + dat_name;
         break;
       }
     }
@@ -904,6 +1075,7 @@ bool MilestoneADemo::Initialize(SDL_Renderer* renderer, std::string* error_out, 
       if (ReadBinaryAsset((dir + archive_name).c_str(), &bytes, &ignored) &&
           atet_data_.LoadFromZip(bytes, &dat_error)) {
         loaded = true;
+        g_audit_startup.data_source = dir + archive_name;
         break;
       }
     }
@@ -917,8 +1089,11 @@ bool MilestoneADemo::Initialize(SDL_Renderer* renderer, std::string* error_out, 
     if (ReadBinaryAsset(ATET_PORT_ATET_DAT_PATH, &bytes, &ignored) &&
         atet_data_.LoadFromDat(bytes, &dat_error)) {
       loaded = true;
+      g_audit_startup.data_source = std::string("compiled-fallback:") + ATET_PORT_ATET_DAT_PATH;
     }
   }
+  g_audit_startup.data_ticks = SDL_GetPerformanceCounter() - audit_t_data;
+  const Uint64 audit_t_textures = SDL_GetPerformanceCounter();
   if (!loaded) {
     SetErrorMessage(error_out,
                     "Could not load the game data (" + dat_error +
@@ -957,6 +1132,8 @@ bool MilestoneADemo::Initialize(SDL_Renderer* renderer, std::string* error_out, 
     }
   }
 
+  g_audit_startup.textures_ticks = SDL_GetPerformanceCounter() - audit_t_textures;
+  const Uint64 audit_t_tables = SDL_GetPerformanceCounter();
   if (!LoadFrontendFont(error_out)) {
     return false;
   }
@@ -968,17 +1145,48 @@ bool MilestoneADemo::Initialize(SDL_Renderer* renderer, std::string* error_out, 
   if (!LoadGameplayParticleAssets(error_out)) {
     return false;
   }
+  g_audit_startup.tables_ticks = SDL_GetPerformanceCounter() - audit_t_tables;
+  const Uint64 audit_t_setup = SDL_GetPerformanceCounter();
 
   scene_ = Scene::kFrontend;
-  SetFrontendView(FrontendView::kMainMenu, 0);
+  frontend_view_ = FrontendView::kMainMenu;
+  frontend_selected_row_ = 0;
   gameplay_preset_index_ = 0;
   keyboard_capture_row_ = -1;
   held_original_scancodes_.fill(false);
   held_original_scancode_frames_.fill(0);
-  high_score_entry_row_ = -1;
-  high_score_entry_name_.clear();
-  high_score_entry_lowercase_ = false;
-  high_score_entry_commit_pending_ = false;
+  // Frontend flow state. ticks_ is the PIT tick counter [0x2d2a3]; the timer is
+  // installed just before the first splash, so the splash t0 is tick 0.
+  ticks_ = 0;
+  release_fifo_.fill(0);
+  flow_phase_ = FlowPhase::kNone;
+  flow_exit_ = FlowExit::kNone;
+  menu_pending_ = 0;
+  screen_exit_ = false;
+  main_menu_row_ = 0;      // 0x5f78 (0x5fcb): [0x1886f] = 0 at boot
+  pulse_phase_ = 0;        // [0x1990f] and [0x19913] are BSS
+  entry_pulse_phase_ = 0;
+  row_text_.fill(std::string());
+  row_amount_.fill(0);
+  frontend_burst_ = 0;
+  state9_pending_ = false;
+  music_freeze_left_ = 0;
+  esc_hold_ticks_ = 0;
+  setup_dirty_ = false;
+  title_level_ = 0;
+  hs_mode_ = 0;
+  hs_slot_ = -1;
+  hs_stage_ = 0;
+  hs_buffer_.clear();
+  hs_len_ = 0;
+  hs_caps_ = false;
+  hs_commit_ = false;
+  hs_done_ = false;
+  // main 0x150: rng_table_fill runs srand([0x2d2a3]) before the PIT is installed
+  // (0x16d), so the table is always seeded with 0 at boot; 0x5fd8 -> 0x5ef4 then
+  // picks the first pointfield bank with rng_next() % 8 (= 5).
+  SeedBootRandomTable();
+  InitFrontendPointfield();
   top_out_handoff_pending_ = false;
   top_out_frame_ = 0;
   top_out_score_ = 0;
@@ -1006,8 +1214,6 @@ bool MilestoneADemo::Initialize(SDL_Renderer* renderer, std::string* error_out, 
   last_clear_was_four_ = false;
   sleepy_ = false;
   frames_since_clear_ = 0;
-  high_score_bootstrap_frames_ = 0;
-  high_score_conceal_frames_ = 0;
   audio_events_.clear();
   line_clear_demo_count_ = 0;
   ResetSetupStateToDefaults();
@@ -1018,14 +1224,16 @@ bool MilestoneADemo::Initialize(SDL_Renderer* renderer, std::string* error_out, 
     PersistSetupState();
   }
   if (start_in_sound_setup || !loaded_setup) {
-    SetFrontendView(FrontendView::kSoundSetup, 0);
-    scene_ = Scene::kFrontend;
+    // main 0x172-0x17c: 0x3830(5) right after the timer starts, before sound
+    // init and the splashes: the dispatcher entry runs over a black screen.
+    BeginDispatcherEntry(5, FrozenSource::kBlack);
   } else {
     BeginStartupSplashes();
   }
   if (error_out != nullptr) {
     error_out->clear();
   }
+  g_audit_startup.setup_ticks = SDL_GetPerformanceCounter() - audit_t_setup;
 
   return true;
 }
@@ -1040,19 +1248,44 @@ void MilestoneADemo::ResetBuildLocalSetupState() {
 }
 
 bool MilestoneADemo::HandleKeyDown(SDL_Keycode key) {
-  // Input is blocked while a gameplay<->frontend screen fade is in progress.
-  if (screen_fade_ != ScreenFade::kNone) {
-    return false;
-  }
+  // The keyboard ISR 0x800 records every make code whatever the game is doing
+  // (splashes, palette fades, reveals), so the held table is always updated.
   TrackKeyDown(key);
 
-  if (scene_ == Scene::kSplash) {
-    if (key == SDLK_RETURN || key == SDLK_SPACE || key == SDLK_ESCAPE || key == SDLK_BACKSPACE) {
-      splash_frame_ = kSplashPageFrames - 1;
-      AdvanceSplashTimers();
+  // Developer scene shortcuts (not in the original): opt-in with --debug.
+  if (debug_keys_enabled_ && scene_ != Scene::kTopOut && frontend_view_ != FrontendView::kHighScoreEntry) {
+    if (key == SDLK_TAB) {
+      if (scene_ == Scene::kGameplay) {
+        scene_ = Scene::kFrontend;
+        StartScreen(1);
+      } else {
+        scene_ = Scene::kGameplay;
+        flow_phase_ = FlowPhase::kNone;
+      }
       return true;
     }
-    return false;
+    if (key == SDLK_T) {
+      scene_ = Scene::kFrontend;
+      StartScreen(1);
+      return true;
+    }
+    if (key == SDLK_G) {
+      if (!live_game_available_) {
+        ResetLiveGameplayState();
+        live_game_available_ = true;
+      }
+      live_game_active_ = true;
+      scene_ = Scene::kGameplay;
+      flow_phase_ = FlowPhase::kNone;
+      return true;
+    }
+    if (key >= SDLK_1 && key <= SDLK_3) {
+      gameplay_preset_index_ = static_cast<int>(key - SDLK_1);
+      live_game_active_ = false;
+      scene_ = Scene::kGameplay;
+      flow_phase_ = FlowPhase::kNone;
+      return true;
+    }
   }
 
   if (scene_ == Scene::kTopOut) {
@@ -1073,53 +1306,10 @@ bool MilestoneADemo::HandleKeyDown(SDL_Keycode key) {
     return false;
   }
 
-  if (scene_ == Scene::kFrontend && frontend_view_ == FrontendView::kKeyboardSetup &&
-      keyboard_capture_row_ >= 0) {
-    const std::uint8_t original_scancode = OriginalScancodeForKey(key);
-    if (key == SDLK_UNKNOWN || original_scancode == 0 || original_scancode == 0x01) {
-      return true;
-    }
-
-    CaptureKeyboardBinding(original_scancode);
-    return true;
-  }
-
-  if (scene_ == Scene::kFrontend && frontend_view_ == FrontendView::kHighScoreEntry) {
-    return HandleHighScoreNameEntry(key);
-  }
-
-  if (key == SDLK_TAB) {
-    scene_ = (scene_ == Scene::kFrontend) ? Scene::kGameplay : Scene::kFrontend;
-    return true;
-  }
-
-  if (key == SDLK_T) {
-    scene_ = Scene::kFrontend;
-    SetFrontendView(FrontendView::kMainMenu, 0);
-    return true;
-  }
-
-  if (key == SDLK_G) {
-    if (!live_game_available_) {
-      ResetLiveGameplayState();
-      live_game_available_ = true;
-    }
-    live_game_active_ = true;
-    scene_ = Scene::kGameplay;
-    return true;
-  }
-
-  if (key >= SDLK_1 && key <= SDLK_3) {
-    gameplay_preset_index_ = static_cast<int>(key - SDLK_1);
-    live_game_active_ = false;
-    scene_ = Scene::kGameplay;
-    return true;
-  }
-
-  if (scene_ == Scene::kGameplay) {
+  if (scene_ == Scene::kGameplay && flow_phase_ == FlowPhase::kNone) {
+    // In play Esc acts on its RELEASE (main 0x4a3: newest release == 0x01),
+    // checked once per tick in Tick(); the press itself does nothing.
     if (key == SDLK_ESCAPE) {
-      SaveLiveSnapshot();
-      BeginSceneFade(PendingScene::kFrontendFromGameplay);
       return true;
     }
     if (key == SDLK_H) {
@@ -1147,92 +1337,38 @@ bool MilestoneADemo::HandleKeyDown(SDL_Keycode key) {
     return false;
   }
 
-  if (frontend_view_ == FrontendView::kHighScores) {
-    if (key == SDLK_RETURN || key == SDLK_ESCAPE || key == SDLK_BACKSPACE) {
-      const std::vector<std::string> rows = CurrentFrontendRows();
-      if (RevealedFrontendRowCount(rows.size()) >= static_cast<int>(rows.size())) {
-        BeginHighScoreConcealToMain();
-      }
-      return true;
-    }
-    return false;
-  }
-
-  if (frontend_view_ == FrontendView::kCredits) {
-    if (key == SDLK_RIGHT || key == SDLK_DOWN || key == SDLK_RETURN) {
-      credits_page_ = (credits_page_ + 1) % static_cast<int>(kCreditsPages.size());
-      credits_page_timer_ = 0;
-      return true;
-    }
-    if (key == SDLK_LEFT || key == SDLK_UP) {
-      credits_page_ = (credits_page_ + static_cast<int>(kCreditsPages.size()) - 1) %
-                      static_cast<int>(kCreditsPages.size());
-      credits_page_timer_ = 0;
-      return true;
-    }
-    if (key == SDLK_ESCAPE || key == SDLK_BACKSPACE) {
-      SetFrontendView(FrontendView::kMainMenu, 0);
-      return true;
-    }
-    return false;
-  }
-
-  if (key == SDLK_UP) {
-    MoveFrontendSelection(-1);
-    return true;
-  }
-
-  if (key == SDLK_DOWN) {
-    MoveFrontendSelection(1);
-    return true;
-  }
-
-  if (key == SDLK_LEFT || key == SDLK_RIGHT) {
-    return ApplyFrontendHorizontalEdit(key == SDLK_LEFT ? -1 : 1, true);
-  }
-
-  if (key == SDLK_RETURN) {
-    ActivateFrontendSelection();
-    return true;
-  }
-
-  if (key == SDLK_ESCAPE || key == SDLK_BACKSPACE) {
-    if (frontend_view_ == FrontendView::kMainMenu) {
-      quit_requested_ = true;
-    } else if (frontend_view_ == FrontendView::kSoundSetup) {
-      BeginStartupSplashes();
-    } else if (frontend_view_ == FrontendView::kKeyboardSetup) {
-      SetFrontendView(FrontendView::kOptions, 2);
-    } else {
-      SetFrontendView(FrontendView::kMainMenu, 0);
-    }
-    return true;
-  }
-
-  return false;
+  // Splashes and every frontend screen read the release history and the held
+  // table once per logic tick (Tick); a key-down never acts by itself.
+  return true;
 }
 
 void MilestoneADemo::HandleKeyUp(SDL_Keycode key) {
   TrackKeyUp(key);
+  PushRelease(OriginalScancodeForKey(key));
   if (scene_ == Scene::kTopOut && IsTopOutAdvanceKey(key) && top_out_handoff_pending_) {
     top_out_handoff_pending_ = false;
     BeginHighScoreNameEntry(top_out_score_, top_out_lines_);
-    return;
-  }
-  if (scene_ == Scene::kFrontend && frontend_view_ == FrontendView::kHighScoreEntry &&
-      key == SDLK_RETURN && high_score_entry_commit_pending_) {
-    CommitHighScoreNameEntry();
   }
 }
 
-void MilestoneADemo::Tick() {
-  // While a screen fade is in progress the original busy-waits on the timer and
-  // does not advance game logic; freeze everything except the fade (and audio
-  // delivery) until it completes.
-  if (screen_fade_ != ScreenFade::kNone) {
-    AdvanceScreenFade();
-    FlushAudioEvents();
+void MilestoneADemo::PushRelease(std::uint8_t original_scancode) {
+  // ISR 0x800: a break code (0xAA, the fake shift, is dropped) shifts the
+  // 32-byte history down and stores the code at the newest slot [31].
+  if (original_scancode == 0 || original_scancode == 0xAA) {
     return;
+  }
+  std::copy(release_fifo_.begin() + 1, release_fifo_.end(), release_fifo_.begin());
+  release_fifo_[31] = original_scancode;
+}
+
+void MilestoneADemo::Tick() {
+  // One logic tick of the PIT clock ([0x2d2a3] = step + 1).
+  ++ticks_;
+
+  if (state9_pending_) {
+    // Game over -> 0x3830(9), requested by the top-out code since the last tick.
+    state9_pending_ = false;
+    BeginDispatcherEntry(9, state9_source_);
   }
 
   for (size_t scan_code = 0; scan_code < held_original_scancodes_.size(); ++scan_code) {
@@ -1243,21 +1379,40 @@ void MilestoneADemo::Tick() {
     ++held_original_scancode_frames_[scan_code];
   }
 
-  if (scene_ == Scene::kFrontend &&
-      (frontend_view_ == FrontendView::kOptions || frontend_view_ == FrontendView::kSoundSetup)) {
-    const bool left_held = held_original_scancodes_[0xCB];
-    const bool right_held = held_original_scancodes_[0xCD];
-    if (left_held != right_held) {
-      const std::uint8_t scan_code = left_held ? 0xCB : 0xCD;
-      const int frames = held_original_scancode_frames_[scan_code];
-      if (frames >= kFrontendHoldStartFrames &&
-          (frames - kFrontendHoldStartFrames) % kFrontendHoldRepeatFrames == 0) {
-        ApplyFrontendHorizontalEdit(left_held ? -1 : 1, false);
+  if (scene_ == Scene::kSplash || scene_ == Scene::kFrontend) {
+    // A stale pacer base (0x24d0) makes the frame after a busy wait run the
+    // capped 6 logic ticks; the music-row freeze and the high-score Esc hold
+    // arm frontend_burst_ for the step that follows them.
+    const int runs = std::max(1, frontend_burst_);
+    frontend_burst_ = 0;
+    for (int run = 0; run < runs; ++run) {
+      TickFrontendOnce(run == 0);
+      // A screen loop that sets its exit flag (a gate returned 1) is left at once:
+      // the rest of the catch-up batch is not run.
+      if (scene_ == Scene::kGameplay || quit_requested_ || screen_exit_) {
+        break;
       }
     }
+    if (scene_ != Scene::kGameplay) {
+      FlushAudioEvents();
+      return;
+    }
+    // The dispatcher exit finished in this tick: main's session loop runs its
+    // first gameplay step in the same tick (0x488 / 0x4db), so fall through.
   }
 
   if (scene_ != Scene::kGameplay) {
+    FlushAudioEvents();
+    return;
+  }
+
+  // main 0x4a3-0x4d6: a released Esc (the newest entry of the release history)
+  // clears the history and enters the frontend (state 1) before any game logic
+  // of this tick runs.
+  if (PeekRelease() == 0x01) {
+    ClearReleases();
+    SaveLiveSnapshot();
+    BeginDispatcherEntry(1, FrozenSource::kGameplay);
     FlushAudioEvents();
     return;
   }
@@ -1285,22 +1440,33 @@ void MilestoneADemo::Tick() {
 }
 
 void MilestoneADemo::Render(SDL_Renderer* renderer) {
-  if (scene_ == Scene::kSplash) {
-    RenderSplash(renderer);
-    return;
-  }
-
   if (scene_ == Scene::kTopOut) {
     RenderTopOut(renderer);
     return;
   }
 
-  if (scene_ == Scene::kFrontend) {
-    RenderFrontend(renderer);
+  if (scene_ == Scene::kGameplay) {
+    RenderGameplay(renderer);
     return;
   }
 
-  RenderGameplay(renderer);
+  switch (flow_phase_) {
+    case FlowPhase::kSplash:
+      RenderSplash(renderer);
+      return;
+    case FlowPhase::kBootGap:
+      return;  // VRAM cleared: black
+    case FlowPhase::kEntryPaletteOut:
+    case FlowPhase::kExitPaletteIn:
+      if (frozen_capture_pending_) {
+        CaptureFrozenPicture(renderer);
+      }
+      RenderFrozenPicture(renderer, CurrentFrozenLevel());
+      return;
+    default:
+      RenderFrontend(renderer);
+      return;
+  }
 }
 
 bool MilestoneADemo::CaptureGameplaySnapshot(SDL_Renderer* renderer) {
@@ -1327,6 +1493,17 @@ bool MilestoneADemo::CaptureGameplaySnapshot(SDL_Renderer* renderer) {
 }
 
 void MilestoneADemo::Shutdown() {
+  // Edits are saved where the original saves (frontend exit, Exit Game); a window
+  // close has no DOS counterpart, so pending edits are flushed here instead of lost.
+  if (setup_dirty_) {
+    setup_dirty_ = false;
+    PersistSetupState();
+  }
+  if (frozen_texture_ != nullptr) {
+    SDL_DestroyTexture(frozen_texture_);
+    frozen_texture_ = nullptr;
+  }
+  frozen_texture_level_ = -1;
   const std::array<TextureAsset*, 8> textures = {
       &ddd_splash_,
       &warning_splash_,
@@ -1428,10 +1605,10 @@ std::string MilestoneADemo::debug_state_line() const {
          << " collapse=" << collapse_frame_
          << " topout=" << top_out_frame_
          << " front=" << frontend_view_frame_
-         << " hsboot=" << HighScoreBootstrapRemainingFrames()
-         << " rows=" << (scene_ == Scene::kFrontend ? VisibleFrontendRowCount(CurrentFrontendRows().size()) : 0)
-         << " conceal=" << high_score_conceal_frames_
-         << " commit=" << (high_score_entry_commit_pending_ ? 1 : 0)
+         << " hsboot=0"
+         << " rows=" << (scene_ == Scene::kFrontend ? VisibleRowCount() : 0)
+         << " conceal=" << (flow_phase_ == FlowPhase::kConceal ? kRevealSteps - flow_step_ : 0)
+         << " commit=" << (hs_commit_ ? 1 : 0)
          << " warning=" << warning_band_
          << " alert=" << alert_effect_id_
          << " pulse=" << PulseRevealAmount()
@@ -1439,8 +1616,20 @@ std::string MilestoneADemo::debug_state_line() const {
          << " sleepy=" << (sleepy_ ? 1 : 0)
          << " snapshot=" << (gameplay_snapshot_texture_valid_ ? 1 : 0)
          << " savedunder=" << (top_out_saved_under_valid_ ? 1 : 0)
-         << " fade=" << (screen_fade_ == ScreenFade::kOut ? "out" : screen_fade_ == ScreenFade::kIn ? "in" : "none")
-         << ":" << screen_fade_frame_;
+         << " fade="
+         << (flow_phase_ == FlowPhase::kEntryPaletteOut ? "pal-out"
+             : flow_phase_ == FlowPhase::kEntryTitleIn  ? "title-in"
+             : flow_phase_ == FlowPhase::kExitTitleOut  ? "title-out"
+             : flow_phase_ == FlowPhase::kExitPaletteIn ? "pal-in"
+             : flow_phase_ == FlowPhase::kQuitTitleOut  ? "quit-out"
+                                                        : "none")
+         << ":" << FlowFadeE()
+         << " flow=" << FlowPhaseName()
+         << " sel=" << (frontend_view_ == FrontendView::kMainMenu ? main_menu_row_ : frontend_selected_row_)
+         << " pend=" << menu_pending_
+         << " phase0x=" << std::hex << pulse_phase_ << std::dec
+         << " tlevel=" << CurrentTitleLevel()
+         << " tick=" << ticks_;
   return stream.str();
 }
 
@@ -1493,6 +1682,11 @@ bool MilestoneADemo::LoadFrontendFont(std::string* error_out) {
   }
 
   sine_table_ = BuildSineTable();
+  original_sine_table_ = BuildOriginalSineTable();
+  scaled_title_palette_ = title_palette_;
+  rendered_title_level_ = 64;  // the textures were built at the full palette
+  rendered_splash_page_ = -1;
+  rendered_splash_level_ = -1;
   return true;
 }
 
@@ -1525,11 +1719,7 @@ bool MilestoneADemo::LoadFrontendPointfield(std::string* error_out) {
     }
   }
 
-  frontend_pointfield_state_ = FrontendPointfieldState{};
-  frontend_current_bank_ = 2;
-  frontend_next_bank_ = 0;
-  frontend_cycle_counter_ = 0;
-  frontend_frame_counter_ = 0;
+  // The 0x5ef4 state init (bank choice from the RNG) runs in InitFrontendPointfield.
   return true;
 }
 
@@ -1668,12 +1858,18 @@ bool MilestoneADemo::RenderGameplayToTexture(SDL_Renderer* renderer, SDL_Texture
 }
 
 void MilestoneADemo::RenderSplash(SDL_Renderer* renderer) {
+  // 0x2998 copies the picture into the displayed page while the palette is black
+  // and then only reprograms the DAC: the picture at the current palette level.
+  const int level = CurrentSplashLevel();
+  if (level <= 0) {
+    return;
+  }
+  EnsureSplashLevel(splash_page_, level);
   if (splash_page_ == 0) {
     DrawTexture(renderer, ddd_splash_.texture, ddd_splash_.width, ddd_splash_.height);
   } else {
     DrawTexture(renderer, warning_splash_.texture, warning_splash_.width, warning_splash_.height);
   }
-  AdvanceSplashTimers();
 }
 
 void MilestoneADemo::RenderTopOutBackdrop(SDL_Renderer* renderer) {
@@ -1788,127 +1984,67 @@ void MilestoneADemo::RenderTopOut(SDL_Renderer* renderer) {
 }
 
 void MilestoneADemo::RenderFrontend(SDL_Renderer* renderer) {
+  // Work buffer = title base + text rows; the chunk-7 points are drawn with
+  // set-if-empty after the text. All of it uses the title palette at the level
+  // the last object fade left (62/64 at rest, 0x63b8's final upload).
+  EnsureTitleLevel(CurrentTitleLevel());
   DrawTexture(renderer, title_screen_.texture, title_screen_.width, title_screen_.height);
   RenderFrontendPointfield(renderer);
-
-  const std::vector<std::string> rows = CurrentFrontendRows();
-  int selected_row = -1;
-  if (frontend_view_ == FrontendView::kMainMenu || frontend_view_ == FrontendView::kOptions ||
-      frontend_view_ == FrontendView::kKeyboardSetup || frontend_view_ == FrontendView::kSoundSetup) {
-    selected_row = frontend_selected_row_;
-  } else if (frontend_view_ == FrontendView::kHighScores && !rows.empty()) {
-    selected_row = static_cast<int>(rows.size()) - 1;
-  }
-
-  RenderFrontendRows(renderer, rows, selected_row);
-  // The chunk-7 objects keep animating during a screen fade (RenderFrontendPointfield
-  // above advances them, matching 0x62e0/0x63b8), but the reveal/menu timers are
-  // frozen while the fade runs so the rows appear only after the fade-in
-  // completes (the original runs the object fade first, then the menu loop).
-  if (screen_fade_ == ScreenFade::kNone) {
-    AdvanceFrontendTimers();
-  }
+  RenderFrontendRows(renderer);
 }
 
 void MilestoneADemo::RenderFrontendPointfield(SDL_Renderer* renderer) {
-  if (frontend_banks_[frontend_current_bank_].empty() || frontend_banks_[frontend_next_bank_].empty()) {
-    return;
+  AuditScopedTicks audit_ticks(&g_audit.pointfield_ticks);
+  if (frontend_frame_counter_ <= 0) {
+    return;  // 0x39c4 has not run yet: nothing projected
   }
-
-  const std::vector<FrontendPoint>& current_bank = frontend_banks_[frontend_current_bank_];
-  const std::vector<FrontendPoint>& next_bank = frontend_banks_[frontend_next_bank_];
-  const int morph_progress =
-      std::clamp(frontend_cycle_counter_ - kFrontendSteadyFrames, 0, kFrontendMorphFrames);
   std::vector<Uint8> occupied(kScreenWidth * kScreenHeight);
-  const std::int64_t sin_xy = sine_table_[frontend_pointfield_state_.angle_xy & 0x7FF] >> 4;
-  const std::int64_t cos_xy = sine_table_[(frontend_pointfield_state_.angle_xy + 0x200) & 0x7FF] >> 4;
-  const std::int64_t sin_z = sine_table_[frontend_pointfield_state_.angle_z & 0x7FF] >> 4;
-  const std::int64_t cos_z = sine_table_[(frontend_pointfield_state_.angle_z + 0x200) & 0x7FF] >> 4;
-
-  for (int point_index = 0; point_index < kFrontendRecordCount; ++point_index) {
-    FrontendPoint active_point = current_bank[point_index];
-    if (morph_progress > 0) {
-      const FrontendPoint& target_point = next_bank[point_index];
-      active_point.x += TruncDiv(static_cast<std::int64_t>(target_point.x - active_point.x) * morph_progress, 128);
-      active_point.y += TruncDiv(static_cast<std::int64_t>(target_point.y - active_point.y) * morph_progress, 128);
-      active_point.z += TruncDiv(static_cast<std::int64_t>(target_point.z - active_point.z) * morph_progress, 128);
-    }
-
-    const std::int64_t rotated = (cos_xy * active_point.x - sin_xy * active_point.y) >> 11;
-    const std::int64_t depth_y = sin_xy * active_point.x + cos_xy * active_point.y;
-    const std::int64_t projected_x_num = cos_z * rotated - sin_z * active_point.z + frontend_pointfield_state_.origin_x;
-    const std::int64_t projected_y_num = depth_y + frontend_pointfield_state_.origin_y;
-    const std::int64_t depth = active_point.z * cos_z + rotated * sin_z + frontend_pointfield_state_.origin_z;
-    const std::int64_t denominator = (depth + 0x14000000) >> 9;
-    if (denominator == 0) {
+  for (const ProjectedPoint& point : frontend_projected_) {
+    if (!point.valid) {
       continue;
     }
-
-    const int screen_x = TruncDiv(projected_x_num, denominator) + 0xA0;
-    const int screen_y = TruncDiv(projected_y_num, denominator) + 0x78;
-    if (screen_x < 0 || screen_x >= kScreenWidth || screen_y < 0 || screen_y >= kScreenHeight) {
+    // pix_set_if_empty (0x175c5): clipped to 320x240, drawn only on a pixel that is
+    // still 0 (title background or an earlier point); text drawn afterwards covers
+    // points exactly where a glyph pixel is non-zero, as in the work buffer.
+    if (point.x < 0 || point.x >= kScreenWidth || point.y < 0 || point.y >= kScreenHeight) {
       continue;
     }
-
-    const size_t screen_index = static_cast<size_t>(screen_y) * kScreenWidth + screen_x;
+    const size_t screen_index = static_cast<size_t>(point.y) * kScreenWidth + point.x;
     if (occupied[screen_index] || (!title_indices_.empty() && title_indices_[screen_index] != 0)) {
       continue;
     }
-
-    int shade = static_cast<int>(((denominator << 9) - 0x14000000) >> 23);
-    shade = std::clamp(shade, 0, 15);
-    const int color_index = std::clamp(kFrontendPointColorBase - shade, 0, 255);
-    const SDL_Color color = title_palette_[color_index];
+    const SDL_Color color = scaled_title_palette_[static_cast<size_t>(std::clamp(point.color, 0, 255))];
     SDL_SetRenderDrawColor(renderer, color.r, color.g, color.b, SDL_ALPHA_OPAQUE);
     const SDL_FRect point_rect = {
-        static_cast<float>(screen_x),
-        static_cast<float>(screen_y),
+        static_cast<float>(point.x),
+        static_cast<float>(point.y),
         1.0f,
         1.0f,
     };
     SDL_RenderFillRect(renderer, &point_rect);
     occupied[screen_index] = 1;
+    ++g_audit.pointfield_points;
   }
-
-  AdvanceFrontendPointfield();
 }
 
-void MilestoneADemo::RenderFrontendRows(
-    SDL_Renderer* renderer,
-    const std::vector<std::string>& rows,
-    int selected_row) const {
-  const int revealed_rows = VisibleFrontendRowCount(rows.size());
-  const bool steady_selection_pulse = revealed_rows >= static_cast<int>(rows.size());
+void MilestoneADemo::RenderFrontendRows(SDL_Renderer* renderer) const {
+  AuditScopedTicks audit_ticks(&g_audit.frontend_rows_ticks);
   const bool high_score_table =
       frontend_view_ == FrontendView::kHighScores || frontend_view_ == FrontendView::kHighScoreEntry;
-  for (size_t row_index = 0; row_index < rows.size(); ++row_index) {
-    if (static_cast<int>(row_index) >= revealed_rows || rows[row_index].empty()) {
+  for (int row = 0; row < kFrontendRowCount; ++row) {
+    const int amount = row_amount_[static_cast<size_t>(row)];
+    if (amount <= 0) {
+      continue;  // 0x60cc with amount 0 clears the row cell
+    }
+    const int y = kFrontendRowY + row * kFrontendRowStep;
+    if (high_score_table && row < 5) {
+      // 0x50b0 / 0x5868: name, score and lines, each centred on its column.
+      RenderFrontendText(renderer, row_text_[static_cast<size_t>(row)], kHiscoreNameCenterX, y, amount);
+      RenderFrontendText(renderer, hs_score_text_[static_cast<size_t>(row)], kHiscoreScoreCenterX, y, amount);
+      RenderFrontendText(renderer, hs_lines_text_[static_cast<size_t>(row)], kHiscoreLinesCenterX, y, amount);
       continue;
     }
-
-    const int reveal_amount =
-        steady_selection_pulse && static_cast<int>(row_index) == selected_row ? PulseRevealAmount() : 0x30;
-    const int y = kFrontendRowY + static_cast<int>(row_index) * kFrontendRowStep;
-
-    // High-score score rows draw as three aligned columns (name left, score and
-    // lines right) instead of a single centered string, matching the original.
-    // A left-align at X uses center_x = X + w/2; a right-align at X, X - w/2.
-    if (high_score_table && row_index < high_scores_.size()) {
-      const HighScoreRecord& record = high_scores_[row_index];
-      std::string name = record.name.empty() ? "Nobody" : record.name;
-      if (frontend_view_ == FrontendView::kHighScoreEntry &&
-          static_cast<int>(row_index) == high_score_entry_row_ && HighScoreEntryInputReady()) {
-        name = high_score_entry_name_.empty() ? "_" : high_score_entry_name_ + "_";
-      }
-      const std::string score = std::to_string(record.score);
-      const std::string lines = std::to_string(record.lines);
-      RenderFrontendText(renderer, name, kHiscoreNameLeftX + MeasureFrontendText(name) / 2, y, reveal_amount);
-      RenderFrontendText(renderer, score, kHiscoreScoreRightX - MeasureFrontendText(score) / 2, y, reveal_amount);
-      RenderFrontendText(renderer, lines, kHiscoreLinesRightX - MeasureFrontendText(lines) / 2, y, reveal_amount);
-      continue;
-    }
-
-    RenderFrontendText(renderer, rows[row_index], kFrontendTextCenterX, y, reveal_amount);
+    RenderFrontendText(renderer, row_text_[static_cast<size_t>(row)], kFrontendTextCenterX, y, amount);
   }
 }
 
@@ -1932,12 +2068,16 @@ void MilestoneADemo::RenderFrontendText(
     }
 
     const int glyph_index = glyph_code - 1;
+    // 0x60cc 0x617a: the '_' cursor glyph (0x42) is skipped while bit 4 of the
+    // tick counter is set (16 ticks shown, 16 hidden); x still advances.
+    if (glyph_code == 0x42 && (ticks_ & 0x10U) != 0) {
+      cursor_x += frontend_font_widths_[glyph_index] + 2;
+      continue;
+    }
     const int atlas_x = (glyph_index % kFrontendGlyphAtlasColumns) * kFrontendGlyphWidth;
     const int atlas_y = (glyph_index / kFrontendGlyphAtlasColumns) * kFrontendGlyphHeight;
     // 0x60cc renders into a fixed 16-row (kFrontendRenderHeight) window at the row's
-    // y, bottom-anchored. The pulse reveal never exceeds 0x40 (a 16px row), so the
-    // tallest breath exactly fills this window -- no clipping and, since 16 < the 17px
-    // row pitch, no overlap with the neighbouring rows.
+    // y, bottom-anchored (0x178b0 sampling). The pulse never exceeds 0x40 (16 px).
     for (int dest_row = 0; dest_row < kFrontendRenderHeight; ++dest_row) {
       const int sample_row = ((kFrontendRenderHeight - 1 - dest_row) * step) >> 16;
       if (sample_row < 0 || sample_row >= kFrontendGlyphHeight) {
@@ -1957,65 +2097,1436 @@ void MilestoneADemo::RenderFrontendText(
           1.0f,
       };
       SDL_RenderTexture(renderer, frontend_font_atlas_.texture, &source, &destination);
+      ++g_audit.glyph_row_draws;
     }
 
     cursor_x += frontend_font_widths_[glyph_index] + 2;
   }
 }
 
-void MilestoneADemo::AdvanceFrontendPointfield() {
-  frontend_pointfield_state_.origin_x += static_cast<std::int64_t>(sine_table_[frontend_pointfield_state_.phase_x & 0x7FF]) << 3;
-  frontend_pointfield_state_.origin_y += static_cast<std::int64_t>(sine_table_[frontend_pointfield_state_.phase_y & 0x7FF]) << 2;
-  frontend_pointfield_state_.origin_z += static_cast<std::int64_t>(sine_table_[frontend_pointfield_state_.phase_z & 0x7FF]) << 4;
+// ---------------------------------------------------------------------------
+// Palette levels (0x284c scaling) for the title, the splashes and the frozen
+// gameplay picture.
 
-  const int angle_xy_delta = sine_table_[frontend_pointfield_state_.angle_xy & 0x7FF] >> 14;
-  const int angle_z_delta = sine_table_[frontend_pointfield_state_.angle_z & 0x7FF] >> 14;
-  frontend_pointfield_state_.phase_x += angle_xy_delta + 3;
-  frontend_pointfield_state_.phase_y += angle_xy_delta + 2;
-  frontend_pointfield_state_.phase_z += angle_z_delta + 4;
-  frontend_pointfield_state_.angle_xy += 5;
-  frontend_pointfield_state_.angle_z += 2;
+std::array<SDL_Color, 256> MilestoneADemo::ScaledPalette(int chunk_id, int level) const {
+  std::array<SDL_Color, 256> palette{};
+  const std::vector<Uint8>& chunk = atet_data_.chunk(chunk_id);
+  for (size_t index = 0; index < palette.size(); ++index) {
+    const size_t offset = index * 3;
+    if (offset + 2 >= chunk.size()) {
+      break;
+    }
+    palette[index] = SDL_Color{
+        Expand6To8(ScaleDac6(chunk[offset + 0], level)),
+        Expand6To8(ScaleDac6(chunk[offset + 1], level)),
+        Expand6To8(ScaleDac6(chunk[offset + 2], level)),
+        SDL_ALPHA_OPAQUE};
+  }
+  return palette;
+}
 
-  ++frontend_frame_counter_;
-  ++frontend_cycle_counter_;
+void MilestoneADemo::EnsureTitleLevel(int level) {
+  level = std::clamp(level, 0, 64);
+  if (level == rendered_title_level_) {
+    return;
+  }
+  rendered_title_level_ = level;
+  scaled_title_palette_ = ScaledPalette(4, level);  // chunk 4 = title palette
+  if (title_screen_.texture != nullptr) {
+    const IndexedImage title = BuildIndexedImage(title_indices_, kScreenWidth, kScreenHeight, scaled_title_palette_, -1);
+    SDL_UpdateTexture(title_screen_.texture, nullptr, title.rgba_pixels.data(), title.width * 4);
+  }
+  if (frontend_font_atlas_.texture != nullptr) {
+    const AtetData::Indexed& font = atet_data_.font_atlas();
+    const IndexedImage atlas = BuildIndexedImage(font.indices, font.width, font.height, scaled_title_palette_, 0);
+    SDL_UpdateTexture(frontend_font_atlas_.texture, nullptr, atlas.rgba_pixels.data(), atlas.width * 4);
+  }
+}
+
+void MilestoneADemo::EnsureSplashLevel(int page, int level) {
+  level = std::clamp(level, 0, 64);
+  if (page == rendered_splash_page_ && level == rendered_splash_level_) {
+    return;
+  }
+  rendered_splash_page_ = page;
+  rendered_splash_level_ = level;
+  const bool ddd = page == 0;
+  TextureAsset& asset = ddd ? ddd_splash_ : warning_splash_;
+  if (asset.texture == nullptr) {
+    return;
+  }
+  const AtetData::Indexed& image = ddd ? atet_data_.ddd_splash() : atet_data_.warning_splash();
+  const IndexedImage scaled =
+      BuildIndexedImage(image.indices, image.width, image.height, ScaledPalette(ddd ? 0 : 2, level), -1);
+  SDL_UpdateTexture(asset.texture, nullptr, scaled.rgba_pixels.data(), scaled.width * 4);
+}
+
+int MilestoneADemo::CurrentTitleLevel() const {
+  return std::clamp(title_level_, 0, 64);
+}
+
+int MilestoneADemo::CurrentSplashLevel() const {
+  return fades_enabled_ ? std::clamp(splash_level_, 0, 64) : 64;
+}
+
+int MilestoneADemo::FlowFadeE() const {
+  switch (flow_phase_) {
+    case FlowPhase::kEntryPaletteOut:
+    case FlowPhase::kEntryTitleIn:
+    case FlowPhase::kExitTitleOut:
+    case FlowPhase::kExitPaletteIn:
+    case FlowPhase::kQuitTitleOut:
+      return static_cast<int>(ticks_ - flow_t0_);
+    default:
+      return 0;
+  }
+}
+
+int MilestoneADemo::CurrentFrozenLevel() const {
+  const int e = std::clamp(static_cast<int>(ticks_ - flow_t0_), 0, kFadeTicks);
+  if (flow_phase_ == FlowPhase::kEntryPaletteOut) {
+    return 64 - e;  // 0x64f0: (c * (64 - e)) >> 6, e = 0 shows the picture untouched
+  }
+  if (flow_phase_ == FlowPhase::kExitPaletteIn) {
+    return e;  // 0x6498: (c * e) >> 6; e = 0 is the tick 0x62e0 ended on (black)
+  }
+  return 64;
+}
+
+void MilestoneADemo::CaptureFrozenPicture(SDL_Renderer* renderer) {
+  frozen_capture_pending_ = false;
+  frozen_texture_level_ = -1;
+  frozen_rgba_.assign(static_cast<size_t>(kScreenWidth) * kScreenHeight * 4, 0);
+  for (size_t i = 3; i < frozen_rgba_.size(); i += 4) {
+    frozen_rgba_[i] = SDL_ALPHA_OPAQUE;
+  }
+  const bool entry = flow_phase_ == FlowPhase::kEntryPaletteOut;
+  if (frozen_source_ == FrozenSource::kBlack || renderer == nullptr) {
+    if (entry) {
+      // 0x3830 saves the work buffer at its entry (0x3835-0x3847). Before the first
+      // game it holds the game screen main decoded at start-up, with no counters:
+      // the first New Game fades in on the bare game screen (oracle ff-ngfade).
+      const AtetData::Indexed& game = atet_data_.gameplay_screen();
+      saved_screen_rgba_ =
+          BuildIndexedImage(game.indices, game.width, game.height, atet_data_.gameplay_palette(), -1).rgba_pixels;
+    }
+    return;
+  }
+  SDL_Texture* target =
+      SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_TARGET, kScreenWidth, kScreenHeight);
+  if (target == nullptr) {
+    return;
+  }
+  SDL_Texture* previous_target = SDL_GetRenderTarget(renderer);
+  if (SDL_SetRenderTarget(renderer, target)) {
+    SDL_SetRenderDrawColor(renderer, 0, 0, 0, SDL_ALPHA_OPAQUE);
+    SDL_RenderClear(renderer);
+    if (frozen_source_ == FrozenSource::kTopOut) {
+      RenderTopOutFrozen(renderer);
+    } else {
+      RenderGameplay(renderer);
+    }
+    if (SDL_Surface* raw = SDL_RenderReadPixels(renderer, nullptr)) {
+      if (SDL_Surface* rgba = SDL_ConvertSurface(raw, SDL_PIXELFORMAT_RGBA32)) {
+        for (int y = 0; y < std::min(rgba->h, kScreenHeight); ++y) {
+          const auto* src = static_cast<const Uint8*>(rgba->pixels) + static_cast<size_t>(y) * rgba->pitch;
+          std::copy(src, src + static_cast<size_t>(std::min(rgba->w, kScreenWidth)) * 4,
+                    frozen_rgba_.begin() + static_cast<std::ptrdiff_t>(static_cast<size_t>(y) * kScreenWidth * 4));
+        }
+        SDL_DestroySurface(rgba);
+      }
+      SDL_DestroySurface(raw);
+    }
+    SDL_SetRenderTarget(renderer, previous_target);
+  }
+  SDL_DestroyTexture(target);
+  if (entry) {
+    saved_screen_rgba_ = frozen_rgba_;  // [0x2c69f]: restored by the exit tail
+  }
+}
+
+void MilestoneADemo::RenderTopOutFrozen(SDL_Renderer* renderer) {
+  // The game-over picture exactly as RenderTopOut last drew it, without
+  // advancing the top-out timers.
+  if (top_out_frame_ < kTopOutOverlayStartFrame || !top_out_saved_under_valid_ ||
+      top_out_saved_under_texture_ == nullptr) {
+    RenderTopOutBackdrop(renderer);
+  } else {
+    DrawTexture(renderer, top_out_saved_under_texture_, kScreenWidth, kScreenHeight);
+  }
+  if (top_out_frame_ >= kTopOutOverlayStartFrame && top_out_frame_ < kTopOutOverlayEndFrame) {
+    DrawTextureAt(renderer, game_over_overlay_.texture, 96, 82, game_over_overlay_.width, game_over_overlay_.height);
+  }
+}
+
+void MilestoneADemo::RenderFrozenPicture(SDL_Renderer* renderer, int level) {
+  level = std::clamp(level, 0, 64);
+  if (level <= 0 || frozen_rgba_.empty()) {
+    return;
+  }
+  if (frozen_texture_ == nullptr) {
+    frozen_texture_ =
+        SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STREAMING, kScreenWidth, kScreenHeight);
+    if (frozen_texture_ == nullptr) {
+      return;
+    }
+    SDL_SetTextureScaleMode(frozen_texture_, SDL_SCALEMODE_NEAREST);
+    SDL_SetTextureBlendMode(frozen_texture_, SDL_BLENDMODE_NONE);
+    frozen_texture_level_ = -1;
+  }
+  if (level != frozen_texture_level_) {
+    // Every colour of these pictures is a palette colour expanded from 6 bits, so
+    // the 6-bit value is recovered exactly and scaled as the DAC would be.
+    std::array<Uint8, 256> lut{};
+    for (int c8 = 0; c8 < 256; ++c8) {
+      const int c6 = static_cast<int>(std::lround(static_cast<double>(c8) * 63.0 / 255.0));
+      lut[static_cast<size_t>(c8)] = Expand6To8(ScaleDac6(c6, level));
+    }
+    std::vector<Uint8> scaled(frozen_rgba_.size());
+    for (size_t i = 0; i + 3 < frozen_rgba_.size(); i += 4) {
+      scaled[i + 0] = lut[frozen_rgba_[i + 0]];
+      scaled[i + 1] = lut[frozen_rgba_[i + 1]];
+      scaled[i + 2] = lut[frozen_rgba_[i + 2]];
+      scaled[i + 3] = SDL_ALPHA_OPAQUE;
+    }
+    SDL_UpdateTexture(frozen_texture_, nullptr, scaled.data(), kScreenWidth * 4);
+    frozen_texture_level_ = level;
+  }
+  DrawTexture(renderer, frozen_texture_, kScreenWidth, kScreenHeight);
+}
+
+// ---------------------------------------------------------------------------
+// Pointfield: 0x5ef4 init and 0x39c4 step, 32-bit like the original.
+
+void MilestoneADemo::SeedBootRandomTable() {
+  // rng_table_fill 0x32b0 with srand(0): (rand() << 16) | rand() into the table.
+  gameplay_random_state_ = 0;
+  gameplay_random_index_ = 0;
+  for (std::uint32_t& value : gameplay_random_table_) {
+    const std::uint32_t high = NextGameplayRandom15();
+    const std::uint32_t low = NextGameplayRandom15();
+    value = (high << 16) | low;
+  }
+}
+
+namespace {
+int SignedMod8(std::uint32_t value) {
+  // IDIV by 8 after CDQ: the remainder keeps the dividend's sign.
+  const std::int32_t v = static_cast<std::int32_t>(value);
+  return v % 8;
+}
+}  // namespace
+
+void MilestoneADemo::InitFrontendPointfield() {
+  frontend_pointfield_state_ = FrontendPointfieldState{};
+  frontend_next_bank_ = 0;
+  frontend_current_bank_ = std::clamp(SignedMod8(NextGameplayRandomU32()), 0, kFrontendBankCount - 1);
+  for (int i = 0; i < kFrontendRecordCount; ++i) {
+    frontend_active_points_[static_cast<size_t>(i)] =
+        frontend_banks_[static_cast<size_t>(frontend_current_bank_)].empty()
+            ? FrontendPoint{}
+            : frontend_banks_[static_cast<size_t>(frontend_current_bank_)][static_cast<size_t>(i)];
+  }
+  frontend_cycle_counter_ = 0;
+  frontend_frame_counter_ = 0;
+  for (ProjectedPoint& point : frontend_projected_) {
+    point = ProjectedPoint{};
+  }
+}
+
+void MilestoneADemo::StepFrontendPointfield() {
+  const auto& S = original_sine_table_;
+  FrontendPointfieldState& st = frontend_pointfield_state_;
+  const auto& cur_bank = frontend_banks_[static_cast<size_t>(frontend_current_bank_)];
+  if (cur_bank.empty()) {
+    return;
+  }
+  if (frontend_cycle_counter_ == kFrontendSteadyFrames) {
+    // Keep the queued bank unless it equals the current one; then draw from the
+    // shared game RNG until it differs. 0x3c70 stores the morph deltas.
+    while (frontend_next_bank_ == frontend_current_bank_) {
+      frontend_next_bank_ = std::clamp(SignedMod8(NextGameplayRandomU32()), 0, kFrontendBankCount - 1);
+    }
+    const auto& next_bank = frontend_banks_[static_cast<size_t>(frontend_next_bank_)];
+    for (int i = 0; i < kFrontendRecordCount; ++i) {
+      const FrontendPoint& c = cur_bank[static_cast<size_t>(i)];
+      const FrontendPoint& n = next_bank[static_cast<size_t>(i)];
+      frontend_morph_delta_[static_cast<size_t>(i)] = FrontendPoint{Sub32(n.x, c.x), Sub32(n.y, c.y), Sub32(n.z, c.z)};
+    }
+  }
+  if (frontend_cycle_counter_ > kFrontendSteadyFrames) {
+    // 0x3cdc: active = current + trunc(delta * p / 128).
+    const std::int32_t p = frontend_cycle_counter_ - kFrontendSteadyFrames;
+    for (int i = 0; i < kFrontendRecordCount; ++i) {
+      const FrontendPoint& c = cur_bank[static_cast<size_t>(i)];
+      const FrontendPoint& d = frontend_morph_delta_[static_cast<size_t>(i)];
+      frontend_active_points_[static_cast<size_t>(i)] = FrontendPoint{
+          Add32(c.x, TruncDiv(Mul32(d.x, p), 128)),
+          Add32(c.y, TruncDiv(Mul32(d.y, p), 128)),
+          Add32(c.z, TruncDiv(Mul32(d.z, p), 128))};
+    }
+  }
   if (frontend_cycle_counter_ >= kFrontendSteadyFrames + kFrontendMorphFrames) {
-    frontend_current_bank_ = frontend_next_bank_;
-    frontend_next_bank_ = (frontend_next_bank_ + 1) % kFrontendBankCount;
-    if (frontend_next_bank_ == frontend_current_bank_) {
-      frontend_next_bank_ = (frontend_next_bank_ + 1) % kFrontendBankCount;
-    }
     frontend_cycle_counter_ = 0;
+    frontend_current_bank_ = frontend_next_bank_;
+  }
+  ++frontend_cycle_counter_;
+
+  const std::int32_t sin_a = S[static_cast<size_t>(st.angle_xy & 0x7FF)] >> 4;
+  const std::int32_t cos_a = S[static_cast<size_t>((st.angle_xy + 0x200) & 0x7FF)] >> 4;
+  const std::int32_t sin_b = S[static_cast<size_t>(st.angle_z & 0x7FF)] >> 4;
+  const std::int32_t cos_b = S[static_cast<size_t>((st.angle_z + 0x200) & 0x7FF)] >> 4;
+  for (int i = 0; i < kFrontendRecordCount; ++i) {
+    const FrontendPoint& p = frontend_active_points_[static_cast<size_t>(i)];
+    ProjectedPoint& out = frontend_projected_[static_cast<size_t>(i)];
+    const std::int32_t rot = Sub32(Mul32(cos_a, p.x), Mul32(sin_a, p.y)) >> 11;
+    std::int32_t num_y = Add32(Mul32(p.x, sin_a), Mul32(p.y, cos_a));
+    std::int32_t num_x = Sub32(Mul32(cos_b, rot), Mul32(sin_b, p.z));
+    std::int32_t den = Add32(Mul32(rot, sin_b), Mul32(p.z, cos_b));
+    num_x = Add32(num_x, st.origin_x);
+    num_y = Add32(num_y, st.origin_y);
+    den = Add32(den, st.origin_z);
+    den = Add32(den, 0x14000000) >> 9;
+    if (den == 0) {
+      out.valid = false;  // the original would fault (#DE) here; never reached in practice
+      continue;
+    }
+    int shade = Sub32(Shl32(den, 9), 0x14000000) >> 23;
+    shade = std::clamp(shade, 0, 15);
+    out.x = TruncDiv(num_x, den) + 0xA0;
+    out.y = TruncDiv(num_y, den) + 0x78;
+    out.color = kFrontendPointColorBase - shade;
+    out.valid = true;
+  }
+
+  st.origin_x = Add32(st.origin_x, Shl32(S[static_cast<size_t>(st.phase_x & 0x7FF)], 3));
+  st.origin_y = Add32(st.origin_y, Shl32(S[static_cast<size_t>(st.phase_y & 0x7FF)], 2));
+  st.origin_z = Add32(st.origin_z, Shl32(S[static_cast<size_t>(st.phase_z & 0x7FF)], 4));
+  const std::int32_t angle_xy_delta = S[static_cast<size_t>(st.angle_xy & 0x7FF)] >> 14;
+  const std::int32_t angle_z_delta = S[static_cast<size_t>(st.angle_z & 0x7FF)] >> 14;
+  st.phase_x = Add32(st.phase_x, angle_xy_delta + 3);
+  st.phase_y = Add32(st.phase_y, angle_xy_delta + 2);
+  st.phase_z = Add32(st.phase_z, angle_z_delta + 4);
+  st.angle_xy = Add32(st.angle_xy, 5);
+  st.angle_z = Add32(st.angle_z, 2);
+  ++frontend_frame_counter_;
+}
+
+// ---------------------------------------------------------------------------
+// Frontend flow.
+
+void MilestoneADemo::TickFrontendOnce(bool frame_start) {
+  switch (flow_phase_) {
+    case FlowPhase::kSplash:
+      TickSplash();
+      break;
+    case FlowPhase::kBootGap:
+      TickBootGap();
+      break;
+    case FlowPhase::kEntryPaletteOut:
+      TickEntryPaletteOut();
+      break;
+    case FlowPhase::kEntryTitleIn:
+      TickEntryTitleIn();
+      break;
+    case FlowPhase::kReveal:
+      TickReveal();
+      break;
+    case FlowPhase::kScreen:
+      if (frame_start && screen_exit_) {
+        // The loop left after the frame in which the gate (or Esc in Credits)
+        // set the exit flag; the 48-step conceal starts with the next frame.
+        screen_exit_ = false;
+        flow_phase_ = FlowPhase::kConceal;
+        flow_step_ = 0;
+        TickConceal();
+      } else {
+        TickScreen();
+      }
+      break;
+    case FlowPhase::kConceal:
+      TickConceal();
+      break;
+    case FlowPhase::kExitTitleOut:
+      TickExitTitleOut();
+      break;
+    case FlowPhase::kExitPaletteIn:
+      TickExitPaletteIn();
+      break;
+    case FlowPhase::kQuitTitleOut:
+      TickQuitTitleOut();
+      break;
+    case FlowPhase::kMusicFreeze:
+      TickMusicFreeze();
+      break;
+    case FlowPhase::kNone:
+      break;
+  }
+  if (frame_start) {
+    ++frontend_view_frame_;
   }
 }
 
-void MilestoneADemo::AdvanceFrontendTimers() {
-  ++frontend_view_frame_;
-  if (high_score_conceal_frames_ > 0) {
-    --high_score_conceal_frames_;
-    if (high_score_conceal_frames_ == 0) {
-      SetFrontendView(FrontendView::kMainMenu, 0);
+void MilestoneADemo::BeginStartupSplashes() {
+  scene_ = Scene::kSplash;
+  flow_phase_ = FlowPhase::kSplash;
+  keyboard_capture_row_ = -1;
+  BeginSplashPage(0);
+}
+
+void MilestoneADemo::BeginSplashPage(int page) {
+  // 0x2998: black palette, decode, copy to the shown page, then t0 = tick.
+  splash_page_ = page;
+  splash_stage_ = 0;
+  splash_frame_ = 0;
+  splash_hold_t1_ = 0;
+  splash_level_ = 0;
+  flow_t0_ = ticks_;
+}
+
+void MilestoneADemo::TickSplash() {
+  const int e = static_cast<int>(ticks_ - flow_t0_);
+  splash_frame_ = e;
+  bool cut = false;
+  bool done = false;
+  switch (splash_stage_) {
+    case 0: {
+      // Fade-in: after each tick change e = tick - t0, level 64 - (128 - e) / 2,
+      // for e = 1..127 (first visible at e = 3, full at e = 127).
+      splash_level_ = 64 - ((0x80 - e) / 2);
+      cut = PeekRelease() == 0x01;
+      if (!cut && e >= kSplashFadeInEnd) {
+        splash_stage_ = 1;
+        splash_hold_t1_ = e;
+      }
+      break;
+    }
+    case 1: {
+      // Hold: polls the release history until 120 ticks have passed.
+      cut = PeekRelease() == 0x01;
+      if (!cut && e - splash_hold_t1_ >= kSplashHoldTicks) {
+        splash_stage_ = 2;
+        splash_hold_t1_ = e;  // t2: the fade-out uploads at t2+1 .. t2+128
+      }
+      break;
+    }
+    default: {
+      // Fade-out: the tick is read BEFORE each wait, so the upload at tick
+      // t2+1+k uses k = 0..127: level 64 - k / 2 (two full uploads first).
+      const int k = e - 1 - splash_hold_t1_;
+      splash_level_ = 64 - (std::clamp(k, 0, 0x7F) / 2);
+      cut = PeekRelease() == 0x01;
+      if (!cut && k >= kSplashFadeOutUploads - 1) {
+        done = true;  // last upload (k = 127) then VRAM is cleared
+      }
+      break;
     }
   }
-  if (frontend_view_ == FrontendView::kCredits) {
-    ++credits_page_timer_;
-    if (credits_page_timer_ >= kCreditsPageFrames) {
+  if (cut) {
+    // Only an Esc release cuts a page: 0x94c, black palette, VRAM cleared; other
+    // releases stay in the history (an Enter starts a New Game at the menu).
+    ClearReleases();
+    splash_level_ = 0;
+    done = true;
+  }
+  if (!done) {
+    return;
+  }
+  splash_level_ = 0;
+  if (splash_page_ == 0) {
+    BeginSplashPage(1);  // the WARNING page starts in the same tick (zero-time load)
+    return;
+  }
+  // After the WARNING: chunk loads and page clears, then 0x6544 with no track
+  // playing yet still runs its 32-tick fade-out wait before starting the music.
+  scene_ = Scene::kFrontend;
+  frontend_view_ = FrontendView::kMainMenu;
+  flow_phase_ = FlowPhase::kBootGap;
+  flow_t0_ = ticks_;
+}
+
+void MilestoneADemo::TickBootGap() {
+  const int e = static_cast<int>(ticks_ - flow_t0_);
+  if (e < kBootLoadAllowanceTicks + kMusicChangeWaitTicks) {
+    return;
+  }
+  // 0x6544: module loaded and started with its 0x20-tick fade-in, then 0x3830(1).
+  StartCurrentMusic("music-start-after-startup");
+  BeginDispatcherEntry(1, FrozenSource::kBlack);
+}
+
+void MilestoneADemo::BeginDispatcherEntry(int state, FrozenSource source) {
+  // 0x3830 entry: save the work buffer, 0x64f0 over the displayed picture, copy the
+  // title to the work buffer and all three pages, 0x63b8, then dispatch.
+  scene_ = Scene::kFrontend;
+  dispatch_state_ = state;
+  frontend_view_ = state == 5 ? FrontendView::kSoundSetup
+                   : state == 9 ? FrontendView::kHighScoreEntry
+                                : FrontendView::kMainMenu;
+  frozen_source_ = source;
+  frozen_capture_pending_ = true;
+  frozen_texture_level_ = -1;
+  row_amount_.fill(0);
+  menu_pending_ = 0;
+  screen_exit_ = false;
+  flow_t0_ = ticks_;
+  if (!fades_enabled_) {
+    title_level_ = kFrontendRestLevel;
+    StartScreen(state);
+    TickReveal();
+    return;
+  }
+  flow_phase_ = FlowPhase::kEntryPaletteOut;
+}
+
+void MilestoneADemo::TickEntryPaletteOut() {
+  const int e = static_cast<int>(ticks_ - flow_t0_);
+  if (e < kFadeTicks) {
+    return;  // level 64 - e, read by Render; no game logic, no pointfield
+  }
+  // Last upload (e = 63) done: the title copy and 0x63b8 start in this tick.
+  flow_phase_ = FlowPhase::kEntryTitleIn;
+  flow_t0_ = ticks_;
+  title_level_ = 0;
+  TickEntryTitleIn();
+}
+
+void MilestoneADemo::TickEntryTitleIn() {
+  const int e = static_cast<int>(ticks_ - flow_t0_);
+  if (e >= kFadeTicks) {
+    // 0x63b8 leaves after the frame with e = 62: the title palette stays at 62/64.
+    StartScreen(dispatch_state_);
+    TickReveal();
+    return;
+  }
+  title_level_ = e;
+  // 0x63b8 does not re-base the pacer, whose base predates the 63-tick busy wait,
+  // so the fade's second frame runs the capped 6 catch-up ticks (6 pointfield steps).
+  const int steps = e == 1 ? kStalePacerBurst : 1;
+  for (int i = 0; i < steps; ++i) {
+    StepFrontendPointfield();
+  }
+}
+
+void MilestoneADemo::SetAllRowAmounts(int amount) {
+  for (int row = 0; row < kFrontendRowCount; ++row) {
+    row_amount_[static_cast<size_t>(row)] = amount;
+  }
+}
+
+void MilestoneADemo::SetMainMenuRowText(int row) {
+  switch (row) {
+    case 0:
+      row_text_[0] = "New Game";
+      break;
+    case 1:
+      row_text_[1] = "Options";
+      break;
+    case 2:
+      row_text_[2] = std::string("Music:`") + kMusicTracks[static_cast<size_t>(
+                                                   NormalizeModulo(music_track_index_, static_cast<int>(kMusicTracks.size())))] +
+                     "'";
+      break;
+    case 3:
+      row_text_[3] = "Level " + std::to_string(start_level_);
+      break;
+    case 4:
+      row_text_[4] = "High Scores";
+      break;
+    case 5:
+      row_text_[5] = "Credits";
+      break;
+    case 6:
+      row_text_[6] = "Exit Game";
+      break;
+    case 7:
+      row_text_[7] = "Return to Game";
+      break;
+    default:
+      break;
+  }
+}
+
+void MilestoneADemo::BuildOptionsRows() {
+  row_text_[0] = "Music Volume:" + std::to_string(music_volume_);
+  row_text_[1] = "Sound FX Volume:" + std::to_string(sfx_volume_);
+  row_text_[2] = "Keyboard Setup";
+  row_text_[3] = "Back To Main Menu";
+  for (int row = 4; row < kFrontendRowCount; ++row) {
+    row_text_[static_cast<size_t>(row)].clear();
+  }
+}
+
+std::string MilestoneADemo::KeyboardBindingRowText(int row_index) const {
+  if (row_index < 0 || row_index >= static_cast<int>(keyboard_bindings_.size())) {
+    return {};
+  }
+  return std::string(kKeyboardBindingLabels[static_cast<size_t>(row_index)]) + ":" +
+         KeyNameForBinding(keyboard_bindings_[static_cast<size_t>(row_index)]);
+}
+
+void MilestoneADemo::BuildKeyboardSetupRows() {
+  for (int row = 0; row < 5; ++row) {
+    row_text_[static_cast<size_t>(row)] = KeyboardBindingRowText(row);
+  }
+  row_text_[5] = "Back to Options Menu";
+  row_text_[6].clear();
+  row_text_[7].clear();
+}
+
+void MilestoneADemo::BuildSoundSetupRows() {
+  row_text_[0] = kSoundDeviceNames[static_cast<size_t>(
+      std::clamp(sound_device_index_, 0, static_cast<int>(kSoundDeviceNames.size()) - 1))];
+  row_text_[1] = "Mixing Rate:" + std::to_string(mixing_rate_hz_);
+  row_text_[2] = stereo_flag_ != 0 ? "Stereo" : "Mono";
+  row_text_[3] = bit_depth_flag_ != 0 ? "16 Bit" : "8 Bit";
+  row_text_[4] = "Play Game";
+  row_text_[5] = "Exit to Dos";
+  row_text_[6].clear();
+  row_text_[7].clear();
+}
+
+void MilestoneADemo::BuildCreditsRows() {
+  const CreditsPage& page =
+      kCreditsPages[static_cast<size_t>(NormalizeModulo(credits_page_, static_cast<int>(kCreditsPages.size())))];
+  for (int row = 0; row < kFrontendRowCount; ++row) {
+    row_text_[static_cast<size_t>(row)] = page[static_cast<size_t>(row)];
+  }
+}
+
+void MilestoneADemo::BuildHighScoreRows() {
+  for (size_t row = 0; row < high_scores_.size(); ++row) {
+    row_text_[row] = high_scores_[row].name;
+    hs_score_text_[row] = std::to_string(high_scores_[row].score);
+    hs_lines_text_[row] = std::to_string(high_scores_[row].lines);
+  }
+  row_text_[5].clear();
+  row_text_[6] = "Return to Main Menu";
+  row_text_[7].clear();
+}
+
+void MilestoneADemo::StartScreen(int state) {
+  scene_ = Scene::kFrontend;
+  flow_phase_ = FlowPhase::kReveal;
+  flow_step_ = 0;
+  menu_pending_ = 0;
+  screen_exit_ = false;
+  menu_return_state_ = 1;
+  keyboard_capture_row_ = -1;
+  frontend_view_frame_ = 0;
+  dispatch_state_ = state;
+  row_text_.fill(std::string());
+  row_amount_.fill(0);
+  switch (state) {
+    case 5: {
+      // 0x5a94 snaps the stored mixing rate to the first table entry >= it; a rate
+      // above 44100 indexes past the 7-entry copy and reads the index itself (7).
+      frontend_view_ = FrontendView::kSoundSetup;
+      int index = 0;
+      while (index < static_cast<int>(kMixingRates.size()) && mixing_rate_hz_ > kMixingRates[static_cast<size_t>(index)]) {
+        ++index;
+      }
+      sound_rate_index_ = index;
+      mixing_rate_hz_ = index < static_cast<int>(kMixingRates.size()) ? kMixingRates[static_cast<size_t>(index)] : index;
+      frontend_selected_row_ = 0;
+      BuildSoundSetupRows();
+      break;
+    }
+    case 6:
+      frontend_view_ = FrontendView::kOptions;
+      frontend_selected_row_ = 0;  // 0x4584 always starts on row 0
+      BuildOptionsRows();
+      break;
+    case 7:
+      frontend_view_ = FrontendView::kKeyboardSetup;
+      frontend_selected_row_ = 0;
+      BuildKeyboardSetupRows();
+      break;
+    case 8:
+    case 9: {
+      // 0x50b0(mode): mode 1 (a game just ended) qualifies the run first.
+      hs_mode_ = state == 9 ? 1 : 0;
+      hs_slot_ = -1;
+      if (hs_mode_ == 1) {
+        int slot = 0;
+        while (slot < static_cast<int>(high_scores_.size()) &&
+               top_out_score_ <= high_scores_[static_cast<size_t>(slot)].score) {
+          ++slot;
+        }
+        if (slot >= static_cast<int>(high_scores_.size())) {
+          hs_mode_ = 0;
+        } else {
+          for (int index = static_cast<int>(high_scores_.size()) - 1; index > slot; --index) {
+            high_scores_[static_cast<size_t>(index)] = high_scores_[static_cast<size_t>(index - 1)];
+          }
+          high_scores_[static_cast<size_t>(slot)] = HighScoreRecord{"", top_out_score_, top_out_lines_};
+          hs_slot_ = slot;
+          MarkSetupDirty();
+        }
+      }
+      frontend_view_ = hs_mode_ == 1 ? FrontendView::kHighScoreEntry : FrontendView::kHighScores;
+      frontend_selected_row_ = kHiscoreFooterRow;
+      hs_stage_ = hs_mode_ == 1 ? 0 : 1;
+      BuildHighScoreRows();
+      break;
+    }
+    case 10:
+      frontend_view_ = FrontendView::kCredits;
+      credits_page_ = 0;
+      credits_counter_ = 0;
+      credits_esc_latch_ = false;
+      credits_mode_ = 1;
+      BuildCreditsRows();
+      break;
+    case 1:
+    default:
+      frontend_view_ = FrontendView::kMainMenu;
+      for (int row = 0; row < kFrontendRowCount; ++row) {
+        SetMainMenuRowText(row);
+      }
+      frontend_selected_row_ = main_menu_row_;
+      break;
+  }
+}
+
+void MilestoneADemo::TickReveal() {
+  // 0x3df4 (and 0x50b0's reveal): every row at min(step, 0x30) each tick, no
+  // input read; the loop is left after the frame whose step reached 0x30, so the
+  // screen's own loop starts with the next tick.
+  if (flow_step_ >= kRevealSteps) {
+    flow_phase_ = FlowPhase::kScreen;
+    if (frontend_view_ == FrontendView::kCredits) {
+      credits_mode_ = 0;
+      credits_counter_ = 1;  // 0x4fa1: EBX++ after the reveal
+    }
+    if (frontend_view_ == FrontendView::kHighScores || frontend_view_ == FrontendView::kHighScoreEntry) {
+      hs_buffer_.clear();
+      hs_len_ = 0;
+      hs_caps_ = false;
+      hs_commit_ = false;
+      hs_done_ = false;
+      menu_pending_ = 0;
+    }
+    TickScreen();
+    return;
+  }
+  SetAllRowAmounts(std::min(flow_step_, kRevealSteps));
+  StepFrontendPointfield();
+  ++flow_step_;
+}
+
+void MilestoneADemo::TickConceal() {
+  if (flow_step_ >= kRevealSteps) {
+    // 0x3ee4 returned: the screen hands its state to the dispatcher (or Credits
+    // starts its next page).
+    if (frontend_view_ == FrontendView::kCredits && credits_mode_ == 2) {
       credits_page_ = (credits_page_ + 1) % static_cast<int>(kCreditsPages.size());
-      credits_page_timer_ = 0;
-      frontend_view_frame_ = 0;
+      credits_counter_ = 0;
+      credits_mode_ = 0;
+      flow_phase_ = FlowPhase::kScreen;
+      TickScreen();
+      return;
+    }
+    DispatchState(menu_return_state_);
+    return;
+  }
+  SetAllRowAmounts(std::max(kRevealSteps - 1 - flow_step_, 0));
+  StepFrontendPointfield();
+  ++flow_step_;
+}
+
+void MilestoneADemo::DispatchState(int state) {
+  switch (state) {
+    case 2:
+      // Return to Game (or Play Game / Esc in the start-up Sound Setup): [0x1886f]
+      // = 7 (0x38d0), then the exit tail; main resets the row to 0 after the setup
+      // detour returns (0x181).
+      main_menu_row_ = 7;
+      BeginDispatcherExit(dispatch_state_ == 5 ? FlowExit::kSplashes : FlowExit::kResume);
+      return;
+    case 3:
+      BeginQuitFade();
+      return;
+    case 4:
+      BeginDispatcherExit(FlowExit::kNewGame);
+      return;
+    default:
+      // The dispatcher loop calls the next screen directly: no palette fades.
+      StartScreen(state);
+      TickReveal();
+      return;
+  }
+}
+
+void MilestoneADemo::BeginDispatcherExit(FlowExit exit) {
+  ClearReleases();  // 0x3941
+  flow_exit_ = exit;
+  if (!fades_enabled_) {
+    PersistSetupState();
+    setup_dirty_ = false;
+    FinishDispatcherExit();
+    return;
+  }
+  flow_phase_ = FlowPhase::kExitTitleOut;
+  flow_t0_ = ticks_;
+  row_amount_.fill(0);
+  TickExitTitleOut();
+}
+
+void MilestoneADemo::TickExitTitleOut() {
+  const int e = static_cast<int>(ticks_ - flow_t0_);
+  if (e >= kFadeTicks) {
+    // 0x3604 saves SETUP.DAT, the saved gameplay picture is restored (New Game
+    // also runs its init, 0x2d88 / 0x5e0), then 0x6498 starts in this tick.
+    PersistSetupState();
+    setup_dirty_ = false;
+    frozen_capture_pending_ = true;
+    switch (flow_exit_) {
+      case FlowExit::kNewGame:
+        ResetLiveGameplayState();
+        live_game_active_ = true;
+        live_game_available_ = true;
+        StartCurrentMusic("music-continue-new-game");
+        frozen_source_ = FrozenSource::kGameplay;
+        UseSavedScreenForNewGame();
+        break;
+      case FlowExit::kResume:
+        // The original restores the saved screen; nothing in the frontend changes the
+        // parked game, so rendering the restored game gives the same picture.
+        RestoreLiveSnapshot();
+        live_game_active_ = true;
+        StartCurrentMusic("music-continue-return-to-game");
+        frozen_source_ = FrozenSource::kGameplay;
+        break;
+      case FlowExit::kSplashes:
+      case FlowExit::kNone:
+        frozen_source_ = FrozenSource::kBlack;
+        break;
+    }
+    frozen_texture_level_ = -1;
+    flow_phase_ = FlowPhase::kExitPaletteIn;
+    flow_t0_ = ticks_;
+    return;
+  }
+  // 0x62e0: title palette 64 - e (the first frame is at full brightness), the
+  // pointfield keeps moving; the rows were concealed before.
+  title_level_ = 64 - e;
+  StepFrontendPointfield();
+}
+
+void MilestoneADemo::UseSavedScreenForNewGame() {
+  // The exit tail copies the screen saved at the entry ([0x2c69f], 0x395a-0x3995) back
+  // to the work buffer and the pages; 0x6498 then only ramps the palette. For New
+  // Game, 0x05e0 first zeroes the well and the next box (0x6274) and copies the work
+  // buffer to the pages again; the new counters, the first piece, the preview and the
+  // face reset are drawn later and appear with the first gameplay frame (measured on
+  // the oracle: ff-ngfade, ff-ngfade2; AL-VO-01). The old counters, statistics and
+  // face therefore stay visible through the fade-in.
+  if (saved_screen_rgba_.size() != static_cast<size_t>(kScreenWidth) * kScreenHeight * 4) {
+    return;  // no entry picture (fades were off): render the game instead
+  }
+  frozen_rgba_ = saved_screen_rgba_;
+  const SDL_Color black = atet_data_.gameplay_palette()[0];
+  const auto zero_rect = [&](int x0, int y0, int w, int h) {
+    for (int y = y0; y < y0 + h && y < kScreenHeight; ++y) {
+      for (int x = x0; x < x0 + w && x < kScreenWidth; ++x) {
+        const size_t i = (static_cast<size_t>(y) * kScreenWidth + static_cast<size_t>(x)) * 4;
+        frozen_rgba_[i + 0] = black.r;
+        frozen_rgba_[i + 1] = black.g;
+        frozen_rgba_[i + 2] = black.b;
+        frozen_rgba_[i + 3] = SDL_ALPHA_OPAQUE;
+      }
+    }
+  };
+  zero_rect(kGameplayClearX, kGameplayClearY, kGameplayClearWidth, kGameplayClearHeight);
+  zero_rect(kPreviewX, kPreviewY, kPreviewWidth, kPreviewHeight);
+  frozen_capture_pending_ = false;
+}
+
+void MilestoneADemo::TickExitPaletteIn() {
+  const int e = static_cast<int>(ticks_ - flow_t0_);
+  if (e < kFadeTicks) {
+    return;  // level e, read by Render; nothing else runs during the busy wait
+  }
+  // e = 63 uploaded, followed by the full palette in the same tick (0x39b8).
+  FinishDispatcherExit();
+}
+
+void MilestoneADemo::FinishDispatcherExit() {
+  flow_phase_ = FlowPhase::kNone;
+  const FlowExit exit = flow_exit_;
+  flow_exit_ = FlowExit::kNone;
+  switch (exit) {
+    case FlowExit::kNewGame:
+      if (!fades_enabled_) {
+        ResetLiveGameplayState();
+        live_game_active_ = true;
+        live_game_available_ = true;
+        StartCurrentMusic("music-continue-new-game");
+      }
+      scene_ = Scene::kGameplay;
+      break;
+    case FlowExit::kResume:
+      if (!fades_enabled_) {
+        RestoreLiveSnapshot();
+        live_game_active_ = true;
+        StartCurrentMusic("music-continue-return-to-game");
+      }
+      scene_ = Scene::kGameplay;
+      break;
+    case FlowExit::kSplashes:
+    case FlowExit::kNone:
+      // Back in main after the start-up Sound Setup: sound init, then the splashes.
+      main_menu_row_ = 0;
+      BeginStartupSplashes();
+      break;
+  }
+}
+
+void MilestoneADemo::BeginQuitFade() {
+  // State 3: wait for a running music ramp (none can be pending here: the
+  // Music-row change already waited), start the 0x40-tick music fade-out, run the
+  // title fade-out, save SETUP.DAT and exit.
+  ScheduleExitFade();
+  if (!fades_enabled_) {
+    PersistSetupState();
+    setup_dirty_ = false;
+    quit_requested_ = true;
+    return;
+  }
+  flow_phase_ = FlowPhase::kQuitTitleOut;
+  flow_t0_ = ticks_;
+  row_amount_.fill(0);
+  TickQuitTitleOut();
+}
+
+void MilestoneADemo::TickQuitTitleOut() {
+  const int e = static_cast<int>(ticks_ - flow_t0_);
+  title_level_ = 64 - std::min(e, kFadeTicks - 1);
+  if (!quit_requested_) {
+    StepFrontendPointfield();
+  }
+  if (e >= kFadeTicks - 1 && !quit_requested_) {
+    // The frame with e = 62 (level 2) is the last one presented; 0x62e0 then
+    // returns, 0x3604 saves and 0x5cc restores text mode and exits.
+    PersistSetupState();
+    setup_dirty_ = false;
+    quit_requested_ = true;
+  }
+}
+
+void MilestoneADemo::TickMusicFreeze() {
+  if (--music_freeze_left_ > 0) {
+    return;  // inside 0x6544's busy wait: no logic, no presents
+  }
+  // The new module is loaded and fading in; the rest of the Enter tick runs now,
+  // and the pacer then returns min(elapsed, 6) for the next frame.
+  flow_phase_ = FlowPhase::kScreen;
+  TickMainMenu(true);
+  frontend_burst_ = kStalePacerBurst;
+}
+
+int MilestoneADemo::PulseRow(int row, int mode) {
+  // 0x3fd8: in gate mode (1) a phase already at 0 or 0x400 ends the gate without
+  // drawing; otherwise draw at trunc(sine[phase] / 2048) + 0x30 and advance 0x20,
+  // twice in gate mode unless the first step landed on 0 or 0x400.
+  if (mode == 1 && (pulse_phase_ == 0 || pulse_phase_ == 0x400)) {
+    return 1;
+  }
+  if (row >= 0 && row < kFrontendRowCount) {
+    row_amount_[static_cast<size_t>(row)] =
+        TruncDiv(original_sine_table_[static_cast<size_t>(pulse_phase_ & kPulsePhaseMask)], 0x800) + 0x30;
+  }
+  pulse_phase_ = (pulse_phase_ + kPulseStep) & kPulsePhaseMask;
+  if (mode == 1 && pulse_phase_ != 0 && pulse_phase_ != 0x400) {
+    pulse_phase_ = (pulse_phase_ + kPulseStep) & kPulsePhaseMask;
+  }
+  return 0;
+}
+
+int MilestoneADemo::PulseEntryRow(int slot, int mode) {
+  // 0x5868: like 0x3fd8 on its own phase [0x19913] for the three columns of the
+  // inserted row, except that a gate ending on 0 / 0x400 still draws (settled 0x30).
+  if (slot < 0 || slot >= 5) {
+    return 1;
+  }
+  const int amount =
+      TruncDiv(original_sine_table_[static_cast<size_t>(entry_pulse_phase_ & kPulsePhaseMask)], 0x800) + 0x30;
+  row_amount_[static_cast<size_t>(slot)] = amount;
+  if (mode == 1 && (entry_pulse_phase_ == 0 || entry_pulse_phase_ == 0x400)) {
+    return 1;
+  }
+  entry_pulse_phase_ = (entry_pulse_phase_ + kPulseStep) & kPulsePhaseMask;
+  if (mode == 1 && entry_pulse_phase_ != 0 && entry_pulse_phase_ != 0x400) {
+    entry_pulse_phase_ = (entry_pulse_phase_ + kPulseStep) & kPulsePhaseMask;
+  }
+  return 0;
+}
+
+void MilestoneADemo::TickScreen() {
+  switch (frontend_view_) {
+    case FrontendView::kMainMenu:
+      TickMainMenu(false);
+      break;
+    case FrontendView::kOptions:
+      TickOptions();
+      break;
+    case FrontendView::kKeyboardSetup:
+      TickKeyboardSetup();
+      break;
+    case FrontendView::kSoundSetup:
+      TickSoundSetup();
+      break;
+    case FrontendView::kCredits:
+      TickCredits();
+      break;
+    case FrontendView::kHighScores:
+    case FrontendView::kHighScoreEntry:
+      TickHighScores();
+      break;
+  }
+}
+
+void MilestoneADemo::TickMainMenu(bool resume_after_music) {
+  // 0x40c0 steady loop, one logic tick.
+  int& row = main_menu_row_;
+  if (!resume_after_music) {
+    // Esc counts only while HELD, only with a game in progress, and only when no
+    // action is pending: Return to Game through the gate (0x4232-0x425b).
+    if (KeyHeld(0x01) && menu_pending_ == 0 && live_game_available_) {
+      menu_pending_ = 1;
+      menu_return_state_ = 2;
+      ClearReleases();
+    }
+    if (PeekRelease() == 0x1C && menu_pending_ == 0) {
+      ClearReleases();
+      switch (row) {
+        case 0:
+          menu_return_state_ = 4;
+          menu_pending_ = 1;
+          break;
+        case 1:
+          menu_return_state_ = 6;
+          menu_pending_ = 1;
+          break;
+        case 2:
+          // 0x61c8 clears the row, the track advances (wrap after 5) and 0x6544
+          // blocks inside this tick: 32-tick fade-out, load, start, fade-in.
+          music_track_index_ = music_track_index_ + 1 > 5 ? 0 : music_track_index_ + 1;
+          MarkSetupDirty();
+          StartCurrentMusic("music-track-change");
+          flow_phase_ = FlowPhase::kMusicFreeze;
+          music_freeze_left_ = kMusicChangeWaitTicks;
+          return;
+        case 3:
+          start_level_ = start_level_ + 1 > 9 ? 0 : start_level_ + 1;
+          SetMainMenuRowText(3);
+          break;
+        case 4:
+          menu_return_state_ = 8;
+          menu_pending_ = 1;
+          break;
+        case 5:
+          menu_return_state_ = 10;
+          menu_pending_ = 1;
+          break;
+        case 6:
+          menu_return_state_ = 3;
+          menu_pending_ = 1;
+          break;
+        case 7:
+          if (live_game_available_) {
+            menu_return_state_ = 2;
+            menu_pending_ = 1;
+          }
+          break;
+        default:
+          break;
+      }
+    }
+  } else {
+    SetMainMenuRowText(2);  // re-printed after 0x6544 returned
+  }
+  const std::uint8_t up = PeekRelease();
+  if ((up == 0xC8 || up == 0x48) && menu_pending_ == 0) {
+    EmitAudioEvent("menu-row-move", 1);
+    menu_pending_ = 2;
+    ClearReleases();
+  }
+  const std::uint8_t down = PeekRelease();
+  if ((down == 0xD0 || down == 0x50) && menu_pending_ == 0) {
+    EmitAudioEvent("menu-row-move", 1);
+    menu_pending_ = 3;
+    ClearReleases();
+  }
+  StepFrontendPointfield();
+  if (menu_pending_ == 0) {
+    PulseRow(row, 0);
+  }
+  if (menu_pending_ == 1 && PulseRow(row, 1) == 1) {
+    screen_exit_ = true;
+  }
+  if (menu_pending_ == 2 && PulseRow(row, 1) == 1) {
+    row = row - 1 < 0 ? 7 : row - 1;
+    menu_pending_ = 0;
+  }
+  if (menu_pending_ == 3 && PulseRow(row, 1) == 1) {
+    row = row + 1 > 7 ? 0 : row + 1;
+    menu_pending_ = 0;
+  }
+  frontend_selected_row_ = row;
+}
+
+void MilestoneADemo::TickOptions() {
+  // 0x4584 steady loop.
+  int& row = frontend_selected_row_;
+  if (KeyHeld(0x01) && menu_pending_ == 0) {
+    ClearReleases();
+    menu_return_state_ = 1;
+    menu_pending_ = 1;
+  }
+  if (PeekRelease() == 0x1C && menu_pending_ == 0) {
+    ClearReleases();  // rows 0 and 1 ignore Enter
+    if (row == 2) {
+      menu_return_state_ = 7;
+      menu_pending_ = 1;
+    } else if (row == 3) {
+      menu_return_state_ = 1;
+      menu_pending_ = 1;
+    }
+  }
+  // Left/Right are read from the held table: one unit per tick, clamped 0..100,
+  // the two directions tested independently; music volume applied each change.
+  if ((KeyHeld(0xCB) || KeyHeld(0x4B)) && menu_pending_ == 0) {
+    if (row == 0) {
+      if (music_volume_ > 0) {
+        --music_volume_;
+        ApplyMusicVolume();
+        MarkSetupDirty();
+      }
+      row_text_[0] = "Music Volume:" + std::to_string(music_volume_);
+    } else if (row == 1) {
+      if (sfx_volume_ > 0) {
+        --sfx_volume_;
+        MarkSetupDirty();
+      }
+      row_text_[1] = "Sound FX Volume:" + std::to_string(sfx_volume_);
+    }
+  }
+  if ((KeyHeld(0xCD) || KeyHeld(0x4D)) && menu_pending_ == 0) {
+    if (row == 0) {
+      if (music_volume_ < 100) {
+        ++music_volume_;
+        ApplyMusicVolume();
+        MarkSetupDirty();
+      }
+      row_text_[0] = "Music Volume:" + std::to_string(music_volume_);
+    } else if (row == 1) {
+      if (sfx_volume_ < 100) {
+        ++sfx_volume_;
+        MarkSetupDirty();
+      }
+      row_text_[1] = "Sound FX Volume:" + std::to_string(sfx_volume_);
+    }
+  }
+  const std::uint8_t up = PeekRelease();
+  if ((up == 0xC8 || up == 0x48) && menu_pending_ == 0) {
+    EmitAudioEvent("menu-row-move", 1);
+    menu_pending_ = 2;
+    ClearReleases();
+  }
+  const std::uint8_t down = PeekRelease();
+  if ((down == 0xD0 || down == 0x50) && menu_pending_ == 0) {
+    EmitAudioEvent("menu-row-move", 1);
+    menu_pending_ = 3;
+    ClearReleases();
+  }
+  StepFrontendPointfield();
+  if (menu_pending_ == 0) {
+    PulseRow(row, 0);
+  }
+  if (menu_pending_ == 1 && PulseRow(row, 1) == 1) {
+    screen_exit_ = true;
+  }
+  if (menu_pending_ == 2 && PulseRow(row, 1) == 1) {
+    row = row - 1 < 0 ? 3 : row - 1;
+    menu_pending_ = 0;
+  }
+  if (menu_pending_ == 3 && PulseRow(row, 1) == 1) {
+    row = row + 1 > 3 ? 0 : row + 1;
+    menu_pending_ = 0;
+  }
+}
+
+void MilestoneADemo::TickKeyboardSetup() {
+  // 0x49bc steady loop; pending 4 = waiting for the key to bind.
+  int& row = frontend_selected_row_;
+  if (KeyHeld(0x01) && menu_pending_ == 0) {
+    ClearReleases();
+    menu_return_state_ = 1;  // Esc goes back to the main menu
+    menu_pending_ = 1;
+  }
+  if (PeekRelease() == 0x1C && menu_pending_ == 0) {
+    ClearReleases();
+    static constexpr std::array<const char*, 5> kPrompts = {
+        "Down:_", "Left:_", "Right:_", "Rotate Left:_", "Rotate Right:_"};
+    if (row >= 0 && row <= 4) {
+      row_text_[static_cast<size_t>(row)] = kPrompts[static_cast<size_t>(row)];
+      menu_pending_ = 4;
+      keyboard_capture_row_ = row;
+    } else if (row == 5) {
+      menu_return_state_ = 6;  // Back to Options Menu (Options starts on row 0)
+      menu_pending_ = 1;
+    }
+  }
+  const std::uint8_t up = PeekRelease();
+  if ((up == 0xC8 || up == 0x48) && menu_pending_ == 0) {
+    EmitAudioEvent("menu-row-move", 1);
+    menu_pending_ = 2;
+    ClearReleases();
+  }
+  const std::uint8_t down = PeekRelease();
+  if ((down == 0xD0 || down == 0x50) && menu_pending_ == 0) {
+    EmitAudioEvent("menu-row-move", 1);
+    menu_pending_ = 3;
+    ClearReleases();
+  }
+  StepFrontendPointfield();
+  if (menu_pending_ == 0) {
+    PulseRow(row, 0);
+  }
+  if (menu_pending_ == 1 && PulseRow(row, 1) == 1) {
+    screen_exit_ = true;
+  }
+  if (menu_pending_ == 2 && PulseRow(row, 1) == 1) {
+    row = row - 1 < 0 ? 5 : row - 1;
+    menu_pending_ = 0;
+  }
+  if (menu_pending_ == 3 && PulseRow(row, 1) == 1) {
+    row = row + 1 > 5 ? 0 : row + 1;
+    menu_pending_ = 0;
+  }
+  if (menu_pending_ == 4) {
+    // The prompt row keeps pulsing; the binding is the newest released key of any
+    // kind except none and Esc (which is left in the history).
+    PulseRow(row, 0);
+    const std::uint8_t code = PeekRelease();
+    if (code != 0 && code != 0x01) {
+      ClearReleases();
+      menu_pending_ = 0;
+      if (row >= 0 && row < static_cast<int>(keyboard_bindings_.size())) {
+        keyboard_bindings_[static_cast<size_t>(row)] = code;
+        MarkSetupDirty();
+        row_text_[static_cast<size_t>(row)] = KeyboardBindingRowText(row);
+        // 0x61c8 clears the row cell again after the capture; the new name is first
+        // drawn by the next tick's pulse, so this frame shows the row blank.
+        row_amount_[static_cast<size_t>(row)] = 0;
+      }
+      keyboard_capture_row_ = -1;
     }
   }
 }
 
-void MilestoneADemo::AdvanceSplashTimers() {
-  ++splash_frame_;
-  if (splash_frame_ < kSplashPageFrames) {
+void MilestoneADemo::TickSoundSetup() {
+  // 0x5a94 steady loop (runs before sound init: no SFX here).
+  int& row = frontend_selected_row_;
+  if (KeyHeld(0x01) && menu_pending_ == 0) {
+    menu_return_state_ = 2;
+    menu_pending_ = 1;
+    ClearReleases();
+  }
+  if (PeekRelease() == 0x1C && menu_pending_ == 0) {
+    ClearReleases();
+    switch (row) {
+      case 0:
+        sound_device_index_ = sound_device_index_ + 1 > 5 ? 0 : sound_device_index_ + 1;
+        MarkSetupDirty();
+        BuildSoundSetupRows();
+        break;
+      case 1:
+        sound_rate_index_ = sound_rate_index_ + 1 >= static_cast<int>(kMixingRates.size()) ? 0 : sound_rate_index_ + 1;
+        mixing_rate_hz_ = kMixingRates[static_cast<size_t>(sound_rate_index_)];
+        MarkSetupDirty();
+        BuildSoundSetupRows();
+        break;
+      case 2:
+        stereo_flag_ = stereo_flag_ != 0 ? 0 : 1;
+        MarkSetupDirty();
+        BuildSoundSetupRows();
+        break;
+      case 3:
+        bit_depth_flag_ = bit_depth_flag_ != 0 ? 0 : 1;
+        MarkSetupDirty();
+        BuildSoundSetupRows();
+        break;
+      case 4:
+        menu_return_state_ = 2;
+        menu_pending_ = 1;
+        break;
+      case 5:
+        menu_return_state_ = 3;
+        menu_pending_ = 1;
+        break;
+      default:
+        break;
+    }
+  }
+  const std::uint8_t up = PeekRelease();
+  if ((up == 0xC8 || up == 0x48) && menu_pending_ == 0) {
+    menu_pending_ = 2;
+    ClearReleases();
+  }
+  const std::uint8_t down = PeekRelease();
+  if ((down == 0xD0 || down == 0x50) && menu_pending_ == 0) {
+    menu_pending_ = 3;
+    ClearReleases();
+  }
+  StepFrontendPointfield();
+  if (menu_pending_ == 0) {
+    PulseRow(row, 0);
+  }
+  if (menu_pending_ == 1 && PulseRow(row, 1) == 1) {
+    screen_exit_ = true;
+  }
+  if (menu_pending_ == 2 && PulseRow(row, 1) == 1) {
+    row = row - 1 < 0 ? 5 : row - 1;
+    menu_pending_ = 0;
+  }
+  if (menu_pending_ == 3 && PulseRow(row, 1) == 1) {
+    row = row + 1 > 5 ? 0 : row + 1;
+    menu_pending_ = 0;
+  }
+}
+
+void MilestoneADemo::TickCredits() {
+  // 0x4f38 hold loop. Mode 1 = build the next page and reveal it (one staging
+  // tick first), mode 2 = conceal (staged at counter 300), no pulse, no gate.
+  if (credits_mode_ == 1) {
+    BuildCreditsRows();
+    flow_phase_ = FlowPhase::kReveal;
+    flow_step_ = 0;
+    TickReveal();
+    return;
+  }
+  if (credits_mode_ == 2) {
+    flow_phase_ = FlowPhase::kConceal;
+    flow_step_ = 0;
+    TickConceal();
+    return;
+  }
+  if (credits_counter_ == 0) {
+    credits_mode_ = 1;  // staging tick: no pointfield step
+    return;
+  }
+  if (credits_counter_ == kCreditsHoldEnd) {
+    credits_mode_ = 2;  // staging tick
+    return;
+  }
+  // The only key: Esc held during a hold tick, latched once; the page then
+  // conceals and Credits returns to the main menu.
+  if (KeyHeld(0x01) && !credits_esc_latch_) {
+    menu_return_state_ = 1;
+    credits_esc_latch_ = true;
+    screen_exit_ = true;
+  }
+  StepFrontendPointfield();
+  ++credits_counter_;
+}
+
+void MilestoneADemo::TickHighScores() {
+  // 0x50b0 after its reveal: name entry (state 9 with a qualifying score), then the
+  // footer loop.
+  if (hs_stage_ == 0 && hs_done_) {
+    // The entry loop presented its settled frame last tick and left; the footer loop
+    // starts with this tick.
+    hs_stage_ = 1;
+    frontend_view_ = FrontendView::kHighScores;
+    menu_pending_ = 0;
+  }
+  if (hs_stage_ == 0 && hs_slot_ >= 0) {
+    const size_t slot = static_cast<size_t>(hs_slot_);
+    if (PeekRelease() == 0x1C && !hs_commit_) {
+      ClearReleases();
+      hs_commit_ = true;
+    }
+    // 0x61c8 clears the name cell, the row is printed as "%s_".
+    row_text_[slot] = hs_buffer_ + "_";
+    StepFrontendPointfield();
+    if (!hs_commit_) {
+      PulseEntryRow(hs_slot_, 0);
+    } else {
+      // From the commit on, the name is copied (no cursor) into the row and the
+      // record every tick while the one-shot gate settles the row.
+      row_text_[slot] = hs_buffer_;
+      high_scores_[slot].name = hs_buffer_;
+      MarkSetupDirty();
+      if (PulseEntryRow(hs_slot_, 1) == 1) {
+        hs_done_ = true;
+      }
+    }
+    // Edits come from the release history, one released key per tick; every key
+    // but Enter clears the history (a second Enter is left for the footer).
+    const std::uint8_t code = PeekRelease();
+    if (code != 0) {
+      if (code != 0x1C) {
+        ClearReleases();
+      }
+      if (code == 0x0E && hs_len_ > 0) {
+        --hs_len_;
+        hs_buffer_.resize(static_cast<size_t>(hs_len_));
+      }
+      if (code == 0x3A) {
+        hs_caps_ = !hs_caps_;
+      }
+      char ch = NameEntryChar(0, code);
+      if (ch != 0) {
+        const bool left_shift = KeyHeld(0x2A);
+        const bool right_shift = KeyHeld(0x36);
+        if (!hs_caps_) {
+          if (left_shift || right_shift) {
+            ch = NameEntryChar(1, code);
+          }
+        } else {
+          ch = (left_shift || !right_shift) ? NameEntryChar(2, code) : NameEntryChar(3, code);
+        }
+        if (((left_shift || right_shift) ? 1 : 0) != (hs_caps_ ? 1 : 0)) {
+          ch = NameEntryChar(1, code);
+        }
+        // buffer[len] = ch; the 10th character keeps being overwritten.
+        hs_buffer_.resize(static_cast<size_t>(hs_len_));
+        hs_buffer_.push_back(ch);
+        if (hs_len_ < 9) {
+          ++hs_len_;
+        }
+      }
+    }
     return;
   }
 
-  splash_frame_ = 0;
-  ++splash_page_;
-  if (splash_page_ >= 2) {
-    CompleteStartupSplashes();
+  // Footer loop: Enter release or a held Esc leave through the 0x3fd8 gate on the
+  // shared menu phase. While Esc is held nothing runs and nothing is presented.
+  if (KeyHeld(0x01)) {
+    ClearReleases();
+    menu_return_state_ = 1;
+    menu_pending_ = 1;
+    ++esc_hold_ticks_;
+    return;
+  }
+  if (esc_hold_ticks_ > 0) {
+    frontend_burst_ = std::min(esc_hold_ticks_ + 1, kStalePacerBurst);
+    esc_hold_ticks_ = 0;
+  }
+  if (PeekRelease() == 0x1C && menu_pending_ == 0) {
+    ClearReleases();
+    menu_return_state_ = 1;
+    menu_pending_ = 1;
+  }
+  StepFrontendPointfield();
+  if (menu_pending_ == 0) {
+    PulseRow(kHiscoreFooterRow, 0);
+  }
+  if (menu_pending_ == 1 && PulseRow(kHiscoreFooterRow, 1) == 1) {
+    screen_exit_ = true;
   }
 }
 
@@ -2026,108 +3537,6 @@ void MilestoneADemo::AdvanceTopOutTimers() {
   }
 }
 
-void MilestoneADemo::ActivateFrontendSelection() {
-  if (frontend_view_ == FrontendView::kSoundSetup) {
-    switch (frontend_selected_row_) {
-      case 0:
-        sound_device_index_ = (sound_device_index_ + 1) % static_cast<int>(kSoundDeviceNames.size());
-        PersistSetupState();
-        return;
-      case 1:
-        mixing_rate_hz_ = kMixingRates[(MixingRateIndex(mixing_rate_hz_) + 1) % static_cast<int>(kMixingRates.size())];
-        PersistSetupState();
-        return;
-      case 2:
-        stereo_flag_ = stereo_flag_ == 0 ? 1 : 0;
-        PersistSetupState();
-        return;
-      case 3:
-        bit_depth_flag_ = bit_depth_flag_ == 0 ? 1 : 0;
-        PersistSetupState();
-        return;
-      case 4:
-        BeginStartupSplashes();
-        return;
-      case 5:
-        quit_requested_ = true;
-        return;
-      default:
-        return;
-    }
-  }
-
-  if (frontend_view_ == FrontendView::kMainMenu) {
-    switch (frontend_selected_row_) {
-      case 0:
-        BeginSceneFade(PendingScene::kGameplayNewGame);
-        return;
-      case 1:
-        SetFrontendView(FrontendView::kOptions, 0);
-        return;
-      case 2:
-        music_track_index_ = (music_track_index_ + 1) % static_cast<int>(kMusicTracks.size());
-        PersistSetupState();
-        StartCurrentMusic("music-track-change");
-        return;
-      case 3:
-        start_level_ = (start_level_ + 1) % 10;
-        return;
-      case 4:
-        SetFrontendView(FrontendView::kHighScores, 0);
-        return;
-      case 5:
-        SetFrontendView(FrontendView::kCredits, 0);
-        return;
-      case 6:
-        ScheduleExitFade();
-        quit_requested_ = true;
-        return;
-      case 7:
-        if (live_game_available_) {
-          BeginSceneFade(PendingScene::kGameplayResume);
-        }
-        return;
-      default:
-        return;
-    }
-  }
-
-  if (frontend_view_ == FrontendView::kOptions) {
-    if (frontend_selected_row_ == 0) {
-      music_volume_ = (music_volume_ + 10) % 110;
-      PersistSetupState();
-      ApplyMusicVolume();
-    } else if (frontend_selected_row_ == 1) {
-      sfx_volume_ = (sfx_volume_ + 10) % 110;
-      PersistSetupState();
-    } else if (frontend_selected_row_ == 2) {
-      SetFrontendView(FrontendView::kKeyboardSetup, 0);
-    } else if (frontend_selected_row_ == 3) {
-      SetFrontendView(FrontendView::kMainMenu, 0);
-    }
-    return;
-  }
-
-  if (frontend_view_ == FrontendView::kKeyboardSetup) {
-    if (frontend_selected_row_ >= 0 && frontend_selected_row_ < static_cast<int>(keyboard_bindings_.size())) {
-      keyboard_capture_row_ = frontend_selected_row_;
-    } else if (frontend_selected_row_ == 5) {
-      SetFrontendView(FrontendView::kOptions, 2);
-      keyboard_capture_row_ = -1;
-    }
-  }
-}
-
-void MilestoneADemo::MoveFrontendSelection(int delta) {
-  const int row_count = SelectableFrontendRowCount();
-  if (row_count <= 0) {
-    return;
-  }
-
-  frontend_selected_row_ = (frontend_selected_row_ + delta + row_count) % row_count;
-  EmitAudioEvent("menu-row-move", 1);
-}
-
 void MilestoneADemo::TrackKeyDown(SDL_Keycode key) {
   const std::uint8_t original_scancode = OriginalScancodeForKey(key);
   if (original_scancode == 0) {
@@ -2136,6 +3545,7 @@ void MilestoneADemo::TrackKeyDown(SDL_Keycode key) {
 
   if (!held_original_scancodes_[original_scancode]) {
     held_original_scancode_frames_[original_scancode] = 0;
+    audit_pressed_[original_scancode] = true;
   }
   held_original_scancodes_[original_scancode] = true;
 }
@@ -2146,157 +3556,33 @@ void MilestoneADemo::TrackKeyUp(SDL_Keycode key) {
     return;
   }
 
+  if (held_original_scancodes_[original_scancode]) {
+    audit_released_[original_scancode] = true;
+  }
   held_original_scancodes_[original_scancode] = false;
   held_original_scancode_frames_[original_scancode] = 0;
 }
 
-void MilestoneADemo::SetFrontendView(FrontendView view, int selected_row) {
-  frontend_view_ = view;
-  const int row_count = SelectableFrontendRowCount();
-  frontend_selected_row_ = row_count <= 0 ? 0 : std::clamp(selected_row, 0, row_count - 1);
-  frontend_view_frame_ = 0;
-  high_score_bootstrap_frames_ = 0;
-  if (view == FrontendView::kCredits) {
-    credits_page_ = 0;
-    credits_page_timer_ = 0;
-  }
-  if (view != FrontendView::kKeyboardSetup) {
-    keyboard_capture_row_ = -1;
-  }
-  if (view != FrontendView::kHighScores && view != FrontendView::kHighScoreEntry) {
-    high_score_conceal_frames_ = 0;
-  }
-  if (view != FrontendView::kHighScoreEntry) {
-    high_score_entry_commit_pending_ = false;
-  }
-}
-
-void MilestoneADemo::BeginSceneFade(PendingScene target) {
-  pending_scene_ = target;
-  if (!fades_enabled_) {
-    CompleteSceneSwitch();  // instant switch for --no-fade / demo shortcuts
-    return;
-  }
-  screen_fade_ = ScreenFade::kOut;
-  screen_fade_frame_ = 0;
-}
-
-void MilestoneADemo::AdvanceScreenFade() {
-  ++screen_fade_frame_;
-  if (screen_fade_frame_ < kScreenFadeTicks) {
-    return;
-  }
-  screen_fade_frame_ = 0;
-  if (screen_fade_ == ScreenFade::kOut) {
-    CompleteSceneSwitch();  // swap content at full black, then fade the new scene in
-    screen_fade_ = ScreenFade::kIn;
-  } else {
-    screen_fade_ = ScreenFade::kNone;
-  }
-}
-
-void MilestoneADemo::CompleteSceneSwitch() {
-  switch (pending_scene_) {
-    case PendingScene::kFrontendFromGameplay:
-      scene_ = Scene::kFrontend;
-      SetFrontendView(FrontendView::kMainMenu, 0);
-      live_game_available_ = true;
-      break;
-    case PendingScene::kGameplayNewGame:
-      ResetLiveGameplayState();
-      live_game_active_ = true;
-      live_game_available_ = true;
-      scene_ = Scene::kGameplay;
-      StartCurrentMusic("music-continue-new-game");
-      break;
-    case PendingScene::kGameplayResume:
-      RestoreLiveSnapshot();
-      live_game_active_ = true;
-      scene_ = Scene::kGameplay;
-      StartCurrentMusic("music-continue-return-to-game");
-      break;
-    case PendingScene::kNone:
-      break;
-  }
-  pending_scene_ = PendingScene::kNone;
-}
-
 int MilestoneADemo::screen_fade_alpha() const {
-  if (screen_fade_ == ScreenFade::kOut) {
-    return std::clamp(screen_fade_frame_ * 255 / kScreenFadeTicks, 0, 255);
-  }
-  if (screen_fade_ == ScreenFade::kIn) {
-    return std::clamp(255 - (screen_fade_frame_ * 255 / kScreenFadeTicks), 0, 255);
-  }
-  // Boot splash pages fade in over the first kSplashFadeTicks frames and out
-  // over the last, holding fully visible between (RE 0x2998).
-  if (fades_enabled_ && scene_ == Scene::kSplash) {
-    if (splash_frame_ < kSplashFadeTicks) {
-      return std::clamp(255 - (splash_frame_ * 255 / kSplashFadeTicks), 0, 255);
-    }
-    const int out_start = kSplashPageFrames - kSplashFadeTicks;
-    if (splash_frame_ >= out_start) {
-      return std::clamp((splash_frame_ - out_start) * 255 / kSplashFadeTicks, 0, 255);
-    }
-  }
   return 0;
 }
 
-void MilestoneADemo::BeginStartupSplashes() {
-  scene_ = Scene::kSplash;
-  splash_page_ = 0;
-  splash_frame_ = 0;
-  keyboard_capture_row_ = -1;
-}
-
-void MilestoneADemo::CompleteStartupSplashes() {
-  scene_ = Scene::kFrontend;
-  splash_page_ = 0;
-  splash_frame_ = 0;
-  SetFrontendView(FrontendView::kMainMenu, 0);
-  StartCurrentMusic("music-start-after-startup");
-}
-
-bool MilestoneADemo::ApplyFrontendHorizontalEdit(int direction, bool allow_toggle_rows) {
-  direction = direction < 0 ? -1 : 1;
-  if (frontend_view_ == FrontendView::kOptions && frontend_selected_row_ == 0) {
-    music_volume_ = std::clamp(music_volume_ + (direction * 10), 0, 100);
-    PersistSetupState();
-    ApplyMusicVolume();
-    return true;
+const char* MilestoneADemo::FlowPhaseName() const {
+  switch (flow_phase_) {
+    case FlowPhase::kNone: return "none";
+    case FlowPhase::kSplash: return "splash";
+    case FlowPhase::kBootGap: return "boot-gap";
+    case FlowPhase::kEntryPaletteOut: return "pal-out";
+    case FlowPhase::kEntryTitleIn: return "title-in";
+    case FlowPhase::kReveal: return "reveal";
+    case FlowPhase::kScreen: return "screen";
+    case FlowPhase::kConceal: return "conceal";
+    case FlowPhase::kExitTitleOut: return "title-out";
+    case FlowPhase::kExitPaletteIn: return "pal-in";
+    case FlowPhase::kQuitTitleOut: return "quit-out";
+    case FlowPhase::kMusicFreeze: return "music-freeze";
   }
-  if (frontend_view_ == FrontendView::kOptions && frontend_selected_row_ == 1) {
-    sfx_volume_ = std::clamp(sfx_volume_ + (direction * 10), 0, 100);
-    PersistSetupState();
-    return true;
-  }
-  if (frontend_view_ == FrontendView::kSoundSetup) {
-    if (frontend_selected_row_ == 0) {
-      sound_device_index_ =
-          NormalizeModulo(sound_device_index_ + direction, static_cast<int>(kSoundDeviceNames.size()));
-      PersistSetupState();
-      return true;
-    }
-    if (frontend_selected_row_ == 1) {
-      const int rate_index =
-          NormalizeModulo(MixingRateIndex(mixing_rate_hz_) + direction, static_cast<int>(kMixingRates.size()));
-      mixing_rate_hz_ = kMixingRates[rate_index];
-      PersistSetupState();
-      return true;
-    }
-    if (allow_toggle_rows && frontend_selected_row_ == 2) {
-      stereo_flag_ = stereo_flag_ == 0 ? 1 : 0;
-      PersistSetupState();
-      return true;
-    }
-    if (allow_toggle_rows && frontend_selected_row_ == 3) {
-      bit_depth_flag_ = bit_depth_flag_ == 0 ? 1 : 0;
-      PersistSetupState();
-      return true;
-    }
-  }
-
-  return false;
+  return "?";
 }
 
 void MilestoneADemo::PersistSetupState() const {
@@ -2305,6 +3591,13 @@ void MilestoneADemo::PersistSetupState() const {
         SDL_LOG_CATEGORY_APPLICATION,
         "Failed to save SETUP.DAT state: %s",
         ATET_PORT_SETUP_DAT_PATH);
+    return;
+  }
+  // The original writes SETUP.DAT only at the frontend exits (0x3604 from the
+  // dispatcher's state 3 and exit tail) and when it creates the defaults; the log
+  // line lets the suites check that an edit alone does not save (IN-14, HS-26).
+  if (debug_state_logging_) {
+    SDL_Log("Setup: SETUP.DAT saved at tick %u", static_cast<unsigned>(ticks_));
   }
 }
 
@@ -2321,6 +3614,9 @@ void MilestoneADemo::EmitAudioEvent(const char* event_name, int slot, int pan, i
       sfx_volume_override >= 0 ? sfx_volume_override : sfx_volume_,
       pan,
       voice_class});
+  audit_emitted_.push_back(AuditEmitted{audit_stage_, event_name, true, slot, music_track_index_, music_volume_,
+                                        sfx_volume_override >= 0 ? sfx_volume_override : sfx_volume_, pan,
+                                        voice_class});
 }
 
 int MilestoneADemo::PanForPieceColumn(int piece_x) const {
@@ -2341,6 +3637,8 @@ void MilestoneADemo::EmitMusicEvent(const char* event_name) {
       music_track_index_,
       music_volume_,
       sfx_volume_});
+  audit_emitted_.push_back(
+      AuditEmitted{audit_stage_, event_name, false, 0, music_track_index_, music_volume_, sfx_volume_, 0x80, 0});
 }
 
 void MilestoneADemo::FlushAudioEvents() {
@@ -2383,139 +3681,24 @@ void MilestoneADemo::ApplyMusicVolume() {
   EmitMusicEvent("music-volume-apply");
 }
 
-void MilestoneADemo::BeginHighScoreConcealToMain() {
-  if (high_score_conceal_frames_ <= 0) {
-    high_score_conceal_frames_ = kHighScoreConcealFrames;
-    EmitMusicEvent("high-score-conceal-to-main");
-  }
-}
-
-bool MilestoneADemo::HandleHighScoreNameEntry(SDL_Keycode key) {
-  if (high_score_entry_row_ < 0 || high_score_entry_row_ >= static_cast<int>(high_scores_.size())) {
-    SetFrontendView(FrontendView::kHighScores, 0);
-    return true;
-  }
-
-  if (key == SDLK_ESCAPE) {
-    SetFrontendView(FrontendView::kHighScores, 0);
-    high_score_entry_row_ = -1;
-    high_score_entry_name_.clear();
-    high_score_entry_lowercase_ = false;
-    high_score_entry_commit_pending_ = false;
-    return true;
-  }
-
-  if (!HighScoreEntryInputReady()) {
-    return true;
-  }
-
-  if (key == SDLK_RETURN) {
-    high_score_entry_commit_pending_ = true;
-    return true;
-  }
-
-  if (key == SDLK_BACKSPACE) {
-    if (!high_score_entry_name_.empty()) {
-      high_score_entry_name_.pop_back();
-    }
-    return true;
-  }
-
-  if (key == SDLK_LSHIFT || key == SDLK_RSHIFT) {
-    high_score_entry_lowercase_ = !high_score_entry_lowercase_;
-    return true;
-  }
-
-  if (high_score_entry_name_.size() >= 10) {
-    return true;
-  }
-
-  if (key >= SDLK_A && key <= SDLK_Z) {
-    const char base = high_score_entry_lowercase_ ? 'a' : 'A';
-    high_score_entry_name_.push_back(static_cast<char>(base + (key - SDLK_A)));
-    return true;
-  }
-
-  if (key >= SDLK_0 && key <= SDLK_9) {
-    high_score_entry_name_.push_back(static_cast<char>('0' + (key - SDLK_0)));
-    return true;
-  }
-
-  if (key == SDLK_SPACE && !high_score_entry_name_.empty()) {
-    high_score_entry_name_.push_back(' ');
-    return true;
-  }
-  if (key == SDLK_SPACE) {
-    return true;
-  }
-
-  return false;
-}
-
-void MilestoneADemo::CommitHighScoreNameEntry() {
-  if (high_score_entry_row_ < 0 || high_score_entry_row_ >= static_cast<int>(high_scores_.size())) {
-    high_score_entry_commit_pending_ = false;
-    return;
-  }
-
-  high_scores_[high_score_entry_row_].name = high_score_entry_name_.empty() ? "Player" : high_score_entry_name_;
-  PersistSetupState();
-  SetFrontendView(FrontendView::kHighScores, 0);
-  high_score_entry_row_ = -1;
-  high_score_entry_name_.clear();
-  high_score_entry_lowercase_ = false;
-  high_score_entry_commit_pending_ = false;
-}
-
-void MilestoneADemo::CaptureKeyboardBinding(std::uint8_t original_scancode) {
-  if (keyboard_capture_row_ < 0 || keyboard_capture_row_ >= static_cast<int>(keyboard_bindings_.size())) {
-    keyboard_capture_row_ = -1;
-    return;
-  }
-
-  keyboard_bindings_[keyboard_capture_row_] = original_scancode;
-  keyboard_capture_row_ = -1;
-  PersistSetupState();
-}
-
 void MilestoneADemo::BeginHighScoreNameEntry(int score, int lines) {
+  // Game over -> 0x3830(9): the session loop clears the release history (0x4ba),
+  // restores the area under GAME OVER only in the saved work buffer (0x23ac), and
+  // the dispatcher entry fades the displayed picture out, fades the title in and
+  // runs 0x50b0(1), which qualifies the run and starts the name entry.
   top_out_handoff_pending_ = false;
-  const bool use_state9_bootstrap =
-      scene_ == Scene::kTopOut || gameplay_phase_ == GameplayPhase::kTopOutDissolve;
-  if (use_state9_bootstrap) {
+  const bool from_top_out = scene_ == Scene::kTopOut || gameplay_phase_ == GameplayPhase::kTopOutDissolve;
+  if (from_top_out) {
     StartCurrentMusic("music-continue-topout-highscore");
   }
-  int insert_index = -1;
-  for (size_t index = 0; index < high_scores_.size(); ++index) {
-    if (score > high_scores_[index].score) {
-      insert_index = static_cast<int>(index);
-      break;
-    }
-  }
-
-  if (insert_index < 0) {
-    scene_ = Scene::kFrontend;
-    SetFrontendView(FrontendView::kHighScores, 0);
-    high_score_entry_row_ = -1;
-    high_score_entry_name_.clear();
-    high_score_entry_lowercase_ = false;
-    high_score_entry_commit_pending_ = false;
-    high_score_bootstrap_frames_ = use_state9_bootstrap ? kState9BootstrapFrames : 0;
-    return;
-  }
-
-  for (int index = static_cast<int>(high_scores_.size()) - 1; index > insert_index; --index) {
-    high_scores_[index] = high_scores_[index - 1];
-  }
-
-  high_scores_[insert_index] = HighScoreRecord{"", score, lines};
-  high_score_entry_row_ = insert_index;
-  high_score_entry_name_.clear();
-  high_score_entry_lowercase_ = false;
-  high_score_entry_commit_pending_ = false;
-  scene_ = Scene::kFrontend;
-  SetFrontendView(FrontendView::kHighScoreEntry, 0);
-  high_score_bootstrap_frames_ = use_state9_bootstrap ? kState9BootstrapFrames : 0;
+  top_out_score_ = score;
+  top_out_lines_ = lines;
+  ClearReleases();
+  // Callers run from key events and Render (outside Tick); the original's session loop
+  // reacts inside the tick that reads the release, so the entry starts with the next
+  // Tick (its 63-tick fade then counts from that tick).
+  state9_pending_ = true;
+  state9_source_ = scene_ == Scene::kTopOut ? FrozenSource::kTopOut : FrozenSource::kGameplay;
 }
 
 void MilestoneADemo::BeginTopOutDemo(int score, int lines) {
@@ -2535,6 +3718,7 @@ void MilestoneADemo::BeginTopOutDemo(int score, int lines) {
   gameplay_phase_ = GameplayPhase::kTopOutDissolve;
   live_game_available_ = false;
   EmitAudioEvent("top-out", 5);
+  flow_phase_ = FlowPhase::kNone;  // --topout-demo starts here from the splash state
   scene_ = Scene::kTopOut;
 }
 
@@ -2543,6 +3727,7 @@ void MilestoneADemo::BeginLiveGameplayDemo(int simulated_clear_count) {
   if (simulated_clear_count > 0) {
     InjectFilledRowsForSmoke(std::clamp(simulated_clear_count, 1, 4));
   }
+  flow_phase_ = FlowPhase::kNone;  // --live-demo starts here from the splash state
   scene_ = Scene::kGameplay;
 }
 
@@ -2694,12 +3879,17 @@ void MilestoneADemo::StepLiveGameplay() {
 }
 
 void MilestoneADemo::StepFallingGameplay() {
+  audit_gravity_active_ = true;
+  audit_gravity_rate_ = CurrentDropIncrement();
+  audit_gravity_acc_before_ = gravity_accumulator_;
   gravity_accumulator_ += CurrentDropIncrement();
   bool moved_down = false;
   while (gravity_accumulator_ >= kGameplayGravityThreshold) {
     gravity_accumulator_ -= kGameplayGravityThreshold;
+    ++audit_descent_attempts_;
     if (TryMoveLivePiece(0, 1)) {
       moved_down = true;
+      ++audit_descent_successes_;
     } else {
       break;
     }
@@ -2854,6 +4044,7 @@ void MilestoneADemo::CollapseMarkedRows() {
 }
 
 void MilestoneADemo::SeedLineClearDebris(const std::vector<int>& rows) {
+  AuditScopedTicks audit_ticks(&g_audit.line_clear_seed_ticks);
   const int style = NormalizeModulo(live_level_, 10);
   for (const int row : rows) {
     if (row < 0 || row >= kBoardHeight) {
@@ -2941,8 +4132,10 @@ void MilestoneADemo::EmitLineClearParticle(int style, int col, int row8, int scr
 
 void MilestoneADemo::SpawnDebrisPolar(int screen_x, int screen_y, int speed, int angle, int lifetime, int color) {
   if (debris_particles_.size() >= kGameplayMaxDebrisParticles) {
+    ++audit_particles_dropped_;
     return;
   }
+  ++audit_particles_spawned_;
   // Polar velocity (0x2f78): v = -(sine[idx] * speed) >> 7 with the original's
   // 0x8001 sine amplitude. sine_table_ here has amplitude 0x10000 (2x), so shift
   // by 8 to reproduce the same velocity scale. Position/velocity are 16.16.
@@ -2956,8 +4149,10 @@ void MilestoneADemo::SpawnDebrisPolar(int screen_x, int screen_y, int speed, int
 
 void MilestoneADemo::SpawnDebrisTarget(int screen_x, int screen_y, int target_x, int target_y, int lifetime, int color) {
   if (debris_particles_.size() >= kGameplayMaxDebrisParticles) {
+    ++audit_particles_dropped_;
     return;
   }
+  ++audit_particles_spawned_;
   // Target velocity (0x3034): v = (target - start) * 65536 / lifetime.
   const int life = std::max(1, lifetime);
   const int vx = ((target_x - screen_x) << 16) / life;
@@ -2967,6 +4162,8 @@ void MilestoneADemo::SpawnDebrisTarget(int screen_x, int screen_y, int target_x,
 }
 
 void MilestoneADemo::StepDebrisParticles() {
+  AuditScopedTicks audit_ticks(&g_audit.debris_step_ticks);
+  const size_t audit_before = debris_particles_.size();
   for (DebrisParticle& particle : debris_particles_) {
     particle.x += particle.vx;
     particle.y += particle.vy;
@@ -2978,9 +4175,13 @@ void MilestoneADemo::StepDebrisParticles() {
           debris_particles_.end(),
           [](const DebrisParticle& particle) { return particle.age >= kDebrisAgeFull; }),
       debris_particles_.end());
+  audit_particles_retired_ += static_cast<std::uint32_t>(audit_before - debris_particles_.size());
+  g_audit.debris_active = static_cast<std::uint32_t>(debris_particles_.size());
 }
 
 void MilestoneADemo::RenderDebrisParticles(SDL_Renderer* renderer) const {
+  AuditScopedTicks audit_ticks(&g_audit.debris_render_ticks);
+  g_audit.debris_active = static_cast<std::uint32_t>(debris_particles_.size());
   for (const DebrisParticle& particle : debris_particles_) {
     const int stage = std::clamp(particle.age >> 8, 0, 3);  // 4 stages of 0x100
     const Uint8 ramp_index = particle_ramps_[static_cast<size_t>(std::clamp(particle.color, 0, 255)) * 4 +
@@ -2997,6 +4198,7 @@ void MilestoneADemo::RenderDebrisParticles(SDL_Renderer* renderer) const {
         1.0f,
     };
     SDL_RenderFillRect(renderer, &debris_rect);
+    ++g_audit.debris_drawn;
   }
 }
 
@@ -3007,6 +4209,7 @@ void MilestoneADemo::RenderDebrisParticles(SDL_Renderer* renderer) const {
 // newly crosses into the dissolved region, spray the certified debris pool
 // upward from that row's filled cells.
 void MilestoneADemo::UpdateTopOutDissolve() {
+  AuditScopedTicks audit_ticks(&g_audit.topout_update_ticks);
   // RE 0x1fc6: the dissolve front advances ONE pixel-row per frame down the whole
   // gameplay area (kBoardHeight*8 pixel rows), spraying that row's debris as it passes.
   // A pixel-row cascade (not board-row bursts) is what makes the next row start
@@ -3218,7 +4421,13 @@ std::uint32_t MilestoneADemo::NextGameplayRandomU32() {
     gameplay_random_index_ = 0;
   }
 
-  return gameplay_random_table_[static_cast<size_t>(gameplay_random_index_)];
+  const std::uint32_t audit_value = gameplay_random_table_[static_cast<size_t>(gameplay_random_index_)];
+  ++audit_rng_draws_;
+  audit_rng_hash_ = Fnv1a64Update(audit_rng_hash_, &audit_value, sizeof(audit_value));
+  if (audit_rng_values_.size() < 16384) {
+    audit_rng_values_.push_back(audit_value);
+  }
+  return audit_value;
 }
 
 void MilestoneADemo::SaveLiveSnapshot() {
@@ -3373,130 +4582,6 @@ void MilestoneADemo::ResetSetupStateToDefaults() {
   }
 }
 
-std::vector<std::string> MilestoneADemo::CurrentFrontendRows() const {
-  if (frontend_view_ == FrontendView::kMainMenu) {
-    return {
-        "New Game",
-        "Options",
-        std::string("Music:`") + kMusicTracks[music_track_index_] + "'",
-        "Level " + std::to_string(start_level_),
-        "High Scores",
-        "Credits",
-        "Exit Game",
-        "Return to Game",
-    };
-  }
-
-  if (frontend_view_ == FrontendView::kOptions) {
-    return {
-        FormatPercentRow("Music Volume:", music_volume_),
-        FormatPercentRow("Sound FX Volume:", sfx_volume_),
-        "Keyboard Setup",
-        "Back To Main Menu",
-        "",
-        "",
-        "",
-        "",
-    };
-  }
-
-  if (frontend_view_ == FrontendView::kKeyboardSetup) {
-    return {
-        KeyboardBindingRowText(0),
-        KeyboardBindingRowText(1),
-        KeyboardBindingRowText(2),
-        KeyboardBindingRowText(3),
-        KeyboardBindingRowText(4),
-        "Back to Options Menu",
-        "",
-        "",
-    };
-  }
-
-  if (frontend_view_ == FrontendView::kSoundSetup) {
-    return {
-        SoundSetupRowText(0),
-        SoundSetupRowText(1),
-        SoundSetupRowText(2),
-        SoundSetupRowText(3),
-        "Play Game",
-        "Exit to Dos",
-        "",
-        "",
-    };
-  }
-
-  if (frontend_view_ == FrontendView::kHighScores || frontend_view_ == FrontendView::kHighScoreEntry) {
-    // The original's high-score screen has no "High Scores" heading -- the five
-    // score rows sit directly under the shared logo (verified against the running
-    // original), starting at the same row Y as the menu's first row.
-    return {
-        HighScoreRowText(0),
-        HighScoreRowText(1),
-        HighScoreRowText(2),
-        HighScoreRowText(3),
-        HighScoreRowText(4),
-        "Return to Main Menu",
-    };
-  }
-
-  std::vector<std::string> rows;
-  std::string page = kCreditsPages[credits_page_];
-  size_t start = 0;
-  while (start <= page.size()) {
-    const size_t newline = page.find('\n', start);
-    rows.push_back(page.substr(start, newline == std::string::npos ? std::string::npos : newline - start));
-    if (newline == std::string::npos) {
-      break;
-    }
-    start = newline + 1;
-  }
-  return rows;
-}
-
-std::string MilestoneADemo::KeyboardBindingRowText(int row_index) const {
-  if (row_index < 0 || row_index >= static_cast<int>(keyboard_bindings_.size())) {
-    return {};
-  }
-
-  std::string row = std::string(kKeyboardBindingLabels[row_index]) + ":";
-  if (keyboard_capture_row_ == row_index) {
-    row += "_";
-  } else {
-    row += KeyNameForBinding(keyboard_bindings_[row_index]);
-  }
-  return row;
-}
-
-std::string MilestoneADemo::HighScoreRowText(int row_index) const {
-  if (row_index < 0 || row_index >= static_cast<int>(high_scores_.size())) {
-    return {};
-  }
-
-  const HighScoreRecord& record = high_scores_[row_index];
-  std::string name = record.name.empty() ? "Nobody" : record.name;
-  if (frontend_view_ == FrontendView::kHighScoreEntry && row_index == high_score_entry_row_ &&
-      HighScoreEntryInputReady()) {
-    name = high_score_entry_name_.empty() ? "_" : high_score_entry_name_ + "_";
-  }
-  return name + " " + std::to_string(record.score) + " " + std::to_string(record.lines);
-}
-
-std::string MilestoneADemo::SoundSetupRowText(int row_index) const {
-  switch (row_index) {
-    case 0:
-      return std::string("Sound Device:") + kSoundDeviceNames[std::clamp(sound_device_index_, 0, static_cast<int>(kSoundDeviceNames.size()) - 1)];
-    case 1:
-      return "Mixing Rate:" + std::to_string(mixing_rate_hz_);
-    case 2:
-      return std::string("Output:") + (stereo_flag_ == 0 ? "Mono" : "Stereo");
-    case 3:
-      return std::string("Sample Size:") + (bit_depth_flag_ == 0 ? "8 Bit" : "16 Bit");
-    default:
-      return {};
-  }
-}
-
 int MilestoneADemo::MeasureFrontendText(const std::string& text) const {
   int width = 0;
   for (const unsigned char raw_byte : text) {
@@ -3511,84 +4596,33 @@ int MilestoneADemo::MeasureFrontendText(const std::string& text) const {
 }
 
 int MilestoneADemo::PulseRevealAmount() const {
-  // Generic menu-row pulse, decoded exactly from RE 0x3fd8: reveal = sine[phase]/0x800
-  // + 0x30, phase advancing 0x20 per frame (period 0x800/0x20 = 64 frames, ~0.91s at
-  // 70Hz). The original sine table amplitude is 0x8001, so sine/0x800 spans +/-0x10 =>
-  // reveal 0x20..0x40, symmetric around the settled 0x30. Peak 0x40 renders a 16px row
-  // (0x40/4) that exactly fills 0x60cc's 16-row window, so it never clips and never
-  // exceeds the 17px row pitch -> NO neighbour overlap. IMPORTANT: this port's
-  // sine_table_ has amplitude 0x10000 (2x the original's 0x8001), so divide by 0x1000
-  // (not 0x800) to reproduce the same +/-0x10 swing. (Earlier passes used 0x40/frame
-  // with /0x800 -> a 32-frame 0x10..0x50 swing, 2x too fast AND 2x too tall = clipped
-  // + overlapping; then over-corrected to a grow-up-only 0x30..0x48 that still
-  // overshot the pitch on middle rows -- the "overlapping everywhere" report.)
-  return TruncDiv(sine_table_[(frontend_frame_counter_ * 0x20) & 0x7FF], 0x1000) + 0x30;
+  // The amount the selected (pulsing) row was last drawn with: 0x3fd8 computes
+  // trunc(sine[phase] / 2048) + 0x30 on the original's peak-32768 table.
+  int row = frontend_selected_row_;
+  if (frontend_view_ == FrontendView::kMainMenu) {
+    row = main_menu_row_;
+  } else if (frontend_view_ == FrontendView::kHighScoreEntry && hs_slot_ >= 0) {
+    row = hs_slot_;
+  } else if (frontend_view_ == FrontendView::kHighScores) {
+    row = kHiscoreFooterRow;
+  }
+  if (row < 0 || row >= kFrontendRowCount) {
+    return 0;
+  }
+  return row_amount_[static_cast<size_t>(row)];
 }
 
-int MilestoneADemo::FrontendRowRevealDelayFrames() const {
-  const bool high_score_view =
+int MilestoneADemo::VisibleRowCount() const {
+  const bool high_score_table =
       frontend_view_ == FrontendView::kHighScores || frontend_view_ == FrontendView::kHighScoreEntry;
-  return kFrontendObjectWarmupFrames + (high_score_view ? high_score_bootstrap_frames_ : 0);
-}
-
-int MilestoneADemo::HighScoreBootstrapRemainingFrames() const {
-  const bool high_score_view =
-      frontend_view_ == FrontendView::kHighScores || frontend_view_ == FrontendView::kHighScoreEntry;
-  if (!high_score_view || high_score_bootstrap_frames_ <= 0) {
-    return 0;
+  int visible = 0;
+  for (int row = 0; row < kFrontendRowCount; ++row) {
+    const bool has_text = !row_text_[static_cast<size_t>(row)].empty() || (high_score_table && row < 5);
+    if (row_amount_[static_cast<size_t>(row)] > 0 && has_text) {
+      ++visible;
+    }
   }
-
-  return std::max(0, high_score_bootstrap_frames_ - frontend_view_frame_);
-}
-
-int MilestoneADemo::RevealedFrontendRowCount(size_t row_count) const {
-  if (row_count == 0) {
-    return 0;
-  }
-
-  const int active_frame = frontend_view_frame_ - FrontendRowRevealDelayFrames();
-  if (active_frame < 0) {
-    return 0;
-  }
-
-  return std::clamp((active_frame / kFrontendRowRevealIntervalFrames) + 1, 0, static_cast<int>(row_count));
-}
-
-int MilestoneADemo::VisibleFrontendRowCount(size_t row_count) const {
-  const int revealed_rows = RevealedFrontendRowCount(row_count);
-  if (high_score_conceal_frames_ <= 0 ||
-      (frontend_view_ != FrontendView::kHighScores && frontend_view_ != FrontendView::kHighScoreEntry)) {
-    return revealed_rows;
-  }
-
-  const int conceal_elapsed = kHighScoreConcealFrames - high_score_conceal_frames_;
-  const int concealed_rows =
-      std::clamp(conceal_elapsed / kFrontendRowRevealIntervalFrames, 0, static_cast<int>(row_count));
-  return std::max(0, revealed_rows - concealed_rows);
-}
-
-bool MilestoneADemo::HighScoreEntryInputReady() const {
-  return frontend_view_ == FrontendView::kHighScoreEntry &&
-         RevealedFrontendRowCount(kHighScoreTableRevealRows) >= kHighScoreTableRevealRows;
-}
-
-int MilestoneADemo::SelectableFrontendRowCount() const {
-  switch (frontend_view_) {
-    case FrontendView::kMainMenu:
-      return 8;
-    case FrontendView::kOptions:
-      return 4;
-    case FrontendView::kKeyboardSetup:
-      return 6;
-    case FrontendView::kSoundSetup:
-      return 6;
-    case FrontendView::kHighScores:
-    case FrontendView::kHighScoreEntry:
-    case FrontendView::kCredits:
-      return 0;
-  }
-
-  return 0;
+  return visible;
 }
 
 void MilestoneADemo::RenderGameplay(SDL_Renderer* renderer) const {
@@ -3700,6 +4734,361 @@ void MilestoneADemo::RenderGameplay(SDL_Renderer* renderer) const {
         kGameplayClearX + (piece.x * kPieceTileSize),
         kGameplayClearY + (piece.y * kPieceTileSize));
   }
+}
+
+// ============================================================================
+// Audit instrumentation (audit/instrument worktree only). Read-only views of the
+// demo state plus per-step accumulators reset by AuditBeginStep.
+// ============================================================================
+namespace {
+
+const char* AuditActionName(size_t index) {
+  static constexpr const char* kNames[8] = {"up",          "down",         "left",    "right",
+                                            "rotate_left", "rotate_right", "confirm", "escape"};
+  return index < 8 ? kNames[index] : "?";
+}
+
+}  // namespace
+
+void MilestoneADemo::AuditBeginStep(std::uint64_t step) {
+  audit_step_ = step;
+  audit_stage_ = "input";
+  audit_emitted_.clear();
+  audit_rng_index_before_ = gameplay_random_index_;
+  audit_rng_draws_ = 0;
+  audit_rng_hash_ = kFnvOffsetBasis;
+  audit_rng_values_.clear();
+  audit_gravity_active_ = false;
+  audit_gravity_rate_ = 0;
+  audit_gravity_acc_before_ = gravity_accumulator_;
+  audit_descent_attempts_ = 0;
+  audit_descent_successes_ = 0;
+  audit_score_before_ = live_score_;
+  audit_particles_spawned_ = 0;
+  audit_particles_dropped_ = 0;
+  audit_particles_retired_ = 0;
+  audit_pressed_.fill(false);
+  audit_released_.fill(false);
+  audit_held_at_step_start_ = held_original_scancodes_;
+}
+
+void MilestoneADemo::AuditWritePresentation(JsonOut& json) const {
+  json.BeginObject()
+      .Key("splash_frame").Int(splash_frame_)
+      .Key("frontend_frame_counter").Int(frontend_frame_counter_)
+      .Key("frontend_view_frame").Int(frontend_view_frame_)
+      .Key("pulse").Int(PulseRevealAmount())
+      .Key("top_out_frame").Int(top_out_frame_)
+      .Key("top_out_dissolved_pixel_rows").Int(top_out_dissolved_rows_)
+      .Key("debris").UInt(debris_particles_.size())
+      .Key("fade_alpha").Int(screen_fade_alpha())
+      .Key("tick").UInt(ticks_)
+      .Key("flow").Str(FlowPhaseName())
+      .EndObject();
+}
+
+void MilestoneADemo::AuditWriteEmittedEvents(JsonOut& json) const {
+  json.BeginArray();
+  for (const AuditEmitted& event : audit_emitted_) {
+    json.BeginObject().Key("stage").Str(event.stage).Key("kind").Str(event.is_sfx ? "sfx" : "music").Key("name").Str(
+        event.name);
+    if (event.is_sfx) {
+      json.Key("slot").Int(event.slot).Key("sfx_volume").Int(event.sfx_volume).Key("pan").Int(event.pan).Key(
+          "voice_class").Int(event.voice_class);
+    } else {
+      json.Key("track").Int(event.track).Key("music_volume").Int(event.music_volume);
+    }
+    json.EndObject();
+  }
+  json.EndArray();
+}
+
+void MilestoneADemo::AuditWriteState(JsonOut& json, bool include_rng_values) const {
+  const char* scene = "frontend";
+  switch (scene_) {
+    case Scene::kSplash: scene = "splash"; break;
+    case Scene::kFrontend: scene = "frontend"; break;
+    case Scene::kGameplay: scene = "gameplay"; break;
+    case Scene::kTopOut: scene = "topout"; break;
+  }
+  const char* view = "main_menu";
+  switch (frontend_view_) {
+    case FrontendView::kMainMenu: view = "main_menu"; break;
+    case FrontendView::kOptions: view = "options"; break;
+    case FrontendView::kKeyboardSetup: view = "keyboard_setup"; break;
+    case FrontendView::kHighScores: view = "high_scores"; break;
+    case FrontendView::kHighScoreEntry: view = "high_score_entry"; break;
+    case FrontendView::kCredits: view = "credits"; break;
+    case FrontendView::kSoundSetup: view = "sound_setup"; break;
+  }
+  const char* phase = "falling";
+  if (gameplay_phase_ == GameplayPhase::kCollapse) {
+    phase = "collapse";
+  } else if (gameplay_phase_ == GameplayPhase::kTopOutDissolve) {
+    phase = "topout_dissolve";
+  }
+  // Fade fields keep their old names: state = the dispatcher fade running
+  // ("pal-out" 0x64f0, "title-in" 0x63b8, "title-out" 0x62e0, "pal-in" 0x6498,
+  // "quit-out" state 3), frame = e (ticks since that fade started).
+  const char* fade = "none";
+  switch (flow_phase_) {
+    case FlowPhase::kEntryPaletteOut: fade = "pal-out"; break;
+    case FlowPhase::kEntryTitleIn: fade = "title-in"; break;
+    case FlowPhase::kExitTitleOut: fade = "title-out"; break;
+    case FlowPhase::kExitPaletteIn: fade = "pal-in"; break;
+    case FlowPhase::kQuitTitleOut: fade = "quit-out"; break;
+    default: break;
+  }
+  const char* pending = "none";
+  switch (flow_exit_) {
+    case FlowExit::kNone: pending = dispatch_state_ == 1 && flow_phase_ == FlowPhase::kEntryPaletteOut ? "frontend_from_gameplay" : "none"; break;
+    case FlowExit::kNewGame: pending = "gameplay_new_game"; break;
+    case FlowExit::kResume: pending = "gameplay_resume"; break;
+    case FlowExit::kSplashes: pending = "splashes"; break;
+  }
+
+  json.Key("scene").Str(scene).Key("scene_name").Str(scene_name());
+  json.Key("splash").BeginObject().Key("page").Int(splash_page_).Key("frame").Int(splash_frame_).EndObject();
+  json.Key("session")
+      .BeginObject()
+      .Key("live_game_active").Bool(live_game_active_)
+      .Key("live_game_available").Bool(live_game_available_)
+      .Key("quit_requested").Bool(quit_requested_)
+      .Key("gameplay_preset").Int(gameplay_preset_index_)
+      .EndObject();
+  json.Key("phase").Str(phase);
+
+  // Piece (port numbering; geometry from RotatedCells, i.e. what draw/collision use).
+  json.Key("piece").BeginObject().Key("id").Int(live_piece_.type).Key("rotation").Int(live_piece_.rotation).Key("x").Int(
+      live_piece_.x).Key("y").Int(live_piece_.y).Key("next").Int(live_next_piece_type_);
+  json.Key("cells").BeginArray();
+  for (const CellOffset& cell : RotatedCells(live_piece_.type, live_piece_.rotation)) {
+    json.BeginArray().Int(live_piece_.x + cell.x).Int(live_piece_.y + cell.y).EndArray();
+  }
+  json.EndArray();
+  json.Key("stats").BeginArray();
+  for (const int count : live_piece_stats_) {
+    json.Int(count);
+  }
+  json.EndArray().EndObject();
+
+  // Gravity bracket for this step (StepFallingGameplay); rate includes the 0x8000 soft-drop override.
+  json.Key("gravity").BeginObject().Key("stepped").Bool(audit_gravity_active_);
+  if (audit_gravity_active_) {
+    json.Key("rate").Int(audit_gravity_rate_).Key("acc_before").Int(audit_gravity_acc_before_);
+  } else {
+    json.Key("rate").Null().Key("acc_before").Null();
+  }
+  json.Key("acc_after").Int(gravity_accumulator_)
+      .Key("natural_rate").Int(CurrentGravityRate())
+      .Key("soft_drop_override").Bool(audit_gravity_active_ && audit_gravity_rate_ == kSoftDropIncrement &&
+                                      CurrentGravityRate() != kSoftDropIncrement)
+      .Key("descent_attempts").Int(audit_descent_attempts_)
+      .Key("descent_successes").Int(audit_descent_successes_)
+      .Key("lock_frames").Int(lock_frames_)
+      .Key("down_lockout").Int(down_lockout_frames_)
+      .EndObject();
+
+  // Input: the eight semantic actions (v1 trace order) mapped through the bindings.
+  const std::array<std::uint8_t, 8> action_scancodes = {
+      0xC8, keyboard_bindings_[0], keyboard_bindings_[1], keyboard_bindings_[2],
+      keyboard_bindings_[3], keyboard_bindings_[4], 0x1C, 0x01};
+  auto write_set = [&](const std::array<bool, 256>& states) {
+    json.BeginArray();
+    for (size_t i = 0; i < action_scancodes.size(); ++i) {
+      const std::uint8_t sc = action_scancodes[i];
+      if (sc != 0 && states[sc]) {
+        json.Str(AuditActionName(i));
+      }
+    }
+    json.EndArray();
+  };
+  json.Key("input").BeginObject();
+  json.Key("held_at_step_start");
+  write_set(audit_held_at_step_start_);
+  json.Key("held");
+  write_set(held_original_scancodes_);
+  json.Key("pressed");
+  write_set(audit_pressed_);
+  json.Key("released");
+  write_set(audit_released_);
+  json.Key("held_frames").BeginObject();
+  for (size_t i = 0; i < action_scancodes.size(); ++i) {
+    const std::uint8_t sc = action_scancodes[i];
+    json.Key(AuditActionName(i)).Int(sc != 0 && held_original_scancodes_[sc] ? held_original_scancode_frames_[sc] : 0);
+  }
+  json.EndObject();
+  // Gameplay auto-repeat fires in Tick when held_frames > 0 && held_frames % 8 == 0
+  // (kGameplayBindingRepeatFrames); the frontend Left/Right edit repeats at 12 then every 4.
+  json.Key("das_period").Int(kGameplayBindingRepeatFrames);
+  json.Key("held_raw").BeginArray();
+  for (size_t sc = 0; sc < held_original_scancodes_.size(); ++sc) {
+    if (held_original_scancodes_[sc]) {
+      json.Int(static_cast<int>(sc));
+    }
+  }
+  json.EndArray().EndObject();
+
+  // RNG (consumption 0x3280 model): draws this step, FNV-1a64 over the raw LE u32 values.
+  json.Key("rng")
+      .BeginObject()
+      .Key("seed").UInt(piece_seed_)
+      .Key("state").UInt(gameplay_random_state_)
+      .Key("index_before").Int(audit_rng_index_before_)
+      .Key("index_after").Int(gameplay_random_index_)
+      .Key("draws").UInt(audit_rng_draws_)
+      .Key("values_fnv1a64").Str(Hex64(audit_rng_hash_));
+  json.Key("values");
+  if (include_rng_values || audit_rng_draws_ <= 8) {
+    json.BeginArray();
+    for (const std::uint32_t value : audit_rng_values_) {
+      json.UInt(value);
+    }
+    json.EndArray();
+  } else {
+    json.Null();
+  }
+  json.EndObject();
+
+  // Board: 20 rows top->bottom, 10 cells left->right, value = cell byte (0 empty,
+  // 1..7 = port piece type + 1). Hash = FNV-1a64 over the 200 bytes (v1 board domain).
+  std::uint64_t board_hash = kFnvOffsetBasis;
+  for (const int cell : live_board_cells_) {
+    const std::uint8_t byte = static_cast<std::uint8_t>(cell);
+    board_hash = Fnv1a64Update(board_hash, &byte, 1);
+  }
+  json.Key("board").BeginObject().Key("fnv1a64").Str(Hex64(board_hash)).Key("rows").BeginArray();
+  for (int y = 0; y < kBoardHeight; ++y) {
+    std::string row;
+    for (int x = 0; x < kBoardWidth; ++x) {
+      row += static_cast<char>('0' + std::clamp(live_board_cells_[static_cast<size_t>(y * kBoardWidth + x)], 0, 9));
+    }
+    json.Str(row);
+  }
+  json.EndArray().EndObject();
+
+  json.Key("score")
+      .BeginObject()
+      .Key("value").Int(live_score_)
+      .Key("lines").Int(live_lines_)
+      .Key("level").Int(live_level_)
+      .Key("start_level").Int(start_level_)
+      .Key("delta").Int(live_score_ - audit_score_before_)
+      .EndObject();
+
+  json.Key("clear").BeginObject().Key("rows").BeginArray();
+  for (const int row : pending_clear_rows_) {
+    json.Int(row);
+  }
+  json.EndArray().Key("collapse_frame").Int(collapse_frame_).EndObject();
+
+  json.Key("particles")
+      .BeginObject()
+      .Key("active").UInt(debris_particles_.size())
+      .Key("spawned").UInt(audit_particles_spawned_)
+      .Key("dropped_at_cap").UInt(audit_particles_dropped_)
+      .Key("retired").UInt(audit_particles_retired_)
+      .EndObject();
+
+  json.Key("warning")
+      .BeginObject()
+      .Key("band").Int(warning_band_)
+      .Key("cooldowns").BeginArray().Int(warning_cooldowns_[0]).Int(warning_cooldowns_[1]).Int(warning_cooldowns_[2]).EndArray()
+      .Key("sleepy").Bool(sleepy_)
+      .Key("frames_since_clear").Int(frames_since_clear_)
+      .EndObject();
+
+  json.Key("alert").BeginObject().Key("id");
+  if (alert_effect_id_ >= 0) {
+    json.Int(alert_effect_id_);
+  } else {
+    json.Null();
+  }
+  json.Key("lifetime").Int(alert_lifetime_).Key("reveal_frame").Int(alert_reveal_frame_).EndObject();
+
+  json.Key("topout")
+      .BeginObject()
+      .Key("frame").Int(top_out_frame_)
+      .Key("gameplay_frame").Int(gameplay_top_out_frame_)
+      .Key("dissolved_pixel_rows").Int(top_out_dissolved_rows_)
+      .Key("overlay_visible").Bool(scene_ == Scene::kTopOut && top_out_frame_ >= kTopOutOverlayStartFrame &&
+                                   top_out_frame_ < kTopOutOverlayEndFrame)
+      .Key("saved_under_valid").Bool(top_out_saved_under_valid_)
+      .Key("handoff_pending").Bool(top_out_handoff_pending_)
+      .EndObject();
+
+  json.Key("frontend")
+      .BeginObject()
+      .Key("view").Str(view)
+      .Key("selected_row").Int(frontend_view_ == FrontendView::kMainMenu ? main_menu_row_ : frontend_selected_row_)
+      .Key("view_frame").Int(frontend_view_frame_)
+      .Key("frame_counter").Int(frontend_frame_counter_)
+      .Key("cycle_counter").Int(frontend_cycle_counter_)
+      .Key("bank").Int(frontend_current_bank_)
+      .Key("next_bank").Int(frontend_next_bank_)
+      .Key("pulse").Int(PulseRevealAmount())
+      .Key("visible_rows").Int(scene_ == Scene::kFrontend ? VisibleRowCount() : 0)
+      .Key("conceal_frames").Int(flow_phase_ == FlowPhase::kConceal ? kRevealSteps - flow_step_ : 0)
+      .Key("hs_bootstrap_remaining").Int(0)
+      .Key("credits_page").Int(credits_page_)
+      .Key("credits_timer").Int(credits_counter_)
+      .Key("keyboard_capture_row").Int(keyboard_capture_row_)
+      .Key("entry_row").Int(frontend_view_ == FrontendView::kHighScoreEntry ? hs_slot_ : -1)
+      .Key("entry_name").Str(hs_buffer_)
+      .Key("commit_pending").Bool(hs_commit_);
+  // Dispatcher-model state (fix-frontend-flow prototype).
+  json.Key("flow").Str(FlowPhaseName())
+      .Key("flow_step").Int(flow_step_)
+      .Key("dispatch_state").Int(dispatch_state_)
+      .Key("pending").Int(menu_pending_)
+      .Key("return_state").Int(menu_return_state_)
+      .Key("main_menu_row").Int(main_menu_row_)
+      .Key("pulse_phase").Int(pulse_phase_)
+      .Key("entry_pulse_phase").Int(entry_pulse_phase_)
+      .Key("title_level").Int(CurrentTitleLevel())
+      .Key("splash_level").Int(CurrentSplashLevel())
+      .Key("frozen_level").Int(CurrentFrozenLevel())
+      .Key("release_newest").Int(PeekRelease())
+      .Key("burst_next").Int(frontend_burst_)
+      .Key("credits_mode").Int(credits_mode_);
+  json.Key("pf")
+      .BeginObject()
+      .Key("ang_xy").Int(frontend_pointfield_state_.angle_xy)
+      .Key("ang_z").Int(frontend_pointfield_state_.angle_z)
+      .Key("ph_x").Int(frontend_pointfield_state_.phase_x)
+      .Key("ph_y").Int(frontend_pointfield_state_.phase_y)
+      .Key("ph_z").Int(frontend_pointfield_state_.phase_z)
+      .Key("org_x").Int(frontend_pointfield_state_.origin_x)
+      .Key("org_y").Int(frontend_pointfield_state_.origin_y)
+      .Key("org_z").Int(frontend_pointfield_state_.origin_z)
+      .EndObject();
+  json.Key("row_amounts").BeginArray();
+  for (const int amount : row_amount_) {
+    json.Int(amount);
+  }
+  json.EndArray();
+  json.Key("row_texts").BeginArray();
+  for (const std::string& text : row_text_) {
+    json.Str(text);
+  }
+  json.EndArray();
+  json.EndObject();
+
+  json.Key("fade")
+      .BeginObject()
+      .Key("state").Str(fade)
+      .Key("frame").Int(FlowFadeE())
+      .Key("alpha").Int(screen_fade_alpha())
+      .Key("pending_scene").Str(pending)
+      .Key("enabled").Bool(fades_enabled_)
+      .EndObject();
+
+  json.Key("settings")
+      .BeginObject()
+      .Key("music_volume").Int(music_volume_)
+      .Key("sfx_volume").Int(sfx_volume_)
+      .Key("music_track_index").Int(music_track_index_)
+      .EndObject();
 }
 
 }  // namespace atet
