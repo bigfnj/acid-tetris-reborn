@@ -88,9 +88,10 @@ The port aims to match the original's behaviour, not just its look: the gameplay
 RNG and piece sequence are bit-identical to the decompiled generator; the tracker
 music, SFX mixer, gravity/soft-drop cadence, line-clear and top-out particle
 systems, menu animation, and screen fades are modelled on the recovered original
-routines; and the whole simulation is paced by a fixed-rate loop clocked to match
-the running original's real-time speed, so it plays at the correct speed regardless
-of your monitor.
+routines; and the whole simulation runs on the original's game clock (its 60.0011 Hz
+timer, not the display) with the original's frame pacing: every frame runs as many
+logic steps as timer ticks have passed, up to six, so it plays at the correct speed
+regardless of your monitor's refresh rate or an occasional slow frame.
 
 Two lightweight test harnesses document and guard that behaviour: `run-smokes.sh`
 (logic/RNG/audio-routing) and `run-dynamic-tests.sh` (animation rates and input

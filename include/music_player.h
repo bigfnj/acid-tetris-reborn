@@ -15,19 +15,21 @@ namespace atet {
 //
 // libmikmod owns the music output device (WinMM on the Windows desktop, the
 // nosound driver when SDL is running headless), so playback is independent of
-// the SDL audio path used for sound effects. Call Update() once per frame to
-// keep the software mixer fed and to advance the volume-ramp controller.
+// the SDL audio path used for sound effects. Call Update() once per game-clock
+// tick (the main loop's timer service) to keep the software mixer fed and to
+// advance the volume-ramp controller.
 //
 // Volume ramps model the original's small music-ramp system (RE:
 // docs/findings/frontend-exit-and-music-ramp-pass-2026-04-14.md). The original
 // track loader (0x6544) fades the current track out over 0x20 ticks, waits for
 // the ramp to finish, loads the new track, then fades it in over 0x20 ticks.
 // The hard exit-to-DOS path (state 3) fades out over 0x40 ticks before shutting
-// the runtime down. One "tick" maps to one rendered frame here, matching the
-// port's other frame-count parity gates.
+// the runtime down. One "tick" is one PIT tick of the original's 60.0011 Hz
+// timer: the original steps the ramp in that timer's interrupt, so the main loop
+// calls Update() once per elapsed tick, whatever the frame rate.
 class MusicPlayer {
  public:
-  // Ticks (rendered frames) for each modelled ramp, taken from the original.
+  // Ticks (game-clock ticks) for each modelled ramp, taken from the original.
   static constexpr int kTrackFadeTicks = 0x20;  // 32: track-change fade in/out
   static constexpr int kExitFadeTicks = 0x40;   // 64: exit-to-DOS fade out
 
@@ -57,7 +59,7 @@ class MusicPlayer {
   // ramp is running; while a ramp is active the ramp lands on the new target.
   void SetVolume(int volume_percent);
 
-  void Update();  // pump the software mixer and advance the ramp; once per frame
+  void Update();  // pump the software mixer and advance the ramp; once per game-clock tick
   void Stop();
   void Shutdown();
 
@@ -80,7 +82,19 @@ class MusicPlayer {
   // True while any ramp (fade in/out) or a pending track load is in flight.
   [[nodiscard]] bool fade_active() const { return ramp_mode_ != RampMode::kNone || pending_track_ >= 0; }
 
+  // ---- Audit instrumentation (audit/instrument worktree only) ----
+  // Capture mode: register only libmikmod's nosound driver (VC software mixer, no
+  // device) and do NOT mix inside Update(); the caller pulls exactly the frames it
+  // wants with CaptureMix(). Must be set before Initialize().
+  void SetCaptureMode(bool enabled) { capture_mode_ = enabled; }
+  // Mixes `frames` interleaved stereo int16 frames at md_mixfreq (44100 Hz) through
+  // libmikmod's software mixer (VC_WriteBytes), advancing the player accordingly.
+  size_t CaptureMix(std::int16_t* out, size_t frames);
+  // JSON object: ramp state + libmikmod module position/volume.
+  [[nodiscard]] std::string AuditJson() const;
+
  private:
+  bool capture_mode_ = false;
   enum class RampMode { kNone, kFadeIn, kFadeOut };
 
   bool LoadAndStart(int index, std::string* error_out);

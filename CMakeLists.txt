@@ -86,9 +86,11 @@ add_executable(acid_tetris_port WIN32
   src/main.cpp
   src/atet_data.cpp
   src/audio_probe.cpp
+  src/frame_pacer.cpp
   src/indexed_asset_loader.cpp
   src/milestone_a_demo.cpp
   src/music_player.cpp
+  src/audit_instrument.cpp  # audit/instrument worktree only
   third_party/miniz/miniz.c
 )
 

@@ -14,9 +14,24 @@
 
 namespace atet {
 
+class JsonOut;  // audit_instrument.h (audit worktree only)
+
 class MilestoneADemo {
  public:
   MilestoneADemo() = default;
+
+  // ---- Audit instrumentation (audit/instrument worktree only; diagnostics) ----
+  // Called by main at the top of each loop iteration: resets per-step
+  // accumulators (RNG draws, gravity bracket, emitted events, particle spawns).
+  void AuditBeginStep(std::uint64_t step);
+  // Labels where emitted audio events originate: "input", "tick", "render".
+  void AuditSetStage(const char* stage) { audit_stage_ = stage; }
+  // Full post-iteration state snapshot (see harness/port/README.md for fields).
+  void AuditWriteState(JsonOut& json, bool include_rng_values) const;
+  // Presentation counters that Render() consumes/advances (sampled pre-render).
+  void AuditWritePresentation(JsonOut& json) const;
+  // Audio events pushed by EmitAudioEvent/EmitMusicEvent during this step.
+  void AuditWriteEmittedEvents(JsonOut& json) const;
   MilestoneADemo(const MilestoneADemo&) = delete;
   MilestoneADemo& operator=(const MilestoneADemo&) = delete;
 
@@ -46,8 +61,42 @@ class MilestoneADemo {
   void BeginTopOutDemo(int score, int lines);
   void InjectFilledRowsForSmoke(int row_count);
   bool CaptureGameplaySnapshot(SDL_Renderer* renderer);
-  void Tick();
-  void Render(SDL_Renderer* renderer);
+
+  // ---- Logic step / draw contract ----------------------------------------------------------
+  // One logic step is one PIT tick of game time (60.00109716 Hz). The original runs n steps per
+  // presented frame (n = the pacer's return, 1..6) and draws inside or after the last one, so the
+  // picture always shows the state of the last step and every step advances every counter.
+  // A step is split in two around the draw: TickLogic() is everything the original does before it
+  // draws (input reactions, gameplay, fades, scene switches, the top-out dissolve);
+  // TickPresentation() advances the per-step animation counters the original advances after using
+  // them for that draw (splash timer, frontend pointfield and pulse counter, menu timers, top-out
+  // timer). A frame of n steps is: (n - 1) x Tick(), then TickLogic(), Render(), TickPresentation().
+  // Render() never changes game state (the only thing it writes is a render-target cache).
+  void Tick() {
+    TickLogic();
+    TickPresentation();
+  }
+  void TickLogic();
+  void TickPresentation();
+  void Render(SDL_Renderer* renderer) const;
+  // True while the current phase is one the original runs as a busy tick loop that never calls
+  // the frame pacer: the splash pages, the palette fade-out of the gameplay screen when leaving
+  // for the frontend and the palette fade-in of the gameplay screen when entering it. The main
+  // loop runs these one step per elapsed tick without touching the pacer baseline, so the first
+  // pacer return after them is capped at 6 from a stale baseline, as in the original.
+  [[nodiscard]] bool InBlockingPhase() const;
+  // True once, then cleared, when gameplay has just resumed from the frontend on a path where the
+  // original rebases its pacer and runs exactly one step: Return to Game and every New Game except
+  // the first one after boot (that one keeps the stale baseline and gets a 6-step second frame).
+  bool ConsumePacerResetRequest();
+  // Absolute PIT tick (ticks since the start of the boot sequence), set by the main loop before each
+  // frame's steps, for the logic that reads the original's tick counter (RNG seed, alert stamps,
+  // cursor blink). Hook only: no game logic in this file reads it yet.
+  void set_tick_count(std::uint64_t tick) { tick_count_ = tick; }
+  [[nodiscard]] std::uint64_t tick_count() const { return tick_count_; }
+  // Every counter Render() used to advance, as text, for the render-purity check.
+  [[nodiscard]] std::string StepStateFingerprint() const;
+
   void Shutdown();
 
   [[nodiscard]] const char* scene_name() const;
@@ -195,11 +244,11 @@ class MilestoneADemo {
   bool LoadSetupDat();
   bool SaveSetupDat() const;
 
-  void RenderFrontend(SDL_Renderer* renderer);
+  void RenderFrontend(SDL_Renderer* renderer) const;
   void RenderGameplay(SDL_Renderer* renderer) const;
   bool RenderGameplayToTexture(SDL_Renderer* renderer, SDL_Texture* texture);
-  void RenderTopOut(SDL_Renderer* renderer);
-  void RenderTopOutBackdrop(SDL_Renderer* renderer);
+  void RenderTopOut(SDL_Renderer* renderer) const;
+  void RenderTopOutBackdrop(SDL_Renderer* renderer) const;
   void RenderDebrisParticles(SDL_Renderer* renderer) const;
   void UpdateTopOutDissolve();
   void SpawnTopOutPixelRow(int pixel_row);
@@ -210,9 +259,9 @@ class MilestoneADemo {
   void UpdateAlert();
   void RenderAlertTile(SDL_Renderer* renderer) const;
   int AlertIdForClear(int cleared_rows, bool was_four, bool was_sleepy) const;
-  bool CaptureTopOutSavedUnder(SDL_Renderer* renderer);
-  void RenderSplash(SDL_Renderer* renderer);
-  void RenderFrontendPointfield(SDL_Renderer* renderer);
+  bool CaptureTopOutSavedUnder(SDL_Renderer* renderer) const;
+  void RenderSplash(SDL_Renderer* renderer) const;
+  void RenderFrontendPointfield(SDL_Renderer* renderer) const;
   void RenderFrontendRows(SDL_Renderer* renderer, const std::vector<std::string>& rows, int selected_row) const;
   void RenderFrontendText(SDL_Renderer* renderer, const std::string& text, int center_x, int y, int reveal_amount) const;
   void AdvanceFrontendPointfield();
@@ -396,8 +445,15 @@ class MilestoneADemo {
   int top_out_score_ = 0;
   int top_out_lines_ = 0;
   bool top_out_handoff_pending_ = false;
-  SDL_Texture* top_out_saved_under_texture_ = nullptr;
-  bool top_out_saved_under_valid_ = false;
+  // Render-target cache of the frozen GAME OVER backdrop, built lazily by Render(): the only state
+  // Render() writes, and none of it is read by game logic.
+  mutable SDL_Texture* top_out_saved_under_texture_ = nullptr;
+  mutable bool top_out_saved_under_valid_ = false;
+
+  // Pacer contract state (see InBlockingPhase / ConsumePacerResetRequest / set_tick_count).
+  bool pacer_reset_pending_ = false;
+  int frontend_new_games_ = 0;  // New Games started from the frontend since boot
+  std::uint64_t tick_count_ = 0;
 
   TextureAsset ddd_splash_;
   TextureAsset warning_splash_;
@@ -418,6 +474,38 @@ class MilestoneADemo {
   int top_out_dissolved_rows_ = 0;
 
   AtetData atet_data_;
+
+  // ---- Audit instrumentation state (never read by game logic) ----
+  struct AuditEmitted {
+    std::string stage;
+    std::string name;
+    bool is_sfx = false;
+    int slot = 0;
+    int track = 0;
+    int music_volume = 0;
+    int sfx_volume = 0;
+    int pan = 0x80;
+    int voice_class = 0;
+  };
+  std::uint64_t audit_step_ = 0;
+  const char* audit_stage_ = "setup";
+  std::vector<AuditEmitted> audit_emitted_;
+  int audit_rng_index_before_ = 0;
+  std::uint32_t audit_rng_draws_ = 0;
+  std::uint64_t audit_rng_hash_ = 0;
+  std::vector<std::uint32_t> audit_rng_values_;
+  bool audit_gravity_active_ = false;
+  int audit_gravity_rate_ = 0;
+  int audit_gravity_acc_before_ = 0;
+  int audit_descent_attempts_ = 0;
+  int audit_descent_successes_ = 0;
+  int audit_score_before_ = 0;
+  std::uint32_t audit_particles_spawned_ = 0;
+  std::uint32_t audit_particles_dropped_ = 0;
+  std::uint32_t audit_particles_retired_ = 0;
+  std::array<bool, 256> audit_pressed_{};
+  std::array<bool, 256> audit_released_{};
+  std::array<bool, 256> audit_held_at_step_start_{};
 };
 
 }  // namespace atet
