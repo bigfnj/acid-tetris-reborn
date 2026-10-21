@@ -14,9 +14,24 @@
 
 namespace atet {
 
+class JsonOut;  // audit_instrument.h (audit worktree only)
+
 class MilestoneADemo {
  public:
   MilestoneADemo() = default;
+
+  // ---- Audit instrumentation (audit/instrument worktree only; diagnostics) ----
+  // Called by main at the top of each loop iteration: resets per-step
+  // accumulators (RNG draws, gravity bracket, emitted events, particle spawns).
+  void AuditBeginStep(std::uint64_t step);
+  // Labels where emitted audio events originate: "input", "tick", "render".
+  void AuditSetStage(const char* stage) { audit_stage_ = stage; }
+  // Full post-iteration state snapshot (see harness/port/README.md for fields).
+  void AuditWriteState(JsonOut& json, bool include_rng_values) const;
+  // Presentation counters that Render() consumes/advances (sampled pre-render).
+  void AuditWritePresentation(JsonOut& json) const;
+  // Audio events pushed by EmitAudioEvent/EmitMusicEvent during this step.
+  void AuditWriteEmittedEvents(JsonOut& json) const;
   MilestoneADemo(const MilestoneADemo&) = delete;
   MilestoneADemo& operator=(const MilestoneADemo&) = delete;
 
@@ -78,7 +93,7 @@ class MilestoneADemo {
   // Screen fade-through-black state (declared before the methods/members that
   // use it). See the fade members and helpers below.
   enum class ScreenFade { kNone, kOut, kIn };
-  enum class PendingScene { kNone, kFrontendFromGameplay, kGameplayNewGame, kGameplayResume };
+  enum class PendingScene { kNone, kFrontendFromGameplay, kGameplayNewGame, kGameplayResume, kHighScoresFromTopOut };
 
   enum class FrontendView {
     kMainMenu,
@@ -160,12 +175,9 @@ class MilestoneADemo {
     int lock_frames = 0;
     int down_lockout_frames = 0;
     int collapse_frame = 0;
-    int top_out_frame = 0;
     int warning_band = 0;
     std::array<int, 3> warning_cooldowns{};
     bool last_clear_was_four = false;
-    bool sleepy = false;
-    int frames_since_clear = 0;
   };
 
   struct AudioEvent {
@@ -197,20 +209,27 @@ class MilestoneADemo {
 
   void RenderFrontend(SDL_Renderer* renderer);
   void RenderGameplay(SDL_Renderer* renderer) const;
+  void RenderLiveHud(SDL_Renderer* renderer) const;
+  void DrawBoardCells(SDL_Renderer* renderer, const std::array<int, 200>& cells, bool hide_clearing_rows) const;
   bool RenderGameplayToTexture(SDL_Renderer* renderer, SDL_Texture* texture);
-  void RenderTopOut(SDL_Renderer* renderer);
-  void RenderTopOutBackdrop(SDL_Renderer* renderer);
+  void RenderTopOut(SDL_Renderer* renderer) const;
   void RenderDebrisParticles(SDL_Renderer* renderer) const;
-  void UpdateTopOutDissolve();
+  // Top-out: ArmTopOut is the failed-spawn branch (0x102D..0x1065); StepTopOutScene is one
+  // tick of the game-over scene (one scanline sprayed per tick, then GAME OVER, which only
+  // an Esc release leaves).
+  void ArmTopOut(int score, int lines, bool piece_drawn);
+  void StepTopOutScene();
   void SpawnTopOutPixelRow(int pixel_row);
-  // Gameplay alert/mood-face tile system (chunk-6). TriggerAlert arms a tile for a
-  // lifetime (restarting the reveal on a change of tile); UpdateAlert ages it;
-  // RenderAlertTile draws the current tile with a staged vertical reveal-in.
+  // Mood faces (chunk-6 tiles): TriggerAlert is 0x2008, UpdateAlert 0x206C(0),
+  // ResetAlertState 0x206C(1); the corner layer mirrors the working screen at (20,140).
   void TriggerAlert(int effect_id, int lifetime);
   void UpdateAlert();
+  void ResetAlertState();
+  void AlertCornerRestore();
+  void AlertCornerDrawFull(int effect_id);
+  void AlertCornerDrawStretch(int effect_id, int rows);
   void RenderAlertTile(SDL_Renderer* renderer) const;
-  int AlertIdForClear(int cleared_rows, bool was_four, bool was_sleepy) const;
-  bool CaptureTopOutSavedUnder(SDL_Renderer* renderer);
+  void CheckSleepyTimeout();
   void RenderSplash(SDL_Renderer* renderer);
   void RenderFrontendPointfield(SDL_Renderer* renderer);
   void RenderFrontendRows(SDL_Renderer* renderer, const std::vector<std::string>& rows, int selected_row) const;
@@ -218,7 +237,6 @@ class MilestoneADemo {
   void AdvanceFrontendPointfield();
   void AdvanceFrontendTimers();
   void AdvanceSplashTimers();
-  void AdvanceTopOutTimers();
   void ActivateFrontendSelection();
   void MoveFrontendSelection(int delta);
   void SetFrontendView(FrontendView view, int selected_row);
@@ -242,12 +260,11 @@ class MilestoneADemo {
   bool TryRotateLivePiece(int delta_rotation);
   bool CanPlaceLivePiece(const LivePiece& piece) const;
   void ResetLiveGameplayState();
-  bool SpawnNextLivePiece();
+  bool SpawnNextLivePiece(bool after_collapse = false);
   void CommitLivePieceToBoard();
   void StepLiveGameplay();
   void StepFallingGameplay();
   void StepCollapseGameplay();
-  void StepTopOutGameplay();
   int CurrentDropIncrement() const;
   void BeginLineCollapse(const std::vector<int>& rows);
   std::vector<int> DetectFullRows() const;
@@ -261,7 +278,7 @@ class MilestoneADemo {
   void SpawnDebrisPolar(int screen_x, int screen_y, int speed, int angle, int lifetime, int color);   // 0x2f78
   void SpawnDebrisTarget(int screen_x, int screen_y, int target_x, int target_y, int lifetime, int color);  // 0x3034
   void StepDebrisParticles();
-  void UpdateStackWarning(bool allow_sound);
+  void StackWarningStep();
   int HighestOccupiedRow() const;
   int CurrentGravityRate() const;
   void SaveLiveSnapshot();
@@ -345,7 +362,6 @@ class MilestoneADemo {
   int down_lockout_frames_ = 0;
   std::vector<int> pending_clear_rows_;
   int collapse_frame_ = 0;
-  int gameplay_top_out_frame_ = 0;
   int warning_band_ = 0;
   std::array<int, 3> warning_cooldowns_{};
   std::vector<DebrisParticle> debris_particles_;
@@ -353,9 +369,11 @@ class MilestoneADemo {
   SDL_Texture* gameplay_snapshot_texture_ = nullptr;
   std::function<void(const AudioEventNotification&)> audio_event_callback_;
   bool gameplay_snapshot_texture_valid_ = false;
-  bool last_clear_was_four_ = false;
-  bool sleepy_ = false;
-  int frames_since_clear_ = 0;
+  bool last_clear_was_four_ = false;   // 0x2C763 == 4: written by every clear and by New Game only
+  // Stand-in for the PIT tick counter 0x2D2A3 (advanced at the top of every Tick, menus and
+  // fades included) and the tick of the last clear / New Game (0x2C75B).
+  std::uint32_t tick_counter_ = 0;
+  std::uint32_t last_clear_tick_ = 0;
   int high_score_bootstrap_frames_ = 0;
   int high_score_conceal_frames_ = 0;
   bool debug_state_logging_ = false;
@@ -384,6 +402,7 @@ class MilestoneADemo {
   std::vector<Uint8> piece_atlas_indices_;
   std::array<std::vector<FrontendPoint>, 8> frontend_banks_;
   std::array<int, 2048> sine_table_{};
+  std::array<int, 2048> particle_sine_table_{};  // 0x27B8 (peak 32768), particles only
   FrontendPointfieldState frontend_pointfield_state_;
   int frontend_current_bank_ = 2;
   int frontend_next_bank_ = 0;
@@ -395,9 +414,8 @@ class MilestoneADemo {
   int top_out_frame_ = 0;
   int top_out_score_ = 0;
   int top_out_lines_ = 0;
-  bool top_out_handoff_pending_ = false;
-  SDL_Texture* top_out_saved_under_texture_ = nullptr;
-  bool top_out_saved_under_valid_ = false;
+  // What the dissolve samples and draws: the well as the failed spawn left it on screen.
+  std::array<int, 200> top_out_source_cells_{};
 
   TextureAsset ddd_splash_;
   TextureAsset warning_splash_;
@@ -407,17 +425,61 @@ class MilestoneADemo {
   // 6 = top-out/game-over, 2/0/9/7 = 1/2/3/4-line clear, 1/10 = fast follow-up,
   // 8 = back-to-back tetris, 11 = sleepy, 12 = wake-after-clear, 0/13 misc/unused.
   std::array<TextureAsset, 14> alert_tiles_{};
-  // Gameplay alert-tile controller (RE board-alert-pass 0x206c/0x2008): the
-  // currently-shown mood tile, its remaining on-screen lifetime, and the frame
-  // counter that drives the staged vertical reveal-in.
+  // Mood-face state (0x2008/0x206C): current id 0x2C76F (-1 none), lifetime 0x2C75F in
+  // logic steps (0 idle, -1 infinite), reveal counter 0x2C767 (6..0).
   int alert_effect_id_ = -1;
   int alert_lifetime_ = 0;
-  int alert_reveal_frame_ = 0;
-  // Rows already converted to upward debris fountains during the top-out dissolve
-  // (GAP A): tracks the dissolve front so each newly-cleared row bursts once.
+  int alert_reveal_counter_ = 0;
+  // The 50x50 face corner of the working screen at (20,140), as palette indices, and the
+  // base-screen background saved under it (0x2188). Drawn through a streaming texture.
+  std::array<Uint8, 2500> alert_corner_{};
+  std::array<Uint8, 2500> alert_corner_background_{};
+  mutable SDL_Texture* alert_corner_texture_ = nullptr;
+  mutable bool alert_corner_dirty_ = true;
+  // New Game: the frontend puts back the screen it saved on entry (0x395A) and 0x206C(1)
+  // resets only the working screen, so the fade-in still shows the corner as it was left
+  // (the previous game's face) until the first tick flushes the reset corner.
+  std::array<Uint8, 2500> alert_corner_shown_{};
+  bool alert_corner_hold_ = false;
+  // Scanlines of the well sprayed so far by the top-out dissolve (0x184DB, 0..160).
   int top_out_dissolved_rows_ = 0;
+  // The frontend restores a screen that holds no particles (0x3830); the debris shows again
+  // only after the first tick back in the game has stepped it.
+  bool debris_hidden_after_frontend_ = false;
 
   AtetData atet_data_;
+
+  // ---- Audit instrumentation state (never read by game logic) ----
+  struct AuditEmitted {
+    std::string stage;
+    std::string name;
+    bool is_sfx = false;
+    int slot = 0;
+    int track = 0;
+    int music_volume = 0;
+    int sfx_volume = 0;
+    int pan = 0x80;
+    int voice_class = 0;
+  };
+  std::uint64_t audit_step_ = 0;
+  const char* audit_stage_ = "setup";
+  std::vector<AuditEmitted> audit_emitted_;
+  int audit_rng_index_before_ = 0;
+  std::uint32_t audit_rng_draws_ = 0;
+  std::uint64_t audit_rng_hash_ = 0;
+  std::vector<std::uint32_t> audit_rng_values_;
+  bool audit_gravity_active_ = false;
+  int audit_gravity_rate_ = 0;
+  int audit_gravity_acc_before_ = 0;
+  int audit_descent_attempts_ = 0;
+  int audit_descent_successes_ = 0;
+  int audit_score_before_ = 0;
+  std::uint32_t audit_particles_spawned_ = 0;
+  std::uint32_t audit_particles_dropped_ = 0;
+  std::uint32_t audit_particles_retired_ = 0;
+  std::array<bool, 256> audit_pressed_{};
+  std::array<bool, 256> audit_released_{};
+  std::array<bool, 256> audit_held_at_step_start_{};
 };
 
 }  // namespace atet

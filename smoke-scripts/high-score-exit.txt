@@ -1,1 +1,1 @@
-5:esc,8:esc,11:esc,12:esc:up,130:enter,132:enter:up,190:enter
+20:return,22:return:up,40:space,42:space:up,60:backspace,62:backspace:up,1000:esc,1006:esc:up,1124:enter,1126:enter:up,1184:enter

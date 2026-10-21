@@ -47,16 +47,30 @@ declare -A rc
 rc[basic3]=$(run basic3 --smoke-frames=3)
 rc[lineclear]=$(run lineclear --live-demo --scripted-input=@"$ss/live-line-clear.txt" --smoke-frames=90)
 rc[pauseresume]=$(run pauseresume --live-demo --scripted-input=@"$ss/pause-resume.txt" --smoke-frames=100)
-rc[hiscore]=$(run hiscore --reset-setup --topout-demo --scripted-input=@"$ss/high-score-exit.txt" --smoke-frames=240 --debug-state)
+rc[hiscore]=$(run hiscore --reset-setup --topout-demo --scripted-input=@"$ss/high-score-exit.txt" --smoke-frames=1240 --debug-state)
 rc[topout1400]=$(run topout1400 --reset-setup --topout-demo --smoke-frames=1400)
 for n in basic3 lineclear pauseresume hiscore topout1400; do
   [ "${rc[$n]}" = "0" ] && pass "$n EXIT=0" || fail "$n EXIT=${rc[$n]}"
 done
 
-echo "[2] top-out fingerprint"
-for pat in "topout=160" "topout=760" "hsboot=72"; do
-  grep -q "$pat" "$tmp/hiscore.txt" && pass "$pat present" || fail "$pat missing"
-done
+echo "[2] top-out: GAME OVER after 160 scanlines, kept until an Esc RELEASE"
+# This used to assert topout=160, topout=760 and hsboot=72: the port's own timers, which
+# removed GAME OVER after 600 frames and handed off by itself. The original has no such
+# timer: GAME OVER (0x22FC) appears in the tick of the 160th dissolve scanline and stays
+# until Esc is released (session loop 0x4A3); Return/Space/Backspace and the Esc press do
+# nothing (October 2026 audit FX-01, FX-02, FX-25). Step N = debug line N+1.
+grep "Debug state:" "$tmp/hiscore.txt" > "$tmp/hiscore.dbg"
+st(){ sed -n "$(( $1 + 1 ))p" "$tmp/hiscore.dbg"; }
+{ st 158 | grep -q "gameover=0" && st 159 | grep -q "topout=160 .*gameover=1"; } \
+  && pass "GAME OVER first shown at step 159 (topout=160), Return/Space/Backspace ignored" \
+  || fail "GAME OVER timing/skip ($(st 158 | grep -o 'topout=[0-9]*') / $(st 159 | grep -o 'gameover=[01]'))"
+st 999 | grep -q "scene=Top Out .*gameover=1" && pass "GAME OVER still up at step 999 (no timed handoff)" \
+  || fail "GAME OVER left without input ($(st 999 | grep -o 'scene=[A-Za-z ]* phase'))"
+st 1005 | grep -q "scene=Top Out" && pass "Esc held (1000..1005) changes nothing" || fail "Esc acted on its press"
+{ st 1005 | grep -q "scene=Top Out" && st 1006 | grep -q "scene=High Score"; } \
+  && pass "Esc release at 1006 leaves GAME OVER for the high-score path" \
+  || fail "no GAME OVER -> high-score transition on the Esc release ($(st 1006 | grep -o 'scene=[A-Za-z ]* phase'))"
+grep -q "hsboot=72" "$tmp/hiscore.txt" && pass "hsboot=72 present" || fail "hsboot=72 missing"
 
 echo "[3] deterministic RNG (cross-platform golden)"
 chk_seed(){ # seed expected
@@ -74,8 +88,11 @@ grep -q "SFX mix: slot=0 vol%=45 engine=28/64 pan=107 class=0" "$tmp/sfx.txt" \
 grep -q "SFX mix: slot=10 vol%=90 engine=57/64" "$tmp/sfx.txt" \
   && pass "line-clear engine curve 90->57" || fail "engine curve mismatch"
 
-echo "[5] startup music loads"
-grep -q "Music: playing track 0" "$tmp/topout1400.txt" && pass "track 0 'Continuum' loads" || fail "startup music missing"
+echo "[5] track 0 music loads"
+# Read from the hiscore run: the --topout-demo run only ever started music through the
+# port's invented 780-frame top-out handoff, which no longer exists (GAME OVER now waits
+# for an Esc release, FX-01). The hiscore run starts track 0 on that release.
+grep -q "Music: playing track 0" "$tmp/hiscore.txt" && pass "track 0 'Continuum' loads" || fail "track 0 music missing"
 
 echo "[6] gameplay<->frontend screen fade"
 # Real New Game (no shortcut, fades on): Enter on the default menu row after the

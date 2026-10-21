@@ -14,8 +14,26 @@
 #include <vector>
 
 #include "indexed_asset_loader.h"
+#include "audit_instrument.h"
+
+// Audit instrumentation: count the SDL draw API calls the demo issues per frame.
+// A function-like macro does not re-expand inside its own replacement, so the
+// inner call reaches the real SDL function.
+#define SDL_RenderTexture(...) (++::atet::g_audit.render_texture_calls, SDL_RenderTexture(__VA_ARGS__))
+#define SDL_RenderFillRect(...) (++::atet::g_audit.fill_rect_calls, SDL_RenderFillRect(__VA_ARGS__))
+#define SDL_SetRenderDrawColor(...) (++::atet::g_audit.draw_color_calls, SDL_SetRenderDrawColor(__VA_ARGS__))
 
 namespace atet {
+
+namespace {
+// Scoped perf-counter accumulator for the audit sub-phase timers.
+struct AuditScopedTicks {
+  explicit AuditScopedTicks(std::uint64_t* sink) : sink_(sink), start_(SDL_GetPerformanceCounter()) {}
+  ~AuditScopedTicks() { *sink_ += SDL_GetPerformanceCounter() - start_; }
+  std::uint64_t* sink_;
+  std::uint64_t start_;
+};
+}  // namespace
 
 namespace {
 
@@ -66,12 +84,27 @@ constexpr int kGameplayCollapseFramesPerRow = 12;
 constexpr int kGameplayMaxDebrisParticles = 4096;  // 0x1000, matching the original particle-pool cap
 constexpr int kDebrisAgeFull = 0x400;              // age accumulator reaches this at end of life (4 stages of 0x100)
 constexpr int kGameplayDownLockoutFrames = 8;
-constexpr int kWarningLowRow = 8;
-constexpr int kWarningMediumRow = 5;
-constexpr int kWarningHighRow = 2;
-constexpr int kWarningCooldownFrames = 120;
-constexpr int kSleepyNoClearFrames = 60 * 45;
-constexpr int kAlertEventLifetime = 96;  // frames a one-shot mood face (clear/wake) stays up (~1.4s @70fps)
+// Stack warnings (0x21C4, start of every normal step): r = first occupied row - 1;
+// r < 2 high (face 5), r < 4 mid (face 4), r < 7 low (face 3). Every in-band step reloads
+// its band's cooldown (and the lower ones) to 300, so a face and its sound come once per
+// climb into a band whose cooldown has run out.
+constexpr int kWarningHighLimit = 2;
+constexpr int kWarningMidLimit = 4;
+constexpr int kWarningLowLimit = 7;
+constexpr int kWarningCooldownTicks = 0x12C;
+// Mood faces (0x2008 trigger / 0x206C update). Lifetimes count logic steps; the sleepy and
+// fast-follow tests compare the tick counter (the original's PIT counter 0x2D2A3, which also
+// runs through menus and fades) with the tick of the last clear.
+constexpr int kAlertFaceX = 20;   // 0x1793D / 0x2138: working screen + 0xAF14 = (20,140)
+constexpr int kAlertFaceY = 140;
+constexpr int kAlertFaceSize = 50;
+constexpr Uint8 kAlertTransparentIndex = 0x20;
+constexpr int kAlertClearLifetime = 0xA0;    // clear, wake, fast-follow and warning faces
+constexpr int kAlertSleepyLifetime = 0x140;  // 0x10B8
+constexpr int kAlertInfiniteLifetime = -1;   // top-out face (0x1037)
+constexpr std::uint32_t kSleepyTicksSinceClear = 0x708;  // exactly 1800 ticks (0x10A6)
+constexpr std::uint32_t kFastFollowTicks = 0xA0;         // 0x0F5F / 0x0F83, unsigned compare
+constexpr std::array<int, 6> kAlertRevealRows = {50, 40, 30, 20, 10, 1};  // table 0x9B0, by counter - 1
 constexpr int kHighScoreConcealFrames = 36;
 constexpr int kHighScoreTableRevealRows = 6;
 // Boot-splash + fade durations measured from the running original (kryptos boot
@@ -84,15 +117,13 @@ constexpr int kHighScoreTableRevealRows = 6;
 constexpr int kSplashPageFrames = 360;   // ~6.0s at 60 Hz: 2s fade-in + 2s hold + 2s fade-out
 constexpr int kScreenFadeTicks = 120;    // ~2.0s screen fade (title/menu + gameplay<->frontend)
 constexpr int kSplashFadeTicks = 120;    // ~2.0s splash fade-in/out within a page
-constexpr int kTopOutTimingFps = 60;
-// RE 0x1f8c/0x1fc6: the top-out dissolve sweeps exactly ONE pixel-row per frame down
-// the whole gameplay area (kBoardHeight*8 = 160 pixel rows), so the spray completes in
-// ~160 frames (~2.3s at 70Hz), not the earlier 11s guess. With each particle living
-// 16..79 frames, dozens of rows are mid-explosion at once = a continuous cascade.
-constexpr int kTopOutDissolveFrames = kBoardHeight * kPieceTileSize;  // 160
-constexpr int kTopOutOverlayStartFrame = kTopOutDissolveFrames;       // GAME OVER right after
-constexpr int kTopOutOverlayEndFrame = kTopOutOverlayStartFrame + 10 * kTopOutTimingFps;  // ~hold
-constexpr int kTopOutHandoffFrame = kTopOutOverlayEndFrame + 20;
+// Top-out (0x1F8C/0x1EDC): from the tick after the failed spawn, one 80-pixel scanline of
+// the well per tick (y = 21..180) is sprayed and erased; GAME OVER (0x22FC, 128x36 at
+// (85,83)) is drawn in the tick of the 160th. Nothing times out after that: the session
+// loop leaves the game-over screen only on an Esc release (0x4A3..0x4D6).
+constexpr int kTopOutDissolveFrames = kBoardHeight * kPieceTileSize;  // 160 scanlines
+constexpr int kGameOverX = 0x55;
+constexpr int kGameOverY = 0x53;
 constexpr int kState9BootstrapFrames = 72;
 constexpr int kFrontendRecordSize = 0x1C;
 constexpr int kFrontendRecordCount = 0x400;
@@ -114,10 +145,6 @@ constexpr int kSetupHighScoreOffset = 0x26;
 constexpr int kSetupHighScoreRecordSize = 0x1C;
 constexpr int kSetupHighScoreNameLength = 20;
 constexpr int kSetupHighScoreCount = 5;
-
-bool IsTopOutAdvanceKey(SDL_Keycode key) {
-  return key == SDLK_RETURN || key == SDLK_ESCAPE || key == SDLK_BACKSPACE || key == SDLK_SPACE;
-}
 
 struct CounterLayout {
   int x;
@@ -488,6 +515,22 @@ std::array<int, 2048> BuildSineTable() {
   constexpr double kPi = 3.14159265358979323846;
   for (int index = 0; index < 0x200; ++index) {
     const int value = static_cast<int>(std::lround(std::sin(index * kPi / 1024.0) * 65536.0));
+    table[index] = value;
+    table[0x3FF - index] = value;
+    table[0x400 + index] = -value;
+    table[0x7FF - index] = -value;
+  }
+  return table;
+}
+
+// The particle polar table exactly as 0x27B8 builds it: 512 values
+// chop(sin(i * 0.0030679616) * 32769.0) (doubles at 0x17AE8/0x17AF0), mirrored into 2048
+// entries, so t[1] = 100 and t[0x200] = 32768. The nearest value to an integer is 0.002
+// away, so double precision reproduces the original's x87 table on every platform.
+std::array<int, 2048> BuildParticleSineTable() {
+  std::array<int, 2048> table{};
+  for (int index = 0; index < 0x200; ++index) {
+    const int value = static_cast<int>(std::trunc(std::sin(index * 0.0030679616) * 32769.0));
     table[index] = value;
     table[0x3FF - index] = value;
     table[0x400 + index] = -value;
@@ -872,6 +915,7 @@ bool MilestoneADemo::Initialize(SDL_Renderer* renderer, std::string* error_out, 
   // ATETRIS.ZIP, ATET.DAT extracted via miniz), first next to the executable
   // (portable / release layout, robust to the build machine's drive letter), then
   // the working directory, then the build-tree ATET.DAT as a dev fallback.
+  const Uint64 audit_t_data = SDL_GetPerformanceCounter();
   std::string dat_error = "not found";
   bool loaded = false;
   std::vector<std::string> search_dirs;
@@ -892,6 +936,7 @@ bool MilestoneADemo::Initialize(SDL_Renderer* renderer, std::string* error_out, 
           atet_data_.LoadFromDat(bytes, &dat_error)) {
         loaded = true;
         found = true;
+        g_audit_startup.data_source = dir + dat_name;
         break;
       }
     }
@@ -904,6 +949,7 @@ bool MilestoneADemo::Initialize(SDL_Renderer* renderer, std::string* error_out, 
       if (ReadBinaryAsset((dir + archive_name).c_str(), &bytes, &ignored) &&
           atet_data_.LoadFromZip(bytes, &dat_error)) {
         loaded = true;
+        g_audit_startup.data_source = dir + archive_name;
         break;
       }
     }
@@ -917,8 +963,11 @@ bool MilestoneADemo::Initialize(SDL_Renderer* renderer, std::string* error_out, 
     if (ReadBinaryAsset(ATET_PORT_ATET_DAT_PATH, &bytes, &ignored) &&
         atet_data_.LoadFromDat(bytes, &dat_error)) {
       loaded = true;
+      g_audit_startup.data_source = std::string("compiled-fallback:") + ATET_PORT_ATET_DAT_PATH;
     }
   }
+  g_audit_startup.data_ticks = SDL_GetPerformanceCounter() - audit_t_data;
+  const Uint64 audit_t_textures = SDL_GetPerformanceCounter();
   if (!loaded) {
     SetErrorMessage(error_out,
                     "Could not load the game data (" + dat_error +
@@ -957,6 +1006,8 @@ bool MilestoneADemo::Initialize(SDL_Renderer* renderer, std::string* error_out, 
     }
   }
 
+  g_audit_startup.textures_ticks = SDL_GetPerformanceCounter() - audit_t_textures;
+  const Uint64 audit_t_tables = SDL_GetPerformanceCounter();
   if (!LoadFrontendFont(error_out)) {
     return false;
   }
@@ -968,6 +1019,8 @@ bool MilestoneADemo::Initialize(SDL_Renderer* renderer, std::string* error_out, 
   if (!LoadGameplayParticleAssets(error_out)) {
     return false;
   }
+  g_audit_startup.tables_ticks = SDL_GetPerformanceCounter() - audit_t_tables;
+  const Uint64 audit_t_setup = SDL_GetPerformanceCounter();
 
   scene_ = Scene::kFrontend;
   SetFrontendView(FrontendView::kMainMenu, 0);
@@ -979,10 +1032,13 @@ bool MilestoneADemo::Initialize(SDL_Renderer* renderer, std::string* error_out, 
   high_score_entry_name_.clear();
   high_score_entry_lowercase_ = false;
   high_score_entry_commit_pending_ = false;
-  top_out_handoff_pending_ = false;
   top_out_frame_ = 0;
+  top_out_dissolved_rows_ = 0;
+  top_out_source_cells_.fill(0);
   top_out_score_ = 0;
   top_out_lines_ = 0;
+  tick_counter_ = 0;
+  last_clear_tick_ = 0;
   live_game_active_ = false;
   live_board_cells_.fill(0);
   live_piece_stats_.fill(0);
@@ -997,15 +1053,18 @@ bool MilestoneADemo::Initialize(SDL_Renderer* renderer, std::string* error_out, 
   down_lockout_frames_ = 0;
   pending_clear_rows_.clear();
   collapse_frame_ = 0;
-  gameplay_top_out_frame_ = 0;
   warning_band_ = 0;
   warning_cooldowns_.fill(0);
-  debris_particles_.clear();
+  debris_particles_.clear();  // startup only (0x2DA0, single caller 0x126)
+  debris_hidden_after_frontend_ = false;
+  alert_corner_hold_ = false;
   live_snapshot_ = LiveSnapshot{};
   gameplay_snapshot_texture_valid_ = false;
   last_clear_was_four_ = false;
-  sleepy_ = false;
-  frames_since_clear_ = 0;
+  alert_effect_id_ = -1;
+  alert_lifetime_ = 0;
+  alert_reveal_counter_ = 0;
+  AlertCornerRestore();
   high_score_bootstrap_frames_ = 0;
   high_score_conceal_frames_ = 0;
   audio_events_.clear();
@@ -1026,6 +1085,7 @@ bool MilestoneADemo::Initialize(SDL_Renderer* renderer, std::string* error_out, 
   if (error_out != nullptr) {
     error_out->clear();
   }
+  g_audit_startup.setup_ticks = SDL_GetPerformanceCounter() - audit_t_setup;
 
   return true;
 }
@@ -1056,21 +1116,10 @@ bool MilestoneADemo::HandleKeyDown(SDL_Keycode key) {
   }
 
   if (scene_ == Scene::kTopOut) {
-    if (IsTopOutAdvanceKey(key)) {
-      if (top_out_frame_ < kTopOutOverlayStartFrame) {
-        top_out_frame_ = kTopOutOverlayStartFrame;
-        top_out_handoff_pending_ = false;
-        return true;
-      }
-      if (top_out_frame_ < kTopOutOverlayEndFrame) {
-        top_out_frame_ = kTopOutOverlayEndFrame;
-        top_out_handoff_pending_ = false;
-        return true;
-      }
-      top_out_handoff_pending_ = true;
-      return true;
-    }
-    return false;
+    // The keyboard ISR 0x800 records only key RELEASES for the session loop; a press, and
+    // any key but Esc, changes nothing on the dissolve or the GAME OVER screen. Esc acts
+    // on its release (HandleKeyUp). Keys are swallowed so main's debug probe stays silent.
+    return true;
   }
 
   if (scene_ == Scene::kFrontend && frontend_view_ == FrontendView::kKeyboardSetup &&
@@ -1214,9 +1263,19 @@ bool MilestoneADemo::HandleKeyDown(SDL_Keycode key) {
 
 void MilestoneADemo::HandleKeyUp(SDL_Keycode key) {
   TrackKeyUp(key);
-  if (scene_ == Scene::kTopOut && IsTopOutAdvanceKey(key) && top_out_handoff_pending_) {
-    top_out_handoff_pending_ = false;
-    BeginHighScoreNameEntry(top_out_score_, top_out_lines_);
+  if (scene_ == Scene::kTopOut && key == SDLK_ESCAPE && screen_fade_ == ScreenFade::kNone) {
+    // Session loop 0x4A3..0x4D6, at the start of the tick that sees the Esc release:
+    if (top_out_dissolved_rows_ >= kTopOutDissolveFrames) {
+      // after GAME OVER: 0x23AC (save-under back into the working screen only) and
+      // 0x3830(9). The displayed GAME OVER frame itself fades to black, then state 9.
+      BeginSceneFade(PendingScene::kHighScoresFromTopOut);
+    } else {
+      // during the dissolve: 0x3830(1), the main menu, with the game still resumable
+      // (live flag 0x2C72B is cleared only in the GAME OVER tick); Return to Game
+      // continues the dissolve at the next scanline.
+      SaveLiveSnapshot();
+      BeginSceneFade(PendingScene::kFrontendFromGameplay);
+    }
     return;
   }
   if (scene_ == Scene::kFrontend && frontend_view_ == FrontendView::kHighScoreEntry &&
@@ -1226,6 +1285,12 @@ void MilestoneADemo::HandleKeyUp(SDL_Keycode key) {
 }
 
 void MilestoneADemo::Tick() {
+  // Stand-in for the original's PIT tick counter 0x2D2A3 (incremented by the timer ISR at
+  // 0x6683): it advances on every tick, menus, fades and splashes included, and only the
+  // sleepy and fast-follow face tests read it. One Tick per tick here; replace with the
+  // real tick clock when the timing work (pacer 0x24D0 model) lands.
+  ++tick_counter_;
+
   // While a screen fade is in progress the original busy-waits on the timer and
   // does not advance game logic; freeze everything except the fade (and audio
   // delivery) until it completes.
@@ -1255,6 +1320,12 @@ void MilestoneADemo::Tick() {
         ApplyFrontendHorizontalEdit(left_held ? -1 : 1, false);
       }
     }
+  }
+
+  if (scene_ == Scene::kTopOut) {
+    StepTopOutScene();
+    FlushAudioEvents();
+    return;
   }
 
   if (scene_ != Scene::kGameplay) {
@@ -1357,11 +1428,11 @@ void MilestoneADemo::Shutdown() {
     gameplay_snapshot_texture_ = nullptr;
   }
   gameplay_snapshot_texture_valid_ = false;
-  if (top_out_saved_under_texture_ != nullptr) {
-    SDL_DestroyTexture(top_out_saved_under_texture_);
-    top_out_saved_under_texture_ = nullptr;
+  if (alert_corner_texture_ != nullptr) {
+    SDL_DestroyTexture(alert_corner_texture_);
+    alert_corner_texture_ = nullptr;
   }
-  top_out_saved_under_valid_ = false;
+  alert_corner_dirty_ = true;
 
   title_indices_.clear();
   piece_atlas_indices_.clear();
@@ -1436,11 +1507,12 @@ std::string MilestoneADemo::debug_state_line() const {
          << " alert=" << alert_effect_id_
          << " pulse=" << PulseRevealAmount()
          << " debris=" << debris_particles_.size()
-         << " sleepy=" << (sleepy_ ? 1 : 0)
+         << " sleepy=" << (alert_effect_id_ == 11 ? 1 : 0)
          << " snapshot=" << (gameplay_snapshot_texture_valid_ ? 1 : 0)
-         << " savedunder=" << (top_out_saved_under_valid_ ? 1 : 0)
          << " fade=" << (screen_fade_ == ScreenFade::kOut ? "out" : screen_fade_ == ScreenFade::kIn ? "in" : "none")
-         << ":" << screen_fade_frame_;
+         << ":" << screen_fade_frame_
+         << " alertlife=" << alert_lifetime_
+         << " gameover=" << (scene_ == Scene::kTopOut && top_out_dissolved_rows_ >= kTopOutDissolveFrames ? 1 : 0);
   return stream.str();
 }
 
@@ -1548,6 +1620,31 @@ bool MilestoneADemo::LoadGameplayParticleAssets(std::string* error_out) {
   std::copy(ramps.begin(), ramps.end(), particle_ramps_.begin());
 
   gameplay_palette_ = atet_data_.gameplay_palette();
+  particle_sine_table_ = BuildParticleSineTable();
+
+  // The face corner is a 50x50 piece of the working screen. 0x2188 saves the base screen
+  // under it once at startup; 0x2138 restores it when a face expires.
+  const AtetData::Indexed& base = atet_data_.gameplay_screen();
+  if (base.width < kAlertFaceX + kAlertFaceSize || base.height < kAlertFaceY + kAlertFaceSize ||
+      base.indices.size() < static_cast<size_t>(base.width) * static_cast<size_t>(base.height)) {
+    SetErrorMessage(error_out, "Gameplay screen too small for the alert corner.");
+    return false;
+  }
+  for (int row = 0; row < kAlertFaceSize; ++row) {
+    for (int col = 0; col < kAlertFaceSize; ++col) {
+      alert_corner_background_[static_cast<size_t>(row * kAlertFaceSize + col)] =
+          base.indices[static_cast<size_t>((kAlertFaceY + row) * base.width + kAlertFaceX + col)];
+    }
+  }
+  for (int tile = 0; tile < static_cast<int>(alert_tiles_.size()); ++tile) {
+    const AtetData::Indexed& face = atet_data_.alert_tile(tile);
+    if (face.width != kAlertFaceSize || face.height != kAlertFaceSize ||
+        face.indices.size() != static_cast<size_t>(kAlertFaceSize * kAlertFaceSize)) {
+      SetErrorMessage(error_out, "ATET.DAT chunk 6 alert tile is not 50x50.");
+      return false;
+    }
+  }
+  AlertCornerRestore();
   return true;
 }
 
@@ -1676,115 +1773,41 @@ void MilestoneADemo::RenderSplash(SDL_Renderer* renderer) {
   AdvanceSplashTimers();
 }
 
-void MilestoneADemo::RenderTopOutBackdrop(SDL_Renderer* renderer) {
-  RenderGameplay(renderer);
-
-  const TextureAsset& topout_face = alert_tiles_[6];  // tile06 = shocked / game-over (RE alert ID 6)
-  DrawTextureAt(renderer, topout_face.texture, 24, 132, topout_face.width, topout_face.height);
-
-  const int dissolved_rows =
-      std::clamp((top_out_frame_ * kBoardHeight) / kTopOutDissolveFrames, 0, kBoardHeight);
+void MilestoneADemo::RenderTopOut(SDL_Renderer* renderer) const {
+  // The game-over scene is the working screen as the failed spawn left it, redrawn every
+  // frame from state (all stepping happens in Tick): HUD, the well as drawn (board plus the
+  // colliding piece when it was drawn) minus the scanlines 0x1EDC has already erased, the
+  // face corner, GAME OVER once the walk is done (0x22FC at (85,83), colour 0 transparent),
+  // and the debris plotted last (0x2F24 runs after every tick, over face and GAME OVER).
+  DrawTexture(renderer, gameplay_screen_.texture, gameplay_screen_.width, gameplay_screen_.height);
   SDL_SetRenderDrawColor(renderer, 0, 0, 0, SDL_ALPHA_OPAQUE);
-  for (int row = 0; row < dissolved_rows; ++row) {
-    const SDL_FRect row_rect = {
-        static_cast<float>(kGameplayClearX),
-        static_cast<float>(kGameplayClearY + (row * kPieceTileSize)),
-        static_cast<float>(kGameplayClearWidth),
-        static_cast<float>(kPieceTileSize),
-    };
-    SDL_RenderFillRect(renderer, &row_rect);
+  const SDL_FRect preview_clear = {static_cast<float>(kPreviewX), static_cast<float>(kPreviewY),
+                                   static_cast<float>(kPreviewWidth), static_cast<float>(kPreviewHeight)};
+  SDL_RenderFillRect(renderer, &preview_clear);
+  const SDL_FRect well_clear = {static_cast<float>(kGameplayClearX), static_cast<float>(kGameplayClearY),
+                                static_cast<float>(kGameplayClearWidth), static_cast<float>(kGameplayClearHeight)};
+  SDL_RenderFillRect(renderer, &well_clear);
+  if (live_game_active_) {
+    RenderLiveHud(renderer);
+  }
+  DrawBoardCells(renderer, top_out_source_cells_, false);
+
+  const int erased = std::clamp(top_out_dissolved_rows_, 0, kTopOutDissolveFrames);
+  if (erased > 0) {
+    SDL_SetRenderDrawColor(renderer, 0, 0, 0, SDL_ALPHA_OPAQUE);
+    const SDL_FRect erased_rect = {static_cast<float>(kGameplayClearX), static_cast<float>(kGameplayClearY),
+                                   static_cast<float>(kGameplayClearWidth), static_cast<float>(erased)};
+    SDL_RenderFillRect(renderer, &erased_rect);
   }
 
-  // Draw the dissolve fountain on top of the cleared (black) rows so the upward
-  // spray stays visible above the shrinking stack, matching the original.
-  RenderDebrisParticles(renderer);
-}
-
-bool MilestoneADemo::CaptureTopOutSavedUnder(SDL_Renderer* renderer) {
-  if (renderer == nullptr) {
-    return false;
+  RenderAlertTile(renderer);
+  if (top_out_dissolved_rows_ >= kTopOutDissolveFrames) {
+    DrawTextureAt(renderer, game_over_overlay_.texture, kGameOverX, kGameOverY, game_over_overlay_.width,
+                  game_over_overlay_.height);
   }
-
-  if (top_out_saved_under_texture_ == nullptr) {
-    top_out_saved_under_texture_ = SDL_CreateTexture(
-        renderer,
-        SDL_PIXELFORMAT_RGBA8888,
-        SDL_TEXTUREACCESS_TARGET,
-        kScreenWidth,
-        kScreenHeight);
-    if (top_out_saved_under_texture_ == nullptr) {
-      SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "Failed to create top-out saved-under texture: %s", SDL_GetError());
-      top_out_saved_under_valid_ = false;
-      return false;
-    }
+  if (!debris_hidden_after_frontend_) {
+    RenderDebrisParticles(renderer);
   }
-
-  SDL_Texture* previous_target = SDL_GetRenderTarget(renderer);
-  if (!SDL_SetRenderTarget(renderer, top_out_saved_under_texture_)) {
-    SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "Failed to set top-out saved-under target: %s", SDL_GetError());
-    top_out_saved_under_valid_ = false;
-    return false;
-  }
-
-  SDL_SetRenderDrawColor(renderer, 0, 0, 0, SDL_ALPHA_OPAQUE);
-  SDL_RenderClear(renderer);
-  RenderTopOutBackdrop(renderer);
-
-  if (!SDL_SetRenderTarget(renderer, previous_target)) {
-    SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "Failed to restore renderer target after top-out saved-under capture: %s", SDL_GetError());
-    top_out_saved_under_valid_ = false;
-    return false;
-  }
-
-  top_out_saved_under_valid_ = true;
-  return true;
-}
-
-void MilestoneADemo::RenderTopOut(SDL_Renderer* renderer) {
-  // The original game-over overlay is a real saved-under phase: the pixels
-  // beneath the GAME OVER overlay are saved once when the overlay first
-  // appears, the overlay is composited over that frozen backing, and the saved
-  // background is restored when the overlay is removed. It is not a live redraw
-  // of the dissolving gameplay each frame. Model that by capturing the backdrop
-  // into a backing texture on the first overlay-phase frame, then reusing it
-  // (frozen) through overlay removal until the high-score handoff.
-  const bool overlay_phase_reached = top_out_frame_ >= kTopOutOverlayStartFrame;
-  const bool overlay_visible =
-      top_out_frame_ >= kTopOutOverlayStartFrame && top_out_frame_ < kTopOutOverlayEndFrame;
-
-  if (!overlay_phase_reached) {
-    // Pre-overlay: the gameplay image is still dissolving live. Advance the
-    // dissolve fountain (spawn newly-cleared rows' debris + step particles)
-    // before rendering so this frame shows the spray.
-    top_out_saved_under_valid_ = false;
-    UpdateTopOutDissolve();
-    RenderTopOutBackdrop(renderer);
-    AdvanceTopOutTimers();
-    return;
-  }
-
-  if (!top_out_saved_under_valid_) {
-    CaptureTopOutSavedUnder(renderer);
-  }
-
-  if (top_out_saved_under_valid_) {
-    DrawTexture(renderer, top_out_saved_under_texture_, kScreenWidth, kScreenHeight);
-  } else {
-    // Fallback if a render-target texture is unavailable on this backend.
-    RenderTopOutBackdrop(renderer);
-  }
-
-  if (overlay_visible) {
-    DrawTextureAt(
-        renderer,
-        game_over_overlay_.texture,
-        96,
-        82,
-        game_over_overlay_.width,
-        game_over_overlay_.height);
-  }
-
-  AdvanceTopOutTimers();
 }
 
 void MilestoneADemo::RenderFrontend(SDL_Renderer* renderer) {
@@ -1814,6 +1837,7 @@ void MilestoneADemo::RenderFrontendPointfield(SDL_Renderer* renderer) {
   if (frontend_banks_[frontend_current_bank_].empty() || frontend_banks_[frontend_next_bank_].empty()) {
     return;
   }
+  AuditScopedTicks audit_ticks(&g_audit.pointfield_ticks);
 
   const std::vector<FrontendPoint>& current_bank = frontend_banks_[frontend_current_bank_];
   const std::vector<FrontendPoint>& next_bank = frontend_banks_[frontend_next_bank_];
@@ -1868,6 +1892,7 @@ void MilestoneADemo::RenderFrontendPointfield(SDL_Renderer* renderer) {
     };
     SDL_RenderFillRect(renderer, &point_rect);
     occupied[screen_index] = 1;
+    ++g_audit.pointfield_points;
   }
 
   AdvanceFrontendPointfield();
@@ -1877,6 +1902,7 @@ void MilestoneADemo::RenderFrontendRows(
     SDL_Renderer* renderer,
     const std::vector<std::string>& rows,
     int selected_row) const {
+  AuditScopedTicks audit_ticks(&g_audit.frontend_rows_ticks);
   const int revealed_rows = VisibleFrontendRowCount(rows.size());
   const bool steady_selection_pulse = revealed_rows >= static_cast<int>(rows.size());
   const bool high_score_table =
@@ -1957,6 +1983,7 @@ void MilestoneADemo::RenderFrontendText(
           1.0f,
       };
       SDL_RenderTexture(renderer, frontend_font_atlas_.texture, &source, &destination);
+      ++g_audit.glyph_row_draws;
     }
 
     cursor_x += frontend_font_widths_[glyph_index] + 2;
@@ -2016,13 +2043,6 @@ void MilestoneADemo::AdvanceSplashTimers() {
   ++splash_page_;
   if (splash_page_ >= 2) {
     CompleteStartupSplashes();
-  }
-}
-
-void MilestoneADemo::AdvanceTopOutTimers() {
-  ++top_out_frame_;
-  if (top_out_frame_ >= kTopOutHandoffFrame) {
-    BeginHighScoreNameEntry(top_out_score_, top_out_lines_);
   }
 }
 
@@ -2136,6 +2156,7 @@ void MilestoneADemo::TrackKeyDown(SDL_Keycode key) {
 
   if (!held_original_scancodes_[original_scancode]) {
     held_original_scancode_frames_[original_scancode] = 0;
+    audit_pressed_[original_scancode] = true;
   }
   held_original_scancodes_[original_scancode] = true;
 }
@@ -2146,6 +2167,9 @@ void MilestoneADemo::TrackKeyUp(SDL_Keycode key) {
     return;
   }
 
+  if (held_original_scancodes_[original_scancode]) {
+    audit_released_[original_scancode] = true;
+  }
   held_original_scancodes_[original_scancode] = false;
   held_original_scancode_frames_[original_scancode] = 0;
 }
@@ -2203,17 +2227,31 @@ void MilestoneADemo::CompleteSceneSwitch() {
       live_game_available_ = true;
       break;
     case PendingScene::kGameplayNewGame:
+      // The fade-in shows the screen the frontend saved on entry, corner included; New Game
+      // init (0x05E0 -> 0x206C(1)) resets the face only in the working screen.
+      alert_corner_shown_ = alert_corner_;
+      alert_corner_hold_ = true;
       ResetLiveGameplayState();
       live_game_active_ = true;
       live_game_available_ = true;
+      debris_hidden_after_frontend_ = true;
       scene_ = Scene::kGameplay;
       StartCurrentMusic("music-continue-new-game");
       break;
     case PendingScene::kGameplayResume:
       RestoreLiveSnapshot();
       live_game_active_ = true;
-      scene_ = Scene::kGameplay;
+      debris_hidden_after_frontend_ = true;
+      // Return to Game after an Esc during the top-out dissolve resumes the dissolve.
+      scene_ = gameplay_phase_ == GameplayPhase::kTopOutDissolve ? Scene::kTopOut : Scene::kGameplay;
       StartCurrentMusic("music-continue-return-to-game");
+      break;
+    case PendingScene::kHighScoresFromTopOut:
+      // At black after the GAME OVER fade-out: state 9 (high scores / name entry). The lost
+      // game is over: nothing can resume it (0x1FF5 cleared the live flag).
+      BeginHighScoreNameEntry(top_out_score_, top_out_lines_);
+      live_game_active_ = false;
+      live_game_available_ = false;
       break;
     case PendingScene::kNone:
       break;
@@ -2321,6 +2359,9 @@ void MilestoneADemo::EmitAudioEvent(const char* event_name, int slot, int pan, i
       sfx_volume_override >= 0 ? sfx_volume_override : sfx_volume_,
       pan,
       voice_class});
+  audit_emitted_.push_back(AuditEmitted{audit_stage_, event_name, true, slot, music_track_index_, music_volume_,
+                                        sfx_volume_override >= 0 ? sfx_volume_override : sfx_volume_, pan,
+                                        voice_class});
 }
 
 int MilestoneADemo::PanForPieceColumn(int piece_x) const {
@@ -2341,6 +2382,8 @@ void MilestoneADemo::EmitMusicEvent(const char* event_name) {
       music_track_index_,
       music_volume_,
       sfx_volume_});
+  audit_emitted_.push_back(
+      AuditEmitted{audit_stage_, event_name, false, 0, music_track_index_, music_volume_, sfx_volume_, 0x80, 0});
 }
 
 void MilestoneADemo::FlushAudioEvents() {
@@ -2479,7 +2522,6 @@ void MilestoneADemo::CaptureKeyboardBinding(std::uint8_t original_scancode) {
 }
 
 void MilestoneADemo::BeginHighScoreNameEntry(int score, int lines) {
-  top_out_handoff_pending_ = false;
   const bool use_state9_bootstrap =
       scene_ == Scene::kTopOut || gameplay_phase_ == GameplayPhase::kTopOutDissolve;
   if (use_state9_bootstrap) {
@@ -2519,22 +2561,33 @@ void MilestoneADemo::BeginHighScoreNameEntry(int score, int lines) {
 }
 
 void MilestoneADemo::BeginTopOutDemo(int score, int lines) {
+  ArmTopOut(score, lines, false);
+}
+
+void MilestoneADemo::ArmTopOut(int score, int lines, bool piece_drawn) {
+  // Failed spawn (0x102D..0x1065): face 6 for ever through the shared trigger 0x2008,
+  // 0x1F8C(2) (scanline counter 0, logical board cleared), SFX 5 (centre, class 1). The
+  // dissolve samples the working screen, so its source is the board plus the colliding
+  // piece when that was drawn (0x10A1 runs only when no collapse is pending).
   top_out_frame_ = 0;
-  gameplay_top_out_frame_ = 0;
   top_out_dissolved_rows_ = 0;
-  // Clear the gameplay warning band + alert so the backdrop's RenderGameplay
-  // stops drawing a mood face; the top-out (shocked, tile06) face takes over.
-  warning_band_ = 0;
-  alert_effect_id_ = -1;
-  alert_lifetime_ = 0;
-  alert_reveal_frame_ = 0;
-  top_out_saved_under_valid_ = false;
   top_out_score_ = score;
   top_out_lines_ = lines;
-  top_out_handoff_pending_ = false;
+  top_out_source_cells_ = live_board_cells_;
+  if (piece_drawn) {
+    for (const CellOffset& cell : RotatedCells(live_piece_.type, live_piece_.rotation)) {
+      const int board_x = live_piece_.x + cell.x;
+      const int board_y = live_piece_.y + cell.y;
+      if (board_x >= 0 && board_x < kBoardWidth && board_y >= 0 && board_y < kBoardHeight) {
+        top_out_source_cells_[static_cast<size_t>(board_y * kBoardWidth + board_x)] =
+            NormalizeModulo(live_piece_.type, static_cast<int>(kTetrominoShapes.size())) + 1;
+      }
+    }
+  }
+  TriggerAlert(6, kAlertInfiniteLifetime);
+  live_board_cells_.fill(0);
   gameplay_phase_ = GameplayPhase::kTopOutDissolve;
-  live_game_available_ = false;
-  EmitAudioEvent("top-out", 5);
+  EmitAudioEvent("top-out", 5, 0x80, 1);
   scene_ = Scene::kTopOut;
 }
 
@@ -2612,17 +2665,14 @@ void MilestoneADemo::ResetLiveGameplayState() {
   down_lockout_frames_ = 0;
   pending_clear_rows_.clear();
   collapse_frame_ = 0;
-  gameplay_top_out_frame_ = 0;
+  top_out_frame_ = 0;
+  top_out_dissolved_rows_ = 0;
+  top_out_source_cells_.fill(0);
   warning_band_ = 0;
-  warning_cooldowns_.fill(0);
-  debris_particles_.clear();
+  // The particle pool is NOT reset: 0x2DA0 runs once at startup, so debris alive when the
+  // player left for the menu keeps flying in the new game (it froze while the menu ran).
   live_snapshot_ = LiveSnapshot{};
-  last_clear_was_four_ = false;
-  sleepy_ = false;
-  frames_since_clear_ = 0;
-  alert_effect_id_ = -1;
-  alert_lifetime_ = 0;
-  alert_reveal_frame_ = 0;
+  ResetAlertState();  // 0x206C(1) from New Game init (0x0757)
   live_piece_ = LivePiece{0, 0, 4, 0};
   RefillGameplayRandomTable();
   live_piece_ = LivePiece{RollNextPieceType(), 0, 4, 0};
@@ -2631,7 +2681,7 @@ void MilestoneADemo::ResetLiveGameplayState() {
   ++live_piece_stats_[static_cast<size_t>(live_piece_.type)];
 }
 
-bool MilestoneADemo::SpawnNextLivePiece() {
+bool MilestoneADemo::SpawnNextLivePiece(bool after_collapse) {
   live_piece_ = LivePiece{live_next_piece_type_, 0, 4, 0};
   live_next_piece_type_ = RollNextPieceType();
   gravity_accumulator_ = 0;
@@ -2639,7 +2689,8 @@ bool MilestoneADemo::SpawnNextLivePiece() {
   down_lockout_frames_ = kGameplayDownLockoutFrames;
   ++live_piece_stats_[static_cast<size_t>(live_piece_.type)];
   if (!CanPlaceLivePiece(live_piece_)) {
-    BeginTopOutDemo(live_score_, live_lines_);
+    // The original draws the colliding piece only when no collapse is pending.
+    ArmTopOut(live_score_, live_lines_, !after_collapse);
     return false;
   }
   return true;
@@ -2663,19 +2714,15 @@ void MilestoneADemo::StepLiveGameplay() {
     return;
   }
 
+  // One session-loop tick: particles 0x2E18, gameplay 0x9C8, alert face 0x206C.
   StepDebrisParticles();
-  ++frames_since_clear_;
-  if (!sleepy_ && frames_since_clear_ >= kSleepyNoClearFrames) {
-    sleepy_ = true;
-    EmitAudioEvent("sleepy-no-clear-timeout", 6);
+  debris_hidden_after_frontend_ = false;
+  if (alert_corner_hold_) {
+    alert_corner_hold_ = false;  // the first tick's flush shows the working-screen corner
+    alert_corner_dirty_ = true;
   }
   if (down_lockout_frames_ > 0) {
     --down_lockout_frames_;
-  }
-  for (int& cooldown : warning_cooldowns_) {
-    if (gameplay_phase_ != GameplayPhase::kCollapse && cooldown > 0) {
-      --cooldown;
-    }
   }
 
   switch (gameplay_phase_) {
@@ -2686,20 +2733,25 @@ void MilestoneADemo::StepLiveGameplay() {
       StepCollapseGameplay();
       break;
     case GameplayPhase::kTopOutDissolve:
-      StepTopOutGameplay();
-      break;
+      break;  // the game-over scene steps itself (StepTopOutScene)
   }
 
   UpdateAlert();
 }
 
 void MilestoneADemo::StepFallingGameplay() {
+  StackWarningStep();  // 0x21C4 at 0x0A5E: start of every normal step
+  audit_gravity_active_ = true;
+  audit_gravity_rate_ = CurrentDropIncrement();
+  audit_gravity_acc_before_ = gravity_accumulator_;
   gravity_accumulator_ += CurrentDropIncrement();
   bool moved_down = false;
   while (gravity_accumulator_ >= kGameplayGravityThreshold) {
     gravity_accumulator_ -= kGameplayGravityThreshold;
+    ++audit_descent_attempts_;
     if (TryMoveLivePiece(0, 1)) {
       moved_down = true;
+      ++audit_descent_successes_;
     } else {
       break;
     }
@@ -2711,13 +2763,13 @@ void MilestoneADemo::StepFallingGameplay() {
     if (moved_down) {
       lock_frames_ = 0;
     }
-    UpdateStackWarning(true);
+    CheckSleepyTimeout();
     return;
   }
 
   ++lock_frames_;
   if (lock_frames_ < kGameplayLockFrames) {
-    UpdateStackWarning(true);
+    CheckSleepyTimeout();
     return;
   }
 
@@ -2729,18 +2781,20 @@ void MilestoneADemo::StepFallingGameplay() {
   const std::vector<int> full_rows = DetectFullRows();
   if (!full_rows.empty()) {
     BeginLineCollapse(full_rows);
+    CheckSleepyTimeout();
     return;
   }
 
-  UpdateStackWarning(true);
-  last_clear_was_four_ = false;
+  // A non-clearing lock leaves the back-to-back memory alone: 0x2C763 is written only by
+  // a clear (0x0FB9) and by New Game (0x20AF).
   SpawnNextLivePiece();
+  CheckSleepyTimeout();  // also on the lock step that tops out (0x1065 -> 0x10A6)
 }
 
 void MilestoneADemo::StepCollapseGameplay() {
+  // Collapse steps return before the warning (0x21C4) and sleepy (0x10A6) code.
   ++collapse_frame_;
   if (collapse_frame_ < static_cast<int>(pending_clear_rows_.size()) * kGameplayCollapseFramesPerRow) {
-    UpdateStackWarning(false);
     return;
   }
 
@@ -2749,14 +2803,15 @@ void MilestoneADemo::StepCollapseGameplay() {
   pending_clear_rows_.clear();
   collapse_frame_ = 0;
   gameplay_phase_ = GameplayPhase::kFalling;
-  UpdateStackWarning(true);
-  SpawnNextLivePiece();
+  SpawnNextLivePiece(true);
 }
 
-void MilestoneADemo::StepTopOutGameplay() {
-  ++gameplay_top_out_frame_;
-  if (gameplay_top_out_frame_ >= kTopOutHandoffFrame) {
-    BeginHighScoreNameEntry(live_score_, live_lines_);
+// End of every normal step (0x10A6): the sleepy face when exactly 1800 ticks have passed
+// since the last clear (or New Game). A pause straddling that tick skips it for good.
+void MilestoneADemo::CheckSleepyTimeout() {
+  if (tick_counter_ - last_clear_tick_ == kSleepyTicksSinceClear) {
+    TriggerAlert(11, kAlertSleepyLifetime);
+    EmitAudioEvent("sleepy-no-clear-timeout", 6, 0x80, 1);
   }
 }
 
@@ -2779,26 +2834,39 @@ void MilestoneADemo::BeginLineCollapse(const std::vector<int>& rows) {
   collapse_frame_ = 0;
   gameplay_phase_ = GameplayPhase::kCollapse;
   SeedLineClearDebris(rows);
-  const int clear_count = static_cast<int>(rows.size());
-  // Capture the pre-clear state that selects the reward/wake mood face.
-  const bool was_sleepy = sleepy_;
-  const bool was_four = last_clear_was_four_;
-  if (sleepy_ && clear_count == 1) {
-    EmitAudioEvent("sleepy-wake-1-line", 8);
+  const int clear_count = std::clamp(static_cast<int>(rows.size()), 1, 4);
+  // Clear block of the lock step (0x0EB2..0x0FA9): one reward face and ONE sound (centre,
+  // class 1). Wake needs the sleepy face to be the current face; back-to-back needs the
+  // previous clear to have been a tetris; otherwise tables 0x980 / 0x990.
+  static constexpr std::array<int, 4> kClearFace = {2, 0, 9, 7};
+  static constexpr std::array<int, 4> kClearSlot = {9, 7, 7, 10};
+  static constexpr std::array<const char*, 4> kClearName = {"line-clear-1", "line-clear-2-or-3", "line-clear-2-or-3",
+                                                            "line-clear-4"};
+  int face = kClearFace[static_cast<size_t>(clear_count - 1)];
+  int slot = kClearSlot[static_cast<size_t>(clear_count - 1)];
+  const char* name = kClearName[static_cast<size_t>(clear_count - 1)];
+  if (clear_count == 1 && alert_effect_id_ == 11) {
+    face = 12;
+    slot = 8;
+    name = "sleepy-wake-1-line";
+  } else if (clear_count == 4 && last_clear_was_four_) {
+    face = 8;
+    slot = 11;
+    name = "line-clear-4-back-to-back";
   }
-  sleepy_ = false;
-  frames_since_clear_ = 0;
-  if (clear_count == 1) {
-    EmitAudioEvent("line-clear-1", 9);
-  } else if (clear_count == 4) {
-    EmitAudioEvent(last_clear_was_four_ ? "line-clear-4-back-to-back" : "line-clear-4", last_clear_was_four_ ? 11 : 10);
-  } else {
-    EmitAudioEvent("line-clear-2-or-3", 7);
+  TriggerAlert(face, kAlertClearLifetime);
+  EmitAudioEvent(name, slot, 0x80, 1);
+  // Then, silently, the fast-follow face when the previous clear (or New Game) came less
+  // than 160 ticks ago (0x0F54..0x0F9F): 1 for a single, 10 for a double or triple.
+  if (tick_counter_ - last_clear_tick_ < kFastFollowTicks) {
+    if (clear_count == 1) {
+      TriggerAlert(1, kAlertClearLifetime);
+    } else if (clear_count < 4) {
+      TriggerAlert(10, kAlertClearLifetime);
+    }
   }
+  last_clear_tick_ = tick_counter_;
   last_clear_was_four_ = clear_count == 4;
-  // Reward/wake mood face (chunk-6 alert tile), overriding the ambient warning
-  // for its lifetime (RE alert-id-correlation table).
-  TriggerAlert(AlertIdForClear(clear_count, was_four, was_sleepy), kAlertEventLifetime);
 }
 
 std::vector<int> MilestoneADemo::DetectFullRows() const {
@@ -2854,8 +2922,13 @@ void MilestoneADemo::CollapseMarkedRows() {
 }
 
 void MilestoneADemo::SeedLineClearDebris(const std::vector<int>& rows) {
+  AuditScopedTicks audit_ticks(&g_audit.line_clear_seed_ticks);
   const int style = NormalizeModulo(live_level_, 10);
-  for (const int row : rows) {
+  // The lock path scans rows y+1 down to y-2 and calls 0x1414 per full row in that order
+  // (0xDB8..0xE3F): bottom-up, so the lowest cleared row draws the RNG first.
+  std::vector<int> bottom_up(rows);
+  std::sort(bottom_up.begin(), bottom_up.end(), std::greater<int>());
+  for (const int row : bottom_up) {
     if (row < 0 || row >= kBoardHeight) {
       continue;
     }
@@ -2889,75 +2962,76 @@ void MilestoneADemo::SeedLineClearDebris(const std::vector<int>& rows) {
 }
 
 void MilestoneADemo::EmitLineClearParticle(int style, int col, int row8, int screen_x, int screen_y, int color) {
-  // Draw the family's RNG for every swept column (matching the original per-pixel
-  // consumption), then spawn only for a visible sampled pixel. The RNG-burst
-  // families (0/1/2) draw from the certified shared gameplay RNG.
-  const bool visible =
-      color != 0 && particle_ramps_[static_cast<size_t>(std::clamp(color, 0, 255)) * 4] != 0;
-
+  // Every helper spawns one particle per band pixel with no zero test (0x14B4..0x1C40);
+  // the burst families (0/1/2) draw from the shared gameplay RNG first.
   switch (style) {
     case 0: {  // 0x14b4: random polar burst (3 draws: life, angle, speed)
       const int life = static_cast<int>(NextGameplayRandomU32() & 0x3f) + 0x10;
       const int angle = static_cast<int>(NextGameplayRandomU32() & 0x7ff);
       const int speed = static_cast<int>(NextGameplayRandomU32() & 0x1ff) + 0x80;
-      if (visible) SpawnDebrisPolar(screen_x, screen_y, speed, angle, life, color);
+      SpawnDebrisPolar(screen_x, screen_y, speed, angle, life, color);
       break;
     }
     case 1: {  // 0x158c: horizontal spray, direction by band-row parity (2 draws: life, speed)
       const int life = static_cast<int>(NextGameplayRandomU32() & 0x3f) + 0x10;
       const int speed = static_cast<int>(NextGameplayRandomU32() & 0x1ff) + 0x80;
-      if (visible) SpawnDebrisPolar(screen_x, screen_y, speed, (row8 & 1) ? 0x400 : 0, life, color);
+      SpawnDebrisPolar(screen_x, screen_y, speed, (row8 & 1) ? 0x400 : 0, life, color);
       break;
     }
     case 2: {  // 0x1694: column-swept fan (2 draws: life, speed)
       const int life = static_cast<int>(NextGameplayRandomU32() & 0x3f) + 0x10;
       const int speed = static_cast<int>(NextGameplayRandomU32() & 0x1ff) + 0x80;
-      if (visible) SpawnDebrisPolar(screen_x, screen_y, speed, 0x188 + col * 3, life, color);
+      SpawnDebrisPolar(screen_x, screen_y, speed, 0x188 + col * 3, life, color);
       break;
     }
     case 3:  // 0x1770: deterministic fan
-      if (visible) SpawnDebrisPolar(screen_x, screen_y, 0x100, 0xc0 + col * 8, 0x40, color);
+      SpawnDebrisPolar(screen_x, screen_y, 0x100, 0xc0 + col * 8, 0x40, color);
       break;
-    case 4:  // 0x1830: target sweep (targetY = 8*row+0xf; screen_y = 21 + 8*row + row8)
-      if (visible) SpawnDebrisTarget(screen_x, screen_y, 0x1f + col * 3, screen_y - 6 - row8, 0x40, color);
+    case 4:  // 0x1830: target sweep; target Y starts at 8*row+0xf and gains 3 per band pixel
+             // row (0x18F8 add ecx,3). screen_y = 21 + 8*row + row8.
+      SpawnDebrisTarget(screen_x, screen_y, 0x1f + col * 3, screen_y - 6 + 2 * row8, 0x40, color);
       break;
     case 5:  // 0x192c: converge to a fixed point
-      if (visible) SpawnDebrisTarget(screen_x, screen_y, 0x95, 0xd5, 0x30, color);
+      SpawnDebrisTarget(screen_x, screen_y, 0x95, 0xd5, 0x30, color);
       break;
     case 6:  // 0x19dc: fixed direction, column-ramped speed
-      if (visible) SpawnDebrisPolar(screen_x, screen_y, 0x214 + col * 4, 0x600, 0x30, color);
+      SpawnDebrisPolar(screen_x, screen_y, 0x214 + col * 4, 0x600, 0x30, color);
       break;
     case 7:  // 0x1a9c: converge to a vertical line (targetY = 8*row+0x18)
-      if (visible) SpawnDebrisTarget(screen_x, screen_y, 0x94, screen_y + 3 - row8, 0x30, color);
+      SpawnDebrisTarget(screen_x, screen_y, 0x94, screen_y + 3 - row8, 0x30, color);
       break;
-    case 8:  // 0x1b54: horizontal split at column 0x28
-      if (visible) SpawnDebrisPolar(screen_x, screen_y, 0x80, col < 0x28 ? 0 : 0x400, 0x30, color);
+    case 8:  // 0x1b54: horizontal split at column 0x28; speed 0x80 gains 0x10 per band
+             // pixel row (0x1C06 add esi,0x10)
+      SpawnDebrisPolar(screen_x, screen_y, 0x80 + 0x10 * row8, col < 0x28 ? 0 : 0x400, 0x30, color);
       break;
     default:  // 9, 0x1c40: two-band split at column 0x28
-      if (visible) SpawnDebrisPolar(screen_x, screen_y, 0xa0, col < 0x28 ? 0x100 : 0x500, 0x30, color);
+      SpawnDebrisPolar(screen_x, screen_y, 0xa0, col < 0x28 ? 0x100 : 0x500, 0x30, color);
       break;
   }
 }
 
 void MilestoneADemo::SpawnDebrisPolar(int screen_x, int screen_y, int speed, int angle, int lifetime, int color) {
   if (debris_particles_.size() >= kGameplayMaxDebrisParticles) {
+    ++audit_particles_dropped_;
     return;
   }
-  // Polar velocity (0x2f78): v = -(sine[idx] * speed) >> 7 with the original's
-  // 0x8001 sine amplitude. sine_table_ here has amplitude 0x10000 (2x), so shift
-  // by 8 to reproduce the same velocity scale. Position/velocity are 16.16.
+  ++audit_particles_spawned_;
+  // Polar velocity (0x2f78): v = -((t[idx] * speed) >> 7) on the 0x27B8 table (peak
+  // 32768). Position/velocity are 16.16.
   const int cos_index = (angle + 0x200) & 0x7FF;
   const int sin_index = angle & 0x7FF;
-  const int vx = -static_cast<int>((static_cast<std::int64_t>(sine_table_[cos_index]) * speed) >> 8);
-  const int vy = -static_cast<int>((static_cast<std::int64_t>(sine_table_[sin_index]) * speed) >> 8);
+  const int vx = -static_cast<int>((static_cast<std::int64_t>(particle_sine_table_[cos_index]) * speed) >> 7);
+  const int vy = -static_cast<int>((static_cast<std::int64_t>(particle_sine_table_[sin_index]) * speed) >> 7);
   const int decay = kDebrisAgeFull / std::max(1, lifetime);
   debris_particles_.push_back(DebrisParticle{screen_x << 16, screen_y << 16, vx, vy, 0, decay, color});
 }
 
 void MilestoneADemo::SpawnDebrisTarget(int screen_x, int screen_y, int target_x, int target_y, int lifetime, int color) {
   if (debris_particles_.size() >= kGameplayMaxDebrisParticles) {
+    ++audit_particles_dropped_;
     return;
   }
+  ++audit_particles_spawned_;
   // Target velocity (0x3034): v = (target - start) * 65536 / lifetime.
   const int life = std::max(1, lifetime);
   const int vx = ((target_x - screen_x) << 16) / life;
@@ -2967,10 +3041,24 @@ void MilestoneADemo::SpawnDebrisTarget(int screen_x, int screen_y, int target_x,
 }
 
 void MilestoneADemo::StepDebrisParticles() {
+  AuditScopedTicks audit_ticks(&g_audit.debris_step_ticks);
+  const size_t audit_before = debris_particles_.size();
+  // 0x2E18: age += decay and retire at 0x400 before moving; otherwise move, and retire a
+  // particle whose new position is off screen (x < 0, y < 0, x > 320.0, y > 240.0; exactly
+  // 320.0 or 240.0 survive; the new position is not stored). The survivors keep their order.
   for (DebrisParticle& particle : debris_particles_) {
-    particle.x += particle.vx;
-    particle.y += particle.vy;
     particle.age += particle.decay;
+    if (particle.age >= kDebrisAgeFull) {
+      continue;
+    }
+    const int next_x = particle.x + particle.vx;
+    const int next_y = particle.y + particle.vy;
+    if (next_x < 0 || next_y < 0 || next_x > (kScreenWidth << 16) || next_y > (kScreenHeight << 16)) {
+      particle.age = kDebrisAgeFull;  // culled
+      continue;
+    }
+    particle.x = next_x;
+    particle.y = next_y;
   }
   debris_particles_.erase(
       std::remove_if(
@@ -2978,16 +3066,21 @@ void MilestoneADemo::StepDebrisParticles() {
           debris_particles_.end(),
           [](const DebrisParticle& particle) { return particle.age >= kDebrisAgeFull; }),
       debris_particles_.end());
+  audit_particles_retired_ += static_cast<std::uint32_t>(audit_before - debris_particles_.size());
+  g_audit.debris_active = static_cast<std::uint32_t>(debris_particles_.size());
 }
 
 void MilestoneADemo::RenderDebrisParticles(SDL_Renderer* renderer) const {
-  for (const DebrisParticle& particle : debris_particles_) {
+  AuditScopedTicks audit_ticks(&g_audit.debris_render_ticks);
+  g_audit.debris_active = static_cast<std::uint32_t>(debris_particles_.size());
+  // 0x2F24 walks the list from its head, newest first (the spawners insert at the head),
+  // and 0x17821 stores every colour, 0 (black) included; so the OLDEST particle on a pixel
+  // is the one left visible. The container is in spawn order: draw it back to front.
+  for (auto it = debris_particles_.rbegin(); it != debris_particles_.rend(); ++it) {
+    const DebrisParticle& particle = *it;
     const int stage = std::clamp(particle.age >> 8, 0, 3);  // 4 stages of 0x100
     const Uint8 ramp_index = particle_ramps_[static_cast<size_t>(std::clamp(particle.color, 0, 255)) * 4 +
                                               static_cast<size_t>(stage)];
-    if (ramp_index == 0) {
-      continue;
-    }
     const SDL_Color color = gameplay_palette_[ramp_index];
     SDL_SetRenderDrawColor(renderer, color.r, color.g, color.b, SDL_ALPHA_OPAQUE);
     const SDL_FRect debris_rect = {
@@ -2997,29 +3090,27 @@ void MilestoneADemo::RenderDebrisParticles(SDL_Renderer* renderer) const {
         1.0f,
     };
     SDL_RenderFillRect(renderer, &debris_rect);
+    ++g_audit.debris_drawn;
   }
 }
 
-// GAP A: the original's top-out dissolve is not a silent black-out. As the well
-// is cleared top-down, each row erupts into an upward particle fountain of its
-// own cell colors (the line-clear/alert helper family), then the well empties.
-// Drive that off the same dissolve front the black-out uses: for each row that
-// newly crosses into the dissolved region, spray the certified debris pool
-// upward from that row's filled cells.
-void MilestoneADemo::UpdateTopOutDissolve() {
-  // RE 0x1fc6: the dissolve front advances ONE pixel-row per frame down the whole
-  // gameplay area (kBoardHeight*8 pixel rows), spraying that row's debris as it passes.
-  // A pixel-row cascade (not board-row bursts) is what makes the next row start
-  // exploding while the previous is still mid-air -- the continuous teardown the
-  // original shows, instead of "one chunk at a time".
-  const int total_pixel_rows = kBoardHeight * kPieceTileSize;  // 160
-  const int dissolved =
-      std::clamp((top_out_frame_ * total_pixel_rows) / kTopOutDissolveFrames, 0, total_pixel_rows);
-  for (int pixel_row = top_out_dissolved_rows_; pixel_row < dissolved; ++pixel_row) {
-    SpawnTopOutPixelRow(pixel_row);
-  }
-  top_out_dissolved_rows_ = dissolved;
+// One tick of the game-over scene (session loop 0x58E/0x595/0x59D): particles 0x2E18,
+// then 0x9C8 -> 0x1F8C(0), which sprays and erases one scanline per tick until the 160th
+// and then draws GAME OVER in that same tick (afterwards 0x9C8 returns at once), then the
+// alert update 0x206C. Nothing here times out: only an Esc release leaves (HandleKeyUp).
+void MilestoneADemo::StepTopOutScene() {
+  AuditScopedTicks audit_ticks(&g_audit.topout_update_ticks);
   StepDebrisParticles();
+  debris_hidden_after_frontend_ = false;
+  if (top_out_dissolved_rows_ < kTopOutDissolveFrames) {
+    SpawnTopOutPixelRow(top_out_dissolved_rows_);
+    ++top_out_dissolved_rows_;
+    if (top_out_dissolved_rows_ == kTopOutDissolveFrames) {
+      live_game_available_ = false;  // 0x1FF5: the lost game can no longer be resumed
+    }
+  }
+  ++top_out_frame_;
+  UpdateAlert();
 }
 
 void MilestoneADemo::SpawnTopOutPixelRow(int pixel_row) {
@@ -3039,7 +3130,8 @@ void MilestoneADemo::SpawnTopOutPixelRow(int pixel_row) {
     for (int col = 0; col < kGameplayClearWidth; col += 2) {  // every other pixel (40/row)
       const int board_col = col / kPieceTileSize;
       const int pixel_x = col % kPieceTileSize;
-      const int cell = live_board_cells_[static_cast<size_t>(board_row * kBoardWidth + board_col)];
+      // 0x1EDC samples the working screen: the drawn well (board + colliding piece).
+      const int cell = top_out_source_cells_[static_cast<size_t>(board_row * kBoardWidth + board_col)];
       if (cell == 0) {
         continue;
       }
@@ -3060,116 +3152,173 @@ void MilestoneADemo::SpawnTopOutPixelRow(int pixel_row) {
   }
 }
 
-// Gameplay alert/mood-face controller (RE board-alert-pass 0x2008/0x206c). One-shot
-// events (line-clear rewards, wake) arm a tile for a lifetime via TriggerAlert;
-// UpdateAlert ages that event and otherwise reflects the ambient state (stack
-// warning band, then sleepy). Any change of tile restarts the staged reveal-in.
+// Gameplay mood faces, ported from 0x2008 (trigger) and 0x206C (update). The face corner is
+// a 50x50 piece of the working screen at (20,140) that only these routines write, so it is
+// kept as an indexed layer (alert_corner_) and drawn as it stands each frame:
+//   0x1793D draws a whole tile, skipping colour 0x20;
+//   0x17983 draws a tile squashed into N rows centred on y 165, colour 0x20 taken from
+//           the saved background;
+//   0x2138  copies the saved background (the base screen) back.
 void MilestoneADemo::TriggerAlert(int effect_id, int lifetime) {
   if (effect_id < 0 || effect_id >= static_cast<int>(alert_tiles_.size())) {
     return;
   }
-  if (effect_id != alert_effect_id_) {
-    alert_reveal_frame_ = 0;
+  if (effect_id == alert_effect_id_ || alert_lifetime_ != 0) {
+    // A face is up (or the same one again): the new face is drawn whole at once and gets
+    // the new lifetime; a reveal still running keeps its counter.
+    alert_effect_id_ = effect_id;
+    AlertCornerDrawFull(effect_id);
+    alert_lifetime_ = lifetime;
+    return;
   }
+  // Idle start: nothing drawn yet; the update reveals it over the next six steps.
   alert_effect_id_ = effect_id;
-  alert_lifetime_ = std::max(1, lifetime);
+  alert_lifetime_ = lifetime;
+  alert_reveal_counter_ = 6;
 }
 
+// Once per logic step after the gameplay step (0x059D), in play, on collapse steps and in
+// the game-over scene. Lifetime -1 never runs out; a lifetime of L keeps the face L-1 steps.
 void MilestoneADemo::UpdateAlert() {
-  if (alert_lifetime_ > 0) {
+  if (alert_lifetime_ == 0) {
+    return;
+  }
+  if (alert_lifetime_ != kAlertInfiniteLifetime) {
     --alert_lifetime_;
-    ++alert_reveal_frame_;
-    if (alert_lifetime_ == 0) {
-      alert_effect_id_ = -1;
-    }
-    return;  // a timed event holds over the ambient state until it expires
   }
-  int ambient = -1;
-  if (warning_band_ > 0) {
-    ambient = 2 + warning_band_;  // bands 1/2/3 -> alert tiles 3/4/5
-  } else if (sleepy_) {
-    ambient = 11;
+  if (alert_reveal_counter_ > 0) {
+    AlertCornerDrawStretch(alert_effect_id_,
+                           kAlertRevealRows[static_cast<size_t>(alert_reveal_counter_ - 1)]);
+    --alert_reveal_counter_;
   }
-  if (ambient != alert_effect_id_) {
-    alert_reveal_frame_ = 0;
-  } else {
-    ++alert_reveal_frame_;
+  if (alert_lifetime_ == 0) {
+    AlertCornerRestore();
+    alert_effect_id_ = -1;
   }
-  alert_effect_id_ = ambient;
 }
 
-int MilestoneADemo::AlertIdForClear(int cleared_rows, bool was_four, bool was_sleepy) const {
-  // Matches the recovered 0x09c8 line-clear alert table 0x980 = [2,0,9,7] plus its
-  // two overrides: a single-line clear out of the sleepy state wakes to tile 12,
-  // and a four-line clear following another four-line is the back-to-back tile 8.
-  // (There is no fast-follow-up path in the shipped code; tiles 1/10 are unused.)
-  if (was_sleepy && cleared_rows == 1) {
-    return 12;
+// 0x206C(1), called only by New Game init (0x0757): everything idle, the background back,
+// the last-clear tick restarted and the previous clear size and warning cooldowns cleared.
+void MilestoneADemo::ResetAlertState() {
+  alert_reveal_counter_ = 0;
+  alert_lifetime_ = 0;
+  AlertCornerRestore();
+  alert_effect_id_ = -1;
+  last_clear_tick_ = tick_counter_;
+  last_clear_was_four_ = false;
+  warning_cooldowns_.fill(0);
+}
+
+void MilestoneADemo::AlertCornerRestore() {
+  alert_corner_ = alert_corner_background_;
+  alert_corner_dirty_ = true;
+}
+
+void MilestoneADemo::AlertCornerDrawFull(int effect_id) {
+  const std::vector<Uint8>& tile = atet_data_.alert_tile(effect_id).indices;
+  for (size_t index = 0; index < alert_corner_.size(); ++index) {
+    if (tile[index] != kAlertTransparentIndex) {
+      alert_corner_[index] = tile[index];
+    }
   }
-  if (cleared_rows == 4 && was_four) {
-    return 8;
+  alert_corner_dirty_ = true;
+}
+
+void MilestoneADemo::AlertCornerDrawStretch(int effect_id, int rows) {
+  if (rows <= 0) {
+    return;
   }
-  switch (cleared_rows) {
-    case 1:
-      return 2;
-    case 2:
-      return 0;
-    case 3:
-      return 9;
-    case 4:
-      return 7;
-    default:
-      return 2;
+  const std::vector<Uint8>& tile = atet_data_.alert_tile(effect_id).indices;
+  const int step = 0x320000 / rows;             // 50 rows in 16.16, idiv
+  const int first_row = 25 - (rows >> 1);       // centred on corner row 25 (y 165)
+  for (int band_row = 0; band_row < rows; ++band_row) {
+    const int source_row = (step * band_row) >> 16;
+    const int corner_row = first_row + band_row;
+    for (int col = 0; col < kAlertFaceSize; ++col) {
+      const size_t dst = static_cast<size_t>(corner_row * kAlertFaceSize + col);
+      const Uint8 value = tile[static_cast<size_t>(source_row * kAlertFaceSize + col)];
+      alert_corner_[dst] = value == kAlertTransparentIndex ? alert_corner_background_[dst] : value;
+    }
   }
+  alert_corner_dirty_ = true;
 }
 
 void MilestoneADemo::RenderAlertTile(SDL_Renderer* renderer) const {
-  if (scene_ != Scene::kGameplay || alert_effect_id_ < 0 ||
-      alert_effect_id_ >= static_cast<int>(alert_tiles_.size())) {
+  if (renderer == nullptr) {
     return;
   }
-  const TextureAsset& tile = alert_tiles_[static_cast<size_t>(alert_effect_id_)];
-  if (tile.texture == nullptr) {
-    return;
+  if (alert_corner_texture_ == nullptr) {
+    alert_corner_texture_ = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STREAMING,
+                                              kAlertFaceSize, kAlertFaceSize);
+    if (alert_corner_texture_ == nullptr) {
+      return;
+    }
+    SDL_SetTextureScaleMode(alert_corner_texture_, SDL_SCALEMODE_NEAREST);
+    SDL_SetTextureBlendMode(alert_corner_texture_, SDL_BLENDMODE_NONE);
+    alert_corner_dirty_ = true;
   }
-  // Staged vertical reveal-in: RE board-alert-pass 0x206c feeds the row table
-  // {50,40,30,20,10,1} to 0x17983 as the six-step reveal counter counts down,
-  // i.e. rows-from-frame grow 1,10,20,30,40,50 -> full. Top-anchored wipe.
-  static constexpr int kRevealRows[6] = {1, 10, 20, 30, 40, 50};
-  const int step = std::clamp(alert_reveal_frame_, 0, 6);
-  const int revealed = step >= 6 ? tile.height : std::min(kRevealRows[step], tile.height);
-  if (revealed <= 0) {
-    return;
+  if (alert_corner_dirty_) {
+    const std::array<Uint8, 2500>& corner = alert_corner_hold_ ? alert_corner_shown_ : alert_corner_;
+    std::array<Uint8, kAlertFaceSize * kAlertFaceSize * 4> rgba{};
+    for (size_t index = 0; index < corner.size(); ++index) {
+      const SDL_Color& color = gameplay_palette_[corner[index]];
+      rgba[index * 4 + 0] = color.r;
+      rgba[index * 4 + 1] = color.g;
+      rgba[index * 4 + 2] = color.b;
+      rgba[index * 4 + 3] = SDL_ALPHA_OPAQUE;
+    }
+    SDL_UpdateTexture(alert_corner_texture_, nullptr, rgba.data(), kAlertFaceSize * 4);
+    alert_corner_dirty_ = false;
   }
-  const SDL_FRect src = {0.0f, 0.0f, static_cast<float>(tile.width), static_cast<float>(revealed)};
-  const SDL_FRect dst = {24.0f, 132.0f, static_cast<float>(tile.width), static_cast<float>(revealed)};
-  SDL_RenderTexture(renderer, tile.texture, &src, &dst);
+  const SDL_FRect dst = {static_cast<float>(kAlertFaceX), static_cast<float>(kAlertFaceY),
+                         static_cast<float>(kAlertFaceSize), static_cast<float>(kAlertFaceSize)};
+  SDL_RenderTexture(renderer, alert_corner_texture_, nullptr, &dst);
 }
 
-void MilestoneADemo::UpdateStackWarning(bool allow_sound) {
-  const int highest_row = HighestOccupiedRow();
-  int new_band = 0;
-  if (highest_row >= 0 && highest_row <= kWarningHighRow) {
-    new_band = 3;
-  } else if (highest_row >= 0 && highest_row <= kWarningMediumRow) {
-    new_band = 2;
-  } else if (highest_row >= 0 && highest_row <= kWarningLowRow) {
-    new_band = 1;
+// 0x21C4, at the start of every normal step (never on collapse, dissolve or game-over
+// steps): count the three cooldowns down, then look at the first occupied row of the
+// locked board (20 when empty). A warning face is a one-shot 160-step face through the
+// shared trigger; its sound needs the band's cooldown at 0 too, and the high band's sound
+// also needs the mid cooldown at 0, so climbing from the mid band into the high band is
+// silent. Every in-band step reloads the cooldowns, so nothing repeats while the stack
+// stays in a band.
+void MilestoneADemo::StackWarningStep() {
+  for (int& cooldown : warning_cooldowns_) {
+    if (cooldown > 0) {
+      --cooldown;
+    }
   }
-
-  warning_band_ = new_band;
-  if (!allow_sound || new_band == 0) {
-    return;
+  int& low = warning_cooldowns_[0];
+  int& mid = warning_cooldowns_[1];
+  int& high = warning_cooldowns_[2];
+  const int highest = HighestOccupiedRow();
+  const int r = (highest < 0 ? kBoardHeight : highest) - 1;
+  if (r < kWarningHighLimit) {
+    warning_band_ = 3;
+    if (high == 0) {
+      TriggerAlert(5, kAlertClearLifetime);
+      if (mid == 0) {
+        EmitAudioEvent("stack-warning-medium-high", 4, 0x80, 1);
+      }
+    }
+    low = mid = high = kWarningCooldownTicks;
+  } else if (r < kWarningMidLimit) {
+    warning_band_ = 2;
+    if (mid == 0) {
+      TriggerAlert(4, kAlertClearLifetime);
+      EmitAudioEvent("stack-warning-medium-high", 4, 0x80, 1);
+    }
+    mid = low = kWarningCooldownTicks;
+  } else if (r < kWarningLowLimit) {
+    warning_band_ = 1;
+    if (low == 0) {
+      TriggerAlert(3, kAlertClearLifetime);
+      EmitAudioEvent("stack-warning-low", 3, 0x80, 1);
+    }
+    low = kWarningCooldownTicks;
+  } else {
+    warning_band_ = 0;
   }
-
-  const size_t cooldown_index = static_cast<size_t>(new_band - 1);
-  if (warning_cooldowns_[cooldown_index] > 0) {
-    return;
-  }
-
-  // Warnings are centered and routed through the class-1 playback offset (0x6817 EDX=1).
-  EmitAudioEvent(new_band == 1 ? "stack-warning-low" : "stack-warning-medium-high", new_band == 1 ? 3 : 4, 0x80, 1);
-  warning_cooldowns_[cooldown_index] = kWarningCooldownFrames;
 }
 
 int MilestoneADemo::HighestOccupiedRow() const {
@@ -3218,7 +3367,13 @@ std::uint32_t MilestoneADemo::NextGameplayRandomU32() {
     gameplay_random_index_ = 0;
   }
 
-  return gameplay_random_table_[static_cast<size_t>(gameplay_random_index_)];
+  const std::uint32_t audit_value = gameplay_random_table_[static_cast<size_t>(gameplay_random_index_)];
+  ++audit_rng_draws_;
+  audit_rng_hash_ = Fnv1a64Update(audit_rng_hash_, &audit_value, sizeof(audit_value));
+  if (audit_rng_values_.size() < 16384) {
+    audit_rng_values_.push_back(audit_value);
+  }
+  return audit_value;
 }
 
 void MilestoneADemo::SaveLiveSnapshot() {
@@ -3235,12 +3390,9 @@ void MilestoneADemo::SaveLiveSnapshot() {
   live_snapshot_.lock_frames = lock_frames_;
   live_snapshot_.down_lockout_frames = down_lockout_frames_;
   live_snapshot_.collapse_frame = collapse_frame_;
-  live_snapshot_.top_out_frame = gameplay_top_out_frame_;
   live_snapshot_.warning_band = warning_band_;
   live_snapshot_.warning_cooldowns = warning_cooldowns_;
   live_snapshot_.last_clear_was_four = last_clear_was_four_;
-  live_snapshot_.sleepy = sleepy_;
-  live_snapshot_.frames_since_clear = frames_since_clear_;
 }
 
 void MilestoneADemo::RestoreLiveSnapshot() {
@@ -3259,12 +3411,9 @@ void MilestoneADemo::RestoreLiveSnapshot() {
   lock_frames_ = live_snapshot_.lock_frames;
   down_lockout_frames_ = live_snapshot_.down_lockout_frames;
   collapse_frame_ = live_snapshot_.collapse_frame;
-  gameplay_top_out_frame_ = live_snapshot_.top_out_frame;
   warning_band_ = live_snapshot_.warning_band;
   warning_cooldowns_ = live_snapshot_.warning_cooldowns;
   last_clear_was_four_ = live_snapshot_.last_clear_was_four;
-  sleepy_ = live_snapshot_.sleepy;
-  frames_since_clear_ = live_snapshot_.frames_since_clear;
 }
 
 int MilestoneADemo::RollNextPieceType() {
@@ -3591,6 +3740,51 @@ int MilestoneADemo::SelectableFrontendRowCount() const {
   return 0;
 }
 
+void MilestoneADemo::RenderLiveHud(SDL_Renderer* renderer) const {
+  const int high_score_value = high_scores_.empty() ? 0 : high_scores_[0].score;
+  DrawCounter(renderer, digit_atlas_.texture, {36, 89, 7, high_score_value});
+  DrawCounter(renderer, digit_atlas_.texture, {36, 101, 7, live_score_});
+  DrawCounter(renderer, digit_atlas_.texture, {60, 112, 3, live_level_});
+  DrawCounter(renderer, digit_atlas_.texture, {144, 195, 4, live_lines_});
+
+  for (size_t i = 0; i < live_piece_stats_.size(); ++i) {
+    DrawCounter(renderer, digit_atlas_.texture, {kPieceStatX, kPieceStatRows[i], 4, live_piece_stats_[i]});
+  }
+
+  DrawTetromino(
+      renderer,
+      piece_atlas_.texture,
+      live_next_piece_type_,
+      live_next_piece_type_,
+      kPreviewX,
+      kPreviewY);
+}
+
+void MilestoneADemo::DrawBoardCells(SDL_Renderer* renderer, const std::array<int, 200>& cells,
+                                    bool hide_clearing_rows) const {
+  for (int y = 0; y < kBoardHeight; ++y) {
+    // Each line-clear helper erases its 80x8 band right after spawning the band's
+    // particles (memset at e.g. 0x155F), in the clear tick itself: a cleared row is never
+    // drawn again; its debris (stage-0 colour = tile colour) shows it for that one frame.
+    if (hide_clearing_rows && gameplay_phase_ == GameplayPhase::kCollapse &&
+        std::find(pending_clear_rows_.begin(), pending_clear_rows_.end(), y) != pending_clear_rows_.end()) {
+      continue;
+    }
+    for (int x = 0; x < kBoardWidth; ++x) {
+      const int cell = cells[static_cast<size_t>(y * kBoardWidth + x)];
+      if (cell <= 0) {
+        continue;
+      }
+      DrawPieceTile(
+          renderer,
+          piece_atlas_.texture,
+          cell - 1,
+          kGameplayClearX + (x * kPieceTileSize),
+          kGameplayClearY + (y * kPieceTileSize));
+    }
+  }
+}
+
 void MilestoneADemo::RenderGameplay(SDL_Renderer* renderer) const {
   DrawTexture(renderer, gameplay_screen_.texture, gameplay_screen_.width, gameplay_screen_.height);
 
@@ -3612,60 +3806,27 @@ void MilestoneADemo::RenderGameplay(SDL_Renderer* renderer) const {
   SDL_RenderFillRect(renderer, &well_clear);
 
   if (live_game_active_) {
-    const int high_score_value = high_scores_.empty() ? 0 : high_scores_[0].score;
-    DrawCounter(renderer, digit_atlas_.texture, {36, 89, 7, high_score_value});
-    DrawCounter(renderer, digit_atlas_.texture, {36, 101, 7, live_score_});
-    DrawCounter(renderer, digit_atlas_.texture, {60, 112, 3, live_level_});
-    DrawCounter(renderer, digit_atlas_.texture, {144, 195, 4, live_lines_});
-
-    for (size_t i = 0; i < live_piece_stats_.size(); ++i) {
-      DrawCounter(renderer, digit_atlas_.texture, {kPieceStatX, kPieceStatRows[i], 4, live_piece_stats_[i]});
+    RenderLiveHud(renderer);
+    DrawBoardCells(renderer, live_board_cells_, true);
+    // While a collapse runs no piece is drawn: the locked piece is part of the board (and of
+    // the erased bands), and the original draws the next one only after the collapse.
+    if (gameplay_phase_ != GameplayPhase::kCollapse) {
+      DrawLiveTetromino(
+          renderer,
+          piece_atlas_.texture,
+          live_piece_.type,
+          live_piece_.rotation,
+          live_piece_.x,
+          live_piece_.y);
     }
 
-    DrawTetromino(
-        renderer,
-        piece_atlas_.texture,
-        live_next_piece_type_,
-        live_next_piece_type_,
-        kPreviewX,
-        kPreviewY);
-
-    for (int y = 0; y < kBoardHeight; ++y) {
-      bool collapse_row_hidden = false;
-      for (size_t clear_index = 0; clear_index < pending_clear_rows_.size(); ++clear_index) {
-        if (pending_clear_rows_[clear_index] == y &&
-            collapse_frame_ >= static_cast<int>(clear_index + 1) * kGameplayCollapseFramesPerRow) {
-          collapse_row_hidden = true;
-          break;
-        }
-      }
-      if (collapse_row_hidden) {
-        continue;
-      }
-      for (int x = 0; x < kBoardWidth; ++x) {
-        const int cell = live_board_cells_[static_cast<size_t>(y * kBoardWidth + x)];
-        if (cell <= 0) {
-          continue;
-        }
-        DrawPieceTile(
-            renderer,
-            piece_atlas_.texture,
-            cell - 1,
-            kGameplayClearX + (x * kPieceTileSize),
-            kGameplayClearY + (y * kPieceTileSize));
-      }
-    }
-
-    DrawLiveTetromino(
-        renderer,
-        piece_atlas_.texture,
-        live_piece_.type,
-        live_piece_.rotation,
-        live_piece_.x,
-        live_piece_.y);
-
-    RenderDebrisParticles(renderer);
+    // The face is part of the working screen; the debris is plotted after every tick
+    // (0x5AE -> 0x2F24), over the face. A screen restored by the frontend holds no
+    // particles, so none are drawn until the first tick back in the game steps them.
     RenderAlertTile(renderer);
+    if (!debris_hidden_after_frontend_) {
+      RenderDebrisParticles(renderer);
+    }
     return;
   }
 
@@ -3700,6 +3861,348 @@ void MilestoneADemo::RenderGameplay(SDL_Renderer* renderer) const {
         kGameplayClearX + (piece.x * kPieceTileSize),
         kGameplayClearY + (piece.y * kPieceTileSize));
   }
+}
+
+// ============================================================================
+// Audit instrumentation (audit/instrument worktree only). Read-only views of the
+// demo state plus per-step accumulators reset by AuditBeginStep.
+// ============================================================================
+namespace {
+
+const char* AuditActionName(size_t index) {
+  static constexpr const char* kNames[8] = {"up",          "down",         "left",    "right",
+                                            "rotate_left", "rotate_right", "confirm", "escape"};
+  return index < 8 ? kNames[index] : "?";
+}
+
+}  // namespace
+
+void MilestoneADemo::AuditBeginStep(std::uint64_t step) {
+  audit_step_ = step;
+  audit_stage_ = "input";
+  audit_emitted_.clear();
+  audit_rng_index_before_ = gameplay_random_index_;
+  audit_rng_draws_ = 0;
+  audit_rng_hash_ = kFnvOffsetBasis;
+  audit_rng_values_.clear();
+  audit_gravity_active_ = false;
+  audit_gravity_rate_ = 0;
+  audit_gravity_acc_before_ = gravity_accumulator_;
+  audit_descent_attempts_ = 0;
+  audit_descent_successes_ = 0;
+  audit_score_before_ = live_score_;
+  audit_particles_spawned_ = 0;
+  audit_particles_dropped_ = 0;
+  audit_particles_retired_ = 0;
+  audit_pressed_.fill(false);
+  audit_released_.fill(false);
+  audit_held_at_step_start_ = held_original_scancodes_;
+}
+
+void MilestoneADemo::AuditWritePresentation(JsonOut& json) const {
+  json.BeginObject()
+      .Key("splash_frame").Int(splash_frame_)
+      .Key("frontend_frame_counter").Int(frontend_frame_counter_)
+      .Key("frontend_view_frame").Int(frontend_view_frame_)
+      .Key("pulse").Int(PulseRevealAmount())
+      .Key("top_out_frame").Int(top_out_frame_)
+      .Key("top_out_dissolved_pixel_rows").Int(top_out_dissolved_rows_)
+      .Key("debris").UInt(debris_particles_.size())
+      .Key("fade_alpha").Int(screen_fade_alpha())
+      .EndObject();
+}
+
+void MilestoneADemo::AuditWriteEmittedEvents(JsonOut& json) const {
+  json.BeginArray();
+  for (const AuditEmitted& event : audit_emitted_) {
+    json.BeginObject().Key("stage").Str(event.stage).Key("kind").Str(event.is_sfx ? "sfx" : "music").Key("name").Str(
+        event.name);
+    if (event.is_sfx) {
+      json.Key("slot").Int(event.slot).Key("sfx_volume").Int(event.sfx_volume).Key("pan").Int(event.pan).Key(
+          "voice_class").Int(event.voice_class);
+    } else {
+      json.Key("track").Int(event.track).Key("music_volume").Int(event.music_volume);
+    }
+    json.EndObject();
+  }
+  json.EndArray();
+}
+
+void MilestoneADemo::AuditWriteState(JsonOut& json, bool include_rng_values) const {
+  const char* scene = "frontend";
+  switch (scene_) {
+    case Scene::kSplash: scene = "splash"; break;
+    case Scene::kFrontend: scene = "frontend"; break;
+    case Scene::kGameplay: scene = "gameplay"; break;
+    case Scene::kTopOut: scene = "topout"; break;
+  }
+  const char* view = "main_menu";
+  switch (frontend_view_) {
+    case FrontendView::kMainMenu: view = "main_menu"; break;
+    case FrontendView::kOptions: view = "options"; break;
+    case FrontendView::kKeyboardSetup: view = "keyboard_setup"; break;
+    case FrontendView::kHighScores: view = "high_scores"; break;
+    case FrontendView::kHighScoreEntry: view = "high_score_entry"; break;
+    case FrontendView::kCredits: view = "credits"; break;
+    case FrontendView::kSoundSetup: view = "sound_setup"; break;
+  }
+  const char* phase = "falling";
+  if (gameplay_phase_ == GameplayPhase::kCollapse) {
+    phase = "collapse";
+  } else if (gameplay_phase_ == GameplayPhase::kTopOutDissolve) {
+    phase = "topout_dissolve";
+  }
+  const char* fade = screen_fade_ == ScreenFade::kOut ? "out" : screen_fade_ == ScreenFade::kIn ? "in" : "none";
+  const char* pending = "none";
+  switch (pending_scene_) {
+    case PendingScene::kNone: pending = "none"; break;
+    case PendingScene::kFrontendFromGameplay: pending = "frontend_from_gameplay"; break;
+    case PendingScene::kGameplayNewGame: pending = "gameplay_new_game"; break;
+    case PendingScene::kGameplayResume: pending = "gameplay_resume"; break;
+    case PendingScene::kHighScoresFromTopOut: pending = "high_scores_from_topout"; break;
+  }
+
+  json.Key("scene").Str(scene).Key("scene_name").Str(scene_name());
+  json.Key("splash").BeginObject().Key("page").Int(splash_page_).Key("frame").Int(splash_frame_).EndObject();
+  json.Key("session")
+      .BeginObject()
+      .Key("live_game_active").Bool(live_game_active_)
+      .Key("live_game_available").Bool(live_game_available_)
+      .Key("quit_requested").Bool(quit_requested_)
+      .Key("gameplay_preset").Int(gameplay_preset_index_)
+      .EndObject();
+  json.Key("phase").Str(phase);
+
+  // Piece (port numbering; geometry from RotatedCells, i.e. what draw/collision use).
+  json.Key("piece").BeginObject().Key("id").Int(live_piece_.type).Key("rotation").Int(live_piece_.rotation).Key("x").Int(
+      live_piece_.x).Key("y").Int(live_piece_.y).Key("next").Int(live_next_piece_type_);
+  json.Key("cells").BeginArray();
+  for (const CellOffset& cell : RotatedCells(live_piece_.type, live_piece_.rotation)) {
+    json.BeginArray().Int(live_piece_.x + cell.x).Int(live_piece_.y + cell.y).EndArray();
+  }
+  json.EndArray();
+  json.Key("stats").BeginArray();
+  for (const int count : live_piece_stats_) {
+    json.Int(count);
+  }
+  json.EndArray().EndObject();
+
+  // Gravity bracket for this step (StepFallingGameplay); rate includes the 0x8000 soft-drop override.
+  json.Key("gravity").BeginObject().Key("stepped").Bool(audit_gravity_active_);
+  if (audit_gravity_active_) {
+    json.Key("rate").Int(audit_gravity_rate_).Key("acc_before").Int(audit_gravity_acc_before_);
+  } else {
+    json.Key("rate").Null().Key("acc_before").Null();
+  }
+  json.Key("acc_after").Int(gravity_accumulator_)
+      .Key("natural_rate").Int(CurrentGravityRate())
+      .Key("soft_drop_override").Bool(audit_gravity_active_ && audit_gravity_rate_ == kSoftDropIncrement &&
+                                      CurrentGravityRate() != kSoftDropIncrement)
+      .Key("descent_attempts").Int(audit_descent_attempts_)
+      .Key("descent_successes").Int(audit_descent_successes_)
+      .Key("lock_frames").Int(lock_frames_)
+      .Key("down_lockout").Int(down_lockout_frames_)
+      .EndObject();
+
+  // Input: the eight semantic actions (v1 trace order) mapped through the bindings.
+  const std::array<std::uint8_t, 8> action_scancodes = {
+      0xC8, keyboard_bindings_[0], keyboard_bindings_[1], keyboard_bindings_[2],
+      keyboard_bindings_[3], keyboard_bindings_[4], 0x1C, 0x01};
+  auto write_set = [&](const std::array<bool, 256>& states) {
+    json.BeginArray();
+    for (size_t i = 0; i < action_scancodes.size(); ++i) {
+      const std::uint8_t sc = action_scancodes[i];
+      if (sc != 0 && states[sc]) {
+        json.Str(AuditActionName(i));
+      }
+    }
+    json.EndArray();
+  };
+  json.Key("input").BeginObject();
+  json.Key("held_at_step_start");
+  write_set(audit_held_at_step_start_);
+  json.Key("held");
+  write_set(held_original_scancodes_);
+  json.Key("pressed");
+  write_set(audit_pressed_);
+  json.Key("released");
+  write_set(audit_released_);
+  json.Key("held_frames").BeginObject();
+  for (size_t i = 0; i < action_scancodes.size(); ++i) {
+    const std::uint8_t sc = action_scancodes[i];
+    json.Key(AuditActionName(i)).Int(sc != 0 && held_original_scancodes_[sc] ? held_original_scancode_frames_[sc] : 0);
+  }
+  json.EndObject();
+  // Gameplay auto-repeat fires in Tick when held_frames > 0 && held_frames % 8 == 0
+  // (kGameplayBindingRepeatFrames); the frontend Left/Right edit repeats at 12 then every 4.
+  json.Key("das_period").Int(kGameplayBindingRepeatFrames);
+  json.Key("held_raw").BeginArray();
+  for (size_t sc = 0; sc < held_original_scancodes_.size(); ++sc) {
+    if (held_original_scancodes_[sc]) {
+      json.Int(static_cast<int>(sc));
+    }
+  }
+  json.EndArray().EndObject();
+
+  // RNG (consumption 0x3280 model): draws this step, FNV-1a64 over the raw LE u32 values.
+  json.Key("rng")
+      .BeginObject()
+      .Key("seed").UInt(piece_seed_)
+      .Key("state").UInt(gameplay_random_state_)
+      .Key("index_before").Int(audit_rng_index_before_)
+      .Key("index_after").Int(gameplay_random_index_)
+      .Key("draws").UInt(audit_rng_draws_)
+      .Key("values_fnv1a64").Str(Hex64(audit_rng_hash_));
+  json.Key("values");
+  if (include_rng_values || audit_rng_draws_ <= 8) {
+    json.BeginArray();
+    for (const std::uint32_t value : audit_rng_values_) {
+      json.UInt(value);
+    }
+    json.EndArray();
+  } else {
+    json.Null();
+  }
+  json.EndObject();
+
+  // Board: 20 rows top->bottom, 10 cells left->right, value = cell byte (0 empty,
+  // 1..7 = port piece type + 1). Hash = FNV-1a64 over the 200 bytes (v1 board domain).
+  std::uint64_t board_hash = kFnvOffsetBasis;
+  for (const int cell : live_board_cells_) {
+    const std::uint8_t byte = static_cast<std::uint8_t>(cell);
+    board_hash = Fnv1a64Update(board_hash, &byte, 1);
+  }
+  json.Key("board").BeginObject().Key("fnv1a64").Str(Hex64(board_hash)).Key("rows").BeginArray();
+  for (int y = 0; y < kBoardHeight; ++y) {
+    std::string row;
+    for (int x = 0; x < kBoardWidth; ++x) {
+      row += static_cast<char>('0' + std::clamp(live_board_cells_[static_cast<size_t>(y * kBoardWidth + x)], 0, 9));
+    }
+    json.Str(row);
+  }
+  json.EndArray().EndObject();
+
+  json.Key("score")
+      .BeginObject()
+      .Key("value").Int(live_score_)
+      .Key("lines").Int(live_lines_)
+      .Key("level").Int(live_level_)
+      .Key("start_level").Int(start_level_)
+      .Key("delta").Int(live_score_ - audit_score_before_)
+      .EndObject();
+
+  json.Key("clear").BeginObject().Key("rows").BeginArray();
+  for (const int row : pending_clear_rows_) {
+    json.Int(row);
+  }
+  json.EndArray().Key("collapse_frame").Int(collapse_frame_).EndObject();
+
+  json.Key("particles")
+      .BeginObject()
+      .Key("active").UInt(debris_particles_.size())
+      .Key("spawned").UInt(audit_particles_spawned_)
+      .Key("dropped_at_cap").UInt(audit_particles_dropped_)
+      .Key("retired").UInt(audit_particles_retired_)
+      .EndObject();
+
+  // Test hook (effects-alerts prototype): the whole particle pool for the steps in
+  // ATET_AUDIT_PARTICLES=A:B, in container order (index 0 = first spawned), each as
+  // [x, y, vx, vy, age, decay, color] (16.16 fixed point, as the original's nodes).
+  {
+    static const std::pair<std::uint64_t, std::uint64_t> particle_range = [] {
+      std::pair<std::uint64_t, std::uint64_t> range{1, 0};  // empty unless the variable is set
+      const char* spec = SDL_getenv("ATET_AUDIT_PARTICLES");
+      unsigned long long from = 0;
+      unsigned long long to = 0;
+      if (spec != nullptr && SDL_sscanf(spec, "%llu:%llu", &from, &to) == 2 && from <= to) {
+        range = {from, to};
+      }
+      return range;
+    }();
+    if (audit_step_ >= particle_range.first && audit_step_ <= particle_range.second) {
+      json.Key("particle_list").BeginArray();
+      for (const DebrisParticle& particle : debris_particles_) {
+        json.BeginArray()
+            .Int(particle.x)
+            .Int(particle.y)
+            .Int(particle.vx)
+            .Int(particle.vy)
+            .Int(particle.age)
+            .Int(particle.decay)
+            .Int(particle.color)
+            .EndArray();
+      }
+      json.EndArray();
+    }
+  }
+
+  json.Key("warning")
+      .BeginObject()
+      .Key("band").Int(warning_band_)
+      .Key("cooldowns").BeginArray().Int(warning_cooldowns_[0]).Int(warning_cooldowns_[1]).Int(warning_cooldowns_[2]).EndArray()
+      .Key("sleepy").Bool(alert_effect_id_ == 11)
+      .Key("frames_since_clear").Int(static_cast<long long>(tick_counter_ - last_clear_tick_))
+      .EndObject();
+
+  json.Key("alert").BeginObject().Key("id");
+  if (alert_effect_id_ >= 0) {
+    json.Int(alert_effect_id_);
+  } else {
+    json.Null();
+  }
+  json.Key("lifetime").Int(alert_lifetime_)
+      .Key("reveal_frame").Int(6 - alert_reveal_counter_)
+      .Key("reveal_counter").Int(alert_reveal_counter_)
+      .Key("tick").UInt(tick_counter_)
+      .Key("last_clear_tick").UInt(last_clear_tick_)
+      .EndObject();
+
+  json.Key("topout")
+      .BeginObject()
+      .Key("frame").Int(top_out_frame_)
+      .Key("gameplay_frame").Int(top_out_frame_)
+      .Key("dissolved_pixel_rows").Int(top_out_dissolved_rows_)
+      .Key("overlay_visible").Bool(scene_ == Scene::kTopOut && top_out_dissolved_rows_ >= kTopOutDissolveFrames)
+      .Key("saved_under_valid").Bool(false)
+      .Key("handoff_pending").Bool(false)
+      .EndObject();
+
+  json.Key("frontend")
+      .BeginObject()
+      .Key("view").Str(view)
+      .Key("selected_row").Int(frontend_selected_row_)
+      .Key("view_frame").Int(frontend_view_frame_)
+      .Key("frame_counter").Int(frontend_frame_counter_)
+      .Key("cycle_counter").Int(frontend_cycle_counter_)
+      .Key("bank").Int(frontend_current_bank_)
+      .Key("next_bank").Int(frontend_next_bank_)
+      .Key("pulse").Int(PulseRevealAmount())
+      .Key("visible_rows").Int(scene_ == Scene::kFrontend ? VisibleFrontendRowCount(CurrentFrontendRows().size()) : 0)
+      .Key("conceal_frames").Int(high_score_conceal_frames_)
+      .Key("hs_bootstrap_remaining").Int(HighScoreBootstrapRemainingFrames())
+      .Key("credits_page").Int(credits_page_)
+      .Key("credits_timer").Int(credits_page_timer_)
+      .Key("keyboard_capture_row").Int(keyboard_capture_row_)
+      .Key("entry_row").Int(high_score_entry_row_)
+      .Key("entry_name").Str(high_score_entry_name_)
+      .Key("commit_pending").Bool(high_score_entry_commit_pending_)
+      .EndObject();
+
+  json.Key("fade")
+      .BeginObject()
+      .Key("state").Str(fade)
+      .Key("frame").Int(screen_fade_frame_)
+      .Key("alpha").Int(screen_fade_alpha())
+      .Key("pending_scene").Str(pending)
+      .Key("enabled").Bool(fades_enabled_)
+      .EndObject();
+
+  json.Key("settings")
+      .BeginObject()
+      .Key("music_volume").Int(music_volume_)
+      .Key("sfx_volume").Int(sfx_volume_)
+      .Key("music_track_index").Int(music_track_index_)
+      .EndObject();
 }
 
 }  // namespace atet

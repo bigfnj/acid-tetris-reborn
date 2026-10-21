@@ -81,6 +81,33 @@ else
   bad "Left held did not auto-repeat (min col=${minx:-none}; expected <=1)"
 fi
 
+# --- Test 4: clear faces live 160 steps; a clear within 160 ticks of the previous one gets
+# the fast-follow face (original 0x0F54..0x0F9F, life 0xA0 -> face up for 159 steps).
+# --live-demo clears four rows at tick 0; a single (C) at step 60 must show face 1, not 2.
+echo "[4] clear-face lifetime + fast-follow face"
+alerts="$("$exe" --live-demo --debug-state --smoke-frames=400 --scripted-input='60:c,62:c:up' 2>&1 \
+          | grep -o 'Debug state: .*' | grep -oE ' alert=-?[0-9]+' | sed 's/ alert=//')"
+a60="$(echo "$alerts" | sed -n '61p')"
+run1="$(echo "$alerts" | sed -n '61,$p' | awk '$1==1{n++; next} {exit} END{print n+0}')"
+if [ "$a60" = "1" ] && [ "$run1" = "159" ]; then
+  pass "single 60 ticks after a clear shows face 1 for 159 steps"
+else
+  bad "fast-follow/lifetime off (face at step 60 = '$a60' want 1, steps with face 1 = $run1 want 159)"
+fi
+
+# --- Test 5: sleepy face exactly 1800 ticks after the last clear, up for 319 steps
+# (original 0x10A6: tick - last clear == 0x708, life 0x140). --live-demo clears at tick 0.
+echo "[5] sleepy face timing"
+alerts="$("$exe" --live-demo --debug-state --smoke-frames=2200 2>&1 \
+          | grep -o 'Debug state: .*' | grep -oE ' alert=-?[0-9]+' | sed 's/ alert=//')"
+first11="$(echo "$alerts" | awk '$1==11{print NR-1; exit}')"
+n11="$(echo "$alerts" | awk '$1==11{n++} END{print n+0}')"
+if [ "$first11" = "1799" ] && [ "$n11" = "319" ]; then
+  pass "sleepy face from step 1799 (tick 1800) for 319 steps"
+else
+  bad "sleepy face off (first at step '${first11:-none}' want 1799, $n11 steps want 319)"
+fi
+
 echo
 if [ "$fail" -eq 0 ]; then echo "ALL DYNAMIC TESTS PASSED"; else echo "DYNAMIC TESTS FAILED"; fi
 exit "$fail"
