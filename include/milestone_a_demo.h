@@ -14,9 +14,24 @@
 
 namespace atet {
 
+class JsonOut;  // audit_instrument.h (audit worktree only)
+
 class MilestoneADemo {
  public:
   MilestoneADemo() = default;
+
+  // ---- Audit instrumentation (audit/instrument worktree only; diagnostics) ----
+  // Called by main at the top of each loop iteration: resets per-step
+  // accumulators (RNG draws, gravity bracket, emitted events, particle spawns).
+  void AuditBeginStep(std::uint64_t step);
+  // Labels where emitted audio events originate: "input", "tick", "render".
+  void AuditSetStage(const char* stage) { audit_stage_ = stage; }
+  // Full post-iteration state snapshot (see harness/port/README.md for fields).
+  void AuditWriteState(JsonOut& json, bool include_rng_values) const;
+  // Presentation counters that Render() consumes/advances (sampled pre-render).
+  void AuditWritePresentation(JsonOut& json) const;
+  // Audio events pushed by EmitAudioEvent/EmitMusicEvent during this step.
+  void AuditWriteEmittedEvents(JsonOut& json) const;
   MilestoneADemo(const MilestoneADemo&) = delete;
   MilestoneADemo& operator=(const MilestoneADemo&) = delete;
 
@@ -418,6 +433,38 @@ class MilestoneADemo {
   int top_out_dissolved_rows_ = 0;
 
   AtetData atet_data_;
+
+  // ---- Audit instrumentation state (never read by game logic) ----
+  struct AuditEmitted {
+    std::string stage;
+    std::string name;
+    bool is_sfx = false;
+    int slot = 0;
+    int track = 0;
+    int music_volume = 0;
+    int sfx_volume = 0;
+    int pan = 0x80;
+    int voice_class = 0;
+  };
+  std::uint64_t audit_step_ = 0;
+  const char* audit_stage_ = "setup";
+  std::vector<AuditEmitted> audit_emitted_;
+  int audit_rng_index_before_ = 0;
+  std::uint32_t audit_rng_draws_ = 0;
+  std::uint64_t audit_rng_hash_ = 0;
+  std::vector<std::uint32_t> audit_rng_values_;
+  bool audit_gravity_active_ = false;
+  int audit_gravity_rate_ = 0;
+  int audit_gravity_acc_before_ = 0;
+  int audit_descent_attempts_ = 0;
+  int audit_descent_successes_ = 0;
+  int audit_score_before_ = 0;
+  std::uint32_t audit_particles_spawned_ = 0;
+  std::uint32_t audit_particles_dropped_ = 0;
+  std::uint32_t audit_particles_retired_ = 0;
+  std::array<bool, 256> audit_pressed_{};
+  std::array<bool, 256> audit_released_{};
+  std::array<bool, 256> audit_held_at_step_start_{};
 };
 
 }  // namespace atet

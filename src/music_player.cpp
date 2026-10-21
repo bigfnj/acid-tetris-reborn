@@ -39,7 +39,7 @@ bool MusicPlayer::Initialize(const std::array<std::vector<std::uint8_t>, 6>& tra
   const char* sdl_driver = SDL_getenv("SDL_AUDIODRIVER");
   const bool headless = sdl_driver != nullptr && std::strcmp(sdl_driver, "dummy") == 0;
 #ifdef ATET_PORT_HAVE_WINMM
-  if (!headless) {
+  if (!headless && !capture_mode_) {
     MikMod_RegisterDriver(&drv_win);
   }
 #else
@@ -219,7 +219,12 @@ void MusicPlayer::Update() {
   if (!initialized_) {
     return;
   }
-  MikMod_Update();
+  // Audit capture mode: the nosound driver's Update would mix 32768 bytes into a
+  // scratch buffer per call (drv_nos.c NS_Update), advancing the song ~186 ms per
+  // frame; the capture path mixes explicitly via CaptureMix() instead.
+  if (!capture_mode_) {
+    MikMod_Update();
+  }
 
   if (ramp_mode_ == RampMode::kNone) {
     return;
@@ -258,6 +263,42 @@ std::string MusicPlayer::debug_state() const {
          " music_ramp=" + ramp +
          " music_ramp_left=" + std::to_string(ramp_remaining_ticks_) +
          " music_vol=" + std::to_string(vol);
+}
+
+size_t MusicPlayer::CaptureMix(std::int16_t* out, size_t frames) {
+  if (!initialized_ || !capture_mode_ || out == nullptr || frames == 0) {
+    return 0;
+  }
+  // 16-bit stereo => 4 bytes per frame (md_mode has DMODE_16BITS | DMODE_STEREO).
+  const ULONG written = VC_WriteBytes(reinterpret_cast<SBYTE*>(out), static_cast<ULONG>(frames * 4));
+  return static_cast<size_t>(written / 4);
+}
+
+std::string MusicPlayer::AuditJson() const {
+  const char* ramp = "none";
+  if (ramp_mode_ == RampMode::kFadeIn) {
+    ramp = "fadein";
+  } else if (ramp_mode_ == RampMode::kFadeOut) {
+    ramp = "fadeout";
+  }
+  const int percent = ramp_mode_ == RampMode::kNone ? target_volume_percent_ : RampVolumePercent();
+  std::string json = "{\"track\":" + std::to_string(current_track_) + ",\"pending_track\":" +
+                     std::to_string(pending_track_) + ",\"ramp\":\"" + ramp + "\",\"ramp_left\":" +
+                     std::to_string(ramp_remaining_ticks_) + ",\"ramp_total\":" + std::to_string(ramp_total_ticks_) +
+                     ",\"volume_percent\":" + std::to_string(percent) + ",\"target_percent\":" +
+                     std::to_string(target_volume_percent_) + ",\"exiting\":" + (exiting_ ? "true" : "false") +
+                     ",\"capture\":" + (capture_mode_ ? "true" : "false");
+  const MODULE* mod = static_cast<const MODULE*>(module_);
+  if (mod != nullptr) {
+    json += ",\"module\":{\"sngpos\":" + std::to_string(mod->sngpos) + ",\"patpos\":" + std::to_string(mod->patpos) +
+            ",\"vbtick\":" + std::to_string(mod->vbtick) + ",\"sngspd\":" + std::to_string(mod->sngspd) +
+            ",\"bpm\":" + std::to_string(mod->bpm) + ",\"sngtime_1024ths\":" + std::to_string(mod->sngtime) +
+            ",\"mikmod_volume\":" + std::to_string(mod->volume) + "}";
+  } else {
+    json += ",\"module\":null";
+  }
+  json += "}";
+  return json;
 }
 
 void MusicPlayer::UnloadModule() {
